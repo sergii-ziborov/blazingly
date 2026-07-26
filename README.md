@@ -217,9 +217,14 @@ See [dependency injection and plugin scopes](docs/dependency-injection.md).
 The first socket-level development baseline and the remaining acceptance gates
 are recorded in [benchmark status](docs/benchmark-status.md).
 
-## Workspace
+## Repositories
 
-- `blazingly-contract`: portable operation contracts;
+- `blazingly-contract`: independent portable operation contracts, pinned here
+  as a Git submodule until its first registry release;
+- `blazingly-benchmarks`: external conformance and performance comparisons.
+
+The framework workspace contains:
+
 - `blazingly-core`: application model and HTTP bindings;
 - `blazingly-di`: typed providers, lifetimes, finalizers, and compiled slots;
 - `blazingly-executor`: shared handler decoding, validation, and execution;

@@ -22,7 +22,7 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
-blazingly-contract = { path = "crates/blazingly-contract" }
+blazingly-contract = { version = "0.0.1", path = "crates/blazingly-contract" }
 blazingly-core = { path = "crates/blazingly-core" }
 blazingly-docs = { path = "crates/blazingly-docs" }
 blazingly-di = { path = "crates/blazingly-di" }
