@@ -1,0 +1,15 @@
+[package]
+name = "blazingly-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+blazingly-core.workspace = true
+blazingly-executor.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

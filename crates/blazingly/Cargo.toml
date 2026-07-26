@@ -1,0 +1,42 @@
+[package]
+name = "blazingly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["docs", "mcp", "openapi"]
+docs = ["dep:blazingly-docs"]
+mcp = ["dep:blazingly-mcp"]
+mcp-stdio = ["mcp", "dep:blazingly-mcp-stdio"]
+native = ["dep:blazingly-native"]
+native-http2 = ["native", "blazingly-native/http2"]
+native-tls = ["native", "blazingly-native/tls"]
+openapi = ["dep:blazingly-openapi"]
+
+[dependencies]
+blazingly-contract.workspace = true
+blazingly-core.workspace = true
+blazingly-docs = { workspace = true, optional = true }
+blazingly-di.workspace = true
+blazingly-executor.workspace = true
+blazingly-http.workspace = true
+blazingly-macros.workspace = true
+blazingly-mcp = { workspace = true, optional = true }
+blazingly-mcp-stdio = { workspace = true, optional = true }
+blazingly-native = { workspace = true, optional = true }
+blazingly-openapi = { workspace = true, optional = true }
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+shiguredo_http2.workspace = true
+
+[[example]]
+name = "mcp-stdio"
+required-features = ["mcp-stdio"]
+
+[lints]
+workspace = true

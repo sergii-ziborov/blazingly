@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/blazingly",
+    "crates/blazingly-contract",
+    "crates/blazingly-core",
+    "crates/blazingly-docs",
+    "crates/blazingly-di",
+    "crates/blazingly-executor",
+    "crates/blazingly-http",
+    "crates/blazingly-macros",
+    "crates/blazingly-mcp",
+    "crates/blazingly-mcp-stdio",
+    "crates/blazingly-native",
+    "crates/blazingly-openapi",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+blazingly-contract = { path = "crates/blazingly-contract" }
+blazingly-core = { path = "crates/blazingly-core" }
+blazingly-docs = { path = "crates/blazingly-docs" }
+blazingly-di = { path = "crates/blazingly-di" }
+blazingly-executor = { path = "crates/blazingly-executor" }
+blazingly-http = { path = "crates/blazingly-http" }
+blazingly-macros = { path = "crates/blazingly-macros" }
+blazingly-mcp = { path = "crates/blazingly-mcp" }
+blazingly-mcp-stdio = { path = "crates/blazingly-mcp-stdio" }
+blazingly-native = { path = "crates/blazingly-native" }
+blazingly-openapi = { path = "crates/blazingly-openapi" }
+base64 = "0.22"
+compio = { version = "0.17.0", default-features = false, features = [
+    "io-compat",
+    "io-uring",
+    "dispatcher",
+    "polling",
+    "runtime",
+    "signal",
+    "time",
+] }
+futures-lite = "2"
+httparse = "1.10"
+httpdate = "1.0.3"
+proc-macro2 = "1"
+quote = "1"
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
+serde_json = "1.0.151"
+shiguredo_http2 = "=2026.1.0-canary.6"
+syn = { version = "3.0.3", features = ["full", "parsing", "printing"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
