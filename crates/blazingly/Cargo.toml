@@ -3,34 +3,69 @@ name = "blazingly"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Facade crate re-exporting the Blazingly framework: routing, extraction, validation, dependency injection, OpenAPI, and MCP"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish.workspace = true
 
 [features]
-default = ["docs", "mcp", "openapi"]
+default = ["deploy", "docs", "mcp", "middleware", "observability", "openapi", "realtime", "security", "validation"]
+deploy = ["dep:blazingly-deploy"]
+database = ["dep:blazingly-database"]
 docs = ["dep:blazingly-docs"]
 mcp = ["dep:blazingly-mcp"]
 mcp-stdio = ["mcp", "dep:blazingly-mcp-stdio"]
+middleware = ["dep:blazingly-middleware"]
 native = ["dep:blazingly-native"]
 native-http2 = ["native", "blazingly-native/http2"]
 native-tls = ["native", "blazingly-native/tls"]
+observability = ["dep:blazingly-observability"]
+observability-otel = ["observability", "blazingly-observability/otel"]
 openapi = ["dep:blazingly-openapi"]
+queue = ["dep:blazingly-queue"]
+realtime = ["dep:blazingly-realtime"]
+security = ["dep:blazingly-security"]
+templates = ["dep:blazingly-templates"]
+# Also turns on the constraint projection in the crates that render a schema or
+# a decode failure, so a declarative bound reaches OpenAPI, MCP, the docs, and
+# the error envelope instead of staying an opaque validator string.
+validation = [
+    "dep:blazingly-validation",
+    "blazingly-executor/validation",
+    "blazingly-docs?/validation",
+    "blazingly-mcp?/validation",
+    "blazingly-openapi?/validation",
+]
 
 [dependencies]
 blazingly-contract.workspace = true
 blazingly-core.workspace = true
+blazingly-database = { workspace = true, optional = true }
+blazingly-deploy = { workspace = true, optional = true }
 blazingly-docs = { workspace = true, optional = true }
 blazingly-di.workspace = true
 blazingly-executor.workspace = true
 blazingly-http.workspace = true
 blazingly-macros.workspace = true
+blazingly-middleware = { workspace = true, optional = true }
 blazingly-mcp = { workspace = true, optional = true }
 blazingly-mcp-stdio = { workspace = true, optional = true }
 blazingly-native = { workspace = true, optional = true }
+blazingly-observability = { workspace = true, optional = true }
 blazingly-openapi = { workspace = true, optional = true }
+blazingly-queue = { workspace = true, optional = true }
+blazingly-realtime = { workspace = true, optional = true }
+blazingly-security = { workspace = true, optional = true }
+blazingly-templates = { workspace = true, optional = true }
+blazingly-validation = { workspace = true, optional = true }
 serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 futures-lite.workspace = true
 shiguredo_http2.workspace = true
 

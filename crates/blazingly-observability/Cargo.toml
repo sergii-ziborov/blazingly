@@ -1,0 +1,57 @@
+[package]
+name = "blazingly-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Request identity, access events, tracing and OpenTelemetry propagation, and Prometheus metrics for Blazingly"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# OTLP/HTTP span export. Every crate below resolves without Tokio: the SDK batch
+# processor runs on its own thread and blocks on the export future through
+# `futures_executor`, and `opentelemetry-otlp` is taken without its
+# `reqwest-*`/`hyper-client`/`grpc-tonic` transports, which are the only paths
+# that would pull an async runtime in.
+otel = [
+    "dep:async-trait",
+    "dep:http",
+    "dep:opentelemetry",
+    "dep:opentelemetry-http",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+
+[dependencies]
+async-trait = { version = "0.1", optional = true }
+blazingly-core.workspace = true
+blazingly-http.workspace = true
+# The type language of `opentelemetry_http::HttpClient`; already in that crate's
+# tree, declared here so the transport can name `Uri` and `HeaderMap`.
+http = { version = "1", default-features = false, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-http = { version = "0.32", default-features = false, optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "http-proto",
+    "trace",
+], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+    "trace",
+], optional = true }
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+    "std",
+], optional = true }
+uuid.workspace = true
+
+[lints]
+workspace = true

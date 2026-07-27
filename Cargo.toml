@@ -1,17 +1,29 @@
 [workspace]
 members = [
+    "crates/cargo-blazingly",
     "crates/blazingly",
     "crates/blazingly-contract",
     "crates/blazingly-core",
+    "crates/blazingly-database",
+    "crates/blazingly-deploy",
     "crates/blazingly-docs",
     "crates/blazingly-di",
     "crates/blazingly-executor",
     "crates/blazingly-http",
     "crates/blazingly-macros",
+    "crates/blazingly-middleware",
     "crates/blazingly-mcp",
     "crates/blazingly-mcp-stdio",
     "crates/blazingly-native",
+    "crates/blazingly-observability",
     "crates/blazingly-openapi",
+    "crates/blazingly-queue",
+    "crates/blazingly-realtime",
+    "crates/blazingly-security",
+    "crates/blazingly-templates",
+    "crates/blazingly-validation",
+    "crates/blazingly-wire",
+    "crates/blazingly-wire-standalone",
 ]
 resolver = "3"
 
@@ -19,21 +31,49 @@ resolver = "3"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/sergii-ziborov/blazingly"
+readme = "README.md"
+keywords = ["framework", "http", "api", "openapi", "mcp"]
+categories = [
+    "web-programming::http-server",
+    "web-programming",
+    "api-bindings",
+    "asynchronous",
+    "development-tools",
+]
+# Release gate for flipping this to `true` (docs/stability.md, "Release
+# process"): CI `test`, `security-audit`, `miri`, `address-sanitizer`,
+# `fuzz-smoke`, `contract-semver`, `feature-combinations`, and `rustdoc` green;
+# `workspace-semver` reviewed; blazingly-contract pinned to a released tag whose
+# version satisfies the [workspace.dependencies] requirement; CHANGELOG.md
+# section promoted from Unreleased.
 publish = false
 
 [workspace.dependencies]
-blazingly-contract = { version = "0.0.1", path = "crates/blazingly-contract" }
+blazingly-contract = { version = "0.3.0", path = "crates/blazingly-contract" }
 blazingly-core = { path = "crates/blazingly-core" }
+blazingly-database = { path = "crates/blazingly-database" }
+blazingly-deploy = { path = "crates/blazingly-deploy" }
 blazingly-docs = { path = "crates/blazingly-docs" }
 blazingly-di = { path = "crates/blazingly-di" }
 blazingly-executor = { path = "crates/blazingly-executor" }
 blazingly-http = { path = "crates/blazingly-http" }
 blazingly-macros = { path = "crates/blazingly-macros" }
+blazingly-middleware = { path = "crates/blazingly-middleware" }
 blazingly-mcp = { path = "crates/blazingly-mcp" }
 blazingly-mcp-stdio = { path = "crates/blazingly-mcp-stdio" }
 blazingly-native = { path = "crates/blazingly-native" }
+blazingly-observability = { path = "crates/blazingly-observability" }
 blazingly-openapi = { path = "crates/blazingly-openapi" }
+blazingly-queue = { path = "crates/blazingly-queue" }
+blazingly-realtime = { path = "crates/blazingly-realtime" }
+blazingly-security = { path = "crates/blazingly-security" }
+blazingly-templates = { path = "crates/blazingly-templates" }
+blazingly-validation = { path = "crates/blazingly-validation" }
+blazingly-wire = { path = "crates/blazingly-wire" }
 base64 = "0.22"
+brotli = "8"
 compio = { version = "0.17.0", default-features = false, features = [
     "io-compat",
     "io-uring",
@@ -43,15 +83,31 @@ compio = { version = "0.17.0", default-features = false, features = [
     "signal",
     "time",
 ] }
+ctrlc = { version = "3.5.0", features = ["termination"] }
 futures-lite = "2"
+futures-util = "0.3"
+flate2 = "1"
+hmac = "0.12"
 httparse = "1.10"
 httpdate = "1.0.3"
+minijinja = "2.21"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+rust_decimal = "1"
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
 serde_json = "1.0.151"
+serde_path_to_error = "0.1"
+sha2 = "0.10"
+sha1 = "0.10"
 shiguredo_http2 = "=2026.1.0-canary.6"
 syn = { version = "3.0.3", features = ["full", "parsing", "printing"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.33"
+toml = "0.9"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

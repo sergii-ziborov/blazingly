@@ -2,14 +2,16 @@
 
 use base64::Engine;
 use blazingly_core::{
-    Accepted, ApiError, ApiModel, ApiSchema, App, AppDefinition, Cookie, Created, File, Form,
-    Header, InputSource, Json, Multipart, NoContent, OperationDescriptor, OperationFailure,
-    OperationId, Path, Query, ResponseBuildError, ResponseHeader, SchemaKind,
-    SecuritySchemeDescriptor, Status, StreamingBody, TypeDescriptor, UploadFile, WithHeaders,
+    Accepted, ApiError, ApiModel, ApiSchema, App, AppDefinition, Background, BackgroundTask,
+    BodyStreamError, Cookie, Created, File, Form, Header, HttpUpgrade, InputSource, Json,
+    Multipart, NoContent, OperationDescriptor, OperationFailure, OperationId, Path, Query,
+    ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
+    StreamingBody, TypeDescriptor, UploadFile, WithHeaders,
 };
+pub use blazingly_di::DependencyError;
 use blazingly_di::{
-    CompiledProvider, DependencyError, DependencyLifetime, DependencyRequest, DependencySlot,
-    DependencyValue, Depends, Provider,
+    CompiledProvider, DependencyLifetime, DependencyRequest, DependencySlot, DependencyValue,
+    Depends, Provider,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -18,28 +20,300 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
 pub type OperationFuture = Pin<Box<dyn Future<Output = ExecutionOutcome> + 'static>>;
 const INLINE_DEPENDENCY_SLOTS: usize = 8;
-type Handler = Rc<
+type AsyncHandler = Rc<
     dyn for<'input, 'dependencies> Fn(
             InvocationInput<'input>,
             &'dependencies ResolvedDependencies<'dependencies>,
         ) -> Result<OperationFuture, ExecutionOutcome>
         + 'static,
 >;
+type SyncHandler = Rc<
+    dyn for<'input, 'dependencies> Fn(
+            InvocationInput<'input>,
+            &'dependencies ResolvedDependencies<'dependencies>,
+        ) -> Result<ExecutionOutcome, ExecutionOutcome>
+        + 'static,
+>;
+enum Handler {
+    Async(AsyncHandler),
+    Sync {
+        direct: SyncHandler,
+        fallback: AsyncHandler,
+    },
+}
+
+impl Handler {
+    fn prepare(
+        &self,
+        input: InvocationInput<'_>,
+        dependencies: &ResolvedDependencies<'_>,
+    ) -> Result<OperationFuture, ExecutionOutcome> {
+        match self {
+            Self::Async(handler) => handler(input, dependencies),
+            Self::Sync { fallback, .. } => fallback(input, dependencies),
+        }
+    }
+
+    fn invoke_sync(
+        &self,
+        input: InvocationInput<'_>,
+        dependencies: &ResolvedDependencies<'_>,
+    ) -> Option<Result<ExecutionOutcome, ExecutionOutcome>> {
+        match self {
+            Self::Async(_) => None,
+            Self::Sync { direct, .. } => Some(direct(input, dependencies)),
+        }
+    }
+}
+
 type SingletonCompilation = (Vec<Option<DependencyValue>>, Vec<Option<usize>>);
 type OperationHookFuture = Pin<Box<dyn Future<Output = Result<(), DependencyError>> + 'static>>;
 type ResponseHookFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 type OperationHook = Rc<dyn Fn(HookContext) -> OperationHookFuture>;
 type ResponseHook = Rc<dyn Fn(HookContext, HookOutcome) -> ResponseHookFuture>;
-type ShutdownHook = Rc<dyn Fn() -> OperationHookFuture>;
+type LifecycleHook = Rc<dyn Fn() -> OperationHookFuture>;
 type AbortFuture = Pin<Box<dyn Future<Output = InvocationAbort> + 'static>>;
+type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
+
+static GLOBAL_BLOCKING_POOL: OnceLock<BlockingPool> = OnceLock::new();
+
+/// Capacity and worker count for synchronous blocking handlers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockingPoolConfig {
+    workers: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
+}
+
+impl BlockingPoolConfig {
+    #[must_use]
+    pub const fn new(workers: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
+        Self {
+            workers,
+            queue_capacity,
+        }
+    }
+
+    #[must_use]
+    pub const fn workers(self) -> NonZeroUsize {
+        self.workers
+    }
+
+    #[must_use]
+    pub const fn queue_capacity(self) -> NonZeroUsize {
+        self.queue_capacity
+    }
+}
+
+impl Default for BlockingPoolConfig {
+    fn default() -> Self {
+        let workers = std::thread::available_parallelism()
+            .unwrap_or(NonZeroUsize::MIN)
+            .get()
+            .max(2);
+        Self {
+            workers: NonZeroUsize::new(workers).expect("worker count is non-zero"),
+            queue_capacity: NonZeroUsize::new(1024).expect("queue capacity is non-zero"),
+        }
+    }
+}
+
+/// A bounded process-wide pool used only by explicitly synchronous handlers.
+#[derive(Clone)]
+pub struct BlockingPool {
+    sender: SyncSender<BlockingJob>,
+}
+
+impl BlockingPool {
+    /// Starts a bounded worker pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error when a worker thread cannot be started.
+    pub fn new(config: BlockingPoolConfig) -> std::io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<BlockingJob>(config.queue_capacity.get());
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..config.workers.get() {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("blazingly-blocking-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let Ok(receiver) = receiver.lock() else {
+                                return;
+                            };
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else {
+                            return;
+                        };
+                        job();
+                    }
+                })?;
+        }
+        Ok(Self { sender })
+    }
+
+    fn submit(&self, job: BlockingJob) -> Result<(), BlockingError> {
+        self.sender.try_send(job).map_err(|error| match error {
+            TrySendError::Full(_) => BlockingError::Saturated,
+            TrySendError::Disconnected(_) => BlockingError::Unavailable,
+        })
+    }
+}
+
+impl fmt::Debug for BlockingPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockingPool")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Installs the process-wide blocking pool before the first sync invocation.
+///
+/// # Errors
+///
+/// Returns [`BlockingError::AlreadyConfigured`] after a pool has already been
+/// installed or initialized.
+pub fn install_global_blocking_pool(config: BlockingPoolConfig) -> Result<(), BlockingError> {
+    let pool = BlockingPool::new(config).map_err(|_| BlockingError::Unavailable)?;
+    GLOBAL_BLOCKING_POOL
+        .set(pool)
+        .map_err(|_| BlockingError::AlreadyConfigured)
+}
+
+/// Failure to schedule or execute a synchronous blocking handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockingError {
+    Saturated,
+    Unavailable,
+    Panicked,
+    AlreadyConfigured,
+}
+
+impl fmt::Display for BlockingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Saturated => "blocking handler queue is saturated",
+            Self::Unavailable => "blocking handler pool is unavailable",
+            Self::Panicked => "blocking handler panicked",
+            Self::AlreadyConfigured => "blocking handler pool is already configured",
+        })
+    }
+}
+
+impl std::error::Error for BlockingError {}
+
+struct BlockingState<T> {
+    result: Option<Result<T, BlockingError>>,
+    waker: Option<Waker>,
+}
+
+/// Future resolved by a bounded blocking worker.
+pub struct BlockingFuture<T> {
+    state: Arc<Mutex<BlockingState<T>>>,
+}
+
+impl<T> Future for BlockingFuture<T> {
+    type Output = Result<T, BlockingError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(result) = state.result.take() {
+            return Poll::Ready(result);
+        }
+        state.waker = Some(context.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Schedules owned synchronous work without blocking an async worker.
+#[must_use]
+pub fn run_blocking<Task, Output>(task: Task) -> BlockingFuture<Output>
+where
+    Task: FnOnce() -> Output + Send + 'static,
+    Output: Send + 'static,
+{
+    let state = Arc::new(Mutex::new(BlockingState {
+        result: None,
+        waker: None,
+    }));
+    let future = BlockingFuture {
+        state: Arc::clone(&state),
+    };
+    let pool = match global_blocking_pool() {
+        Ok(pool) => pool,
+        Err(error) => {
+            complete_blocking(&state, Err(error));
+            return future;
+        }
+    };
+    let job_state = Arc::clone(&state);
+    let job = Box::new(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
+            .map_err(|_| BlockingError::Panicked);
+        complete_blocking(&job_state, result);
+    });
+    if let Err(error) = pool.submit(job) {
+        complete_blocking(&state, Err(error));
+    }
+    future
+}
+
+fn global_blocking_pool() -> Result<&'static BlockingPool, BlockingError> {
+    if let Some(pool) = GLOBAL_BLOCKING_POOL.get() {
+        return Ok(pool);
+    }
+    let pool =
+        BlockingPool::new(BlockingPoolConfig::default()).map_err(|_| BlockingError::Unavailable)?;
+    let _ = GLOBAL_BLOCKING_POOL.set(pool);
+    GLOBAL_BLOCKING_POOL.get().ok_or(BlockingError::Unavailable)
+}
+
+fn complete_blocking<T>(state: &Arc<Mutex<BlockingState<T>>>, result: Result<T, BlockingError>) {
+    let waker = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.result = Some(result);
+        state.waker.take()
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+#[must_use]
+pub fn blocking_error_outcome(error: BlockingError) -> ExecutionOutcome {
+    match error {
+        BlockingError::Saturated => ExecutionOutcome::Rejected {
+            status: 503,
+            code: "blocking_pool_saturated".to_owned(),
+            message: error.to_string(),
+            details: None,
+        },
+        BlockingError::Unavailable | BlockingError::Panicked | BlockingError::AlreadyConfigured => {
+            ExecutionOutcome::InternalError {
+                code: "blocking_handler_failed".to_owned(),
+                message: error.to_string(),
+            }
+        }
+    }
+}
 
 struct CancellationState {
     cancelled: AtomicBool,
@@ -245,6 +519,10 @@ impl From<&ExecutionOutcome> for HookOutcome {
                 status: *status,
                 kind: HookOutcomeKind::Success,
             },
+            ExecutionOutcome::Upgrade { .. } => Self {
+                status: 101,
+                kind: HookOutcomeKind::Success,
+            },
             ExecutionOutcome::Rejected { status, .. } => Self {
                 status: *status,
                 kind: HookOutcomeKind::Rejected,
@@ -268,6 +546,107 @@ impl From<&ExecutionOutcome> for HookOutcome {
 pub trait HttpRequestParts {
     fn value(&self, source: InputSource, name: &str, index: usize) -> Option<Cow<'_, str>>;
     fn body(&self) -> &[u8];
+
+    /// Transfers an adapter-owned pull request body to a streaming extractor.
+    fn take_body_stream(&self) -> Option<StreamingBody> {
+        None
+    }
+
+    /// Returns transport context installed by HTTP middleware.
+    ///
+    /// The default keeps non-HTTP transports and existing adapters allocation
+    /// free. HTTP adapters only allocate extension storage when middleware
+    /// actually installs a value.
+    fn extension(&self, _type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        None
+    }
+}
+
+/// Pull-based request body with adapter-enforced transport limits.
+///
+/// Each `next_chunk` call is the backpressure boundary. The native adapter
+/// does not read and queue another network chunk until the handler pulls.
+#[derive(Debug)]
+pub struct UploadBody {
+    stream: StreamingBody,
+    bytes_read: u64,
+}
+
+impl UploadBody {
+    #[must_use]
+    pub fn new(stream: StreamingBody) -> Self {
+        Self {
+            stream,
+            bytes_read: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn exact_length(&self) -> Option<u64> {
+        self.stream.exact_length()
+    }
+
+    #[must_use]
+    pub const fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Pulls the next upload chunk.
+    pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, BodyStreamError>> {
+        let chunk = self.stream.next_chunk().await;
+        if let Some(Ok(bytes)) = &chunk {
+            self.bytes_read = self
+                .bytes_read
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
+        chunk
+    }
+
+    /// Deliberately buffers the remaining upload with an explicit limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a producer error or `upload_collect_limit_exceeded`.
+    pub async fn collect(mut self, limit: usize) -> Result<Vec<u8>, BodyStreamError> {
+        let mut body = Vec::new();
+        while let Some(chunk) = self.next_chunk().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > limit {
+                return Err(BodyStreamError::new(
+                    "upload_collect_limit_exceeded",
+                    format!("streaming upload exceeds the {limit}-byte collection limit"),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+}
+
+impl ApiSchema for UploadBody {
+    fn type_descriptor() -> TypeDescriptor {
+        TypeDescriptor::scalar("UploadBody", SchemaKind::Binary)
+    }
+}
+
+impl FromInvocation for UploadBody {
+    fn from_invocation(
+        input: &InvocationInput<'_>,
+        _name: &str,
+        _required: bool,
+    ) -> Result<Self, InputRejection> {
+        let InvocationInput::Http(request) = input else {
+            return Err(InputRejection::new(
+                400,
+                "streaming_input_requires_http",
+                "streaming request bodies are available only through HTTP",
+            ));
+        };
+        let stream = request
+            .take_body_stream()
+            .unwrap_or_else(|| StreamingBody::once(request.body().to_vec()));
+        Ok(Self::new(stream))
+    }
 }
 
 /// Transport-neutral values supplied to typed operation extractors.
@@ -339,6 +718,22 @@ pub struct InputRejection {
 
 impl InputRejection {
     #[must_use]
+    pub fn new(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    #[must_use]
     pub fn into_execution_outcome(self) -> ExecutionOutcome {
         ExecutionOutcome::Rejected {
             status: self.status,
@@ -362,6 +757,41 @@ pub trait FromInvocation: Sized {
         name: &str,
         required: bool,
     ) -> Result<Self, InputRejection>;
+}
+
+/// Typed request-local value installed by transport middleware.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Extension<T>(pub T);
+
+impl<T> FromInvocation for Extension<T>
+where
+    T: Clone + 'static,
+{
+    fn from_invocation(
+        input: &InvocationInput<'_>,
+        name: &str,
+        _required: bool,
+    ) -> Result<Self, InputRejection> {
+        let InvocationInput::Http(request) = input else {
+            return Err(InputRejection::new(
+                500,
+                "extension_transport_mismatch",
+                "request extension is unavailable on this transport",
+            ));
+        };
+        request
+            .extension(std::any::TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref::<T>())
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| {
+                InputRejection::new(
+                    500,
+                    "missing_request_extension",
+                    format!("request middleware did not install extension `{name}`"),
+                )
+            })
+    }
 }
 
 impl<T> FromInvocation for Json<T>
@@ -528,11 +958,17 @@ pub enum ExecutionOutcome {
         status: u16,
         headers: Vec<ResponseHeader>,
         body: Option<Vec<u8>>,
+        background: Vec<BackgroundTask>,
     },
     StreamingSuccess {
         status: u16,
         headers: Vec<ResponseHeader>,
         body: StreamingBody,
+        background: Vec<BackgroundTask>,
+    },
+    Upgrade {
+        upgrade: HttpUpgrade,
+        background: Vec<BackgroundTask>,
     },
     Rejected {
         status: u16,
@@ -550,7 +986,10 @@ pub enum ExecutionOutcome {
 impl ExecutionOutcome {
     #[must_use]
     pub const fn is_error(&self) -> bool {
-        !matches!(self, Self::Success { .. } | Self::StreamingSuccess { .. })
+        !matches!(
+            self,
+            Self::Success { .. } | Self::StreamingSuccess { .. } | Self::Upgrade { .. }
+        )
     }
 }
 
@@ -583,6 +1022,7 @@ impl OperationOutput for NoContent {
             status: 204,
             headers: Vec::new(),
             body: None,
+            background: Vec::new(),
         }
     }
 }
@@ -596,7 +1036,33 @@ impl OperationOutput for StreamingBody {
                 "application/octet-stream",
             )],
             body: self,
+            background: Vec::new(),
         }
+    }
+}
+
+impl OperationOutput for HttpUpgrade {
+    fn into_execution_outcome(self) -> ExecutionOutcome {
+        ExecutionOutcome::Upgrade {
+            upgrade: self,
+            background: Vec::new(),
+        }
+    }
+}
+
+impl<T: OperationOutput> OperationOutput for Background<T> {
+    fn into_execution_outcome(self) -> ExecutionOutcome {
+        let (response, tasks) = self.into_parts();
+        let mut outcome = response.into_execution_outcome();
+        match &mut outcome {
+            ExecutionOutcome::Success { background, .. }
+            | ExecutionOutcome::StreamingSuccess { background, .. }
+            | ExecutionOutcome::Upgrade { background, .. } => background.extend(tasks),
+            ExecutionOutcome::Rejected { .. }
+            | ExecutionOutcome::DomainError(_)
+            | ExecutionOutcome::InternalError { .. } => {}
+        }
+        outcome
     }
 }
 
@@ -612,7 +1078,8 @@ impl<const STATUS: u16, T: OperationOutput> OperationOutput for Status<STATUS, T
         match &mut outcome {
             ExecutionOutcome::Success { status, .. }
             | ExecutionOutcome::StreamingSuccess { status, .. } => *status = STATUS,
-            ExecutionOutcome::Rejected { .. }
+            ExecutionOutcome::Upgrade { .. }
+            | ExecutionOutcome::Rejected { .. }
             | ExecutionOutcome::DomainError(_)
             | ExecutionOutcome::InternalError { .. } => {}
         }
@@ -639,6 +1106,7 @@ impl<T: OperationOutput> OperationOutput for WithHeaders<T> {
                 headers: outcome_headers,
                 ..
             } => outcome_headers.extend(headers),
+            ExecutionOutcome::Upgrade { upgrade, .. } => upgrade.extend_headers(headers),
             ExecutionOutcome::DomainError(error) => error.headers.extend(headers),
             ExecutionOutcome::Rejected { .. } | ExecutionOutcome::InternalError { .. } => {}
         }
@@ -689,9 +1157,9 @@ impl ExecutableOperation {
             dependency_requests: Vec::new(),
             dependency_plan: Some(CompiledOperationDependencies::empty()),
             hooks: CompiledHooks::empty(),
-            handler: Rc::new(move |input, _| {
+            handler: Handler::Async(Rc::new(move |input, _| {
                 handler(input).map_err(InputRejection::into_execution_outcome)
-            }),
+            })),
         }
     }
 
@@ -718,7 +1186,46 @@ impl ExecutableOperation {
             dependency_requests,
             dependency_plan,
             hooks: CompiledHooks::empty(),
-            handler: Rc::new(handler),
+            handler: Handler::Async(Rc::new(handler)),
+        }
+    }
+
+    /// Creates an operation with an allocation-free synchronous fast path.
+    ///
+    /// The fallback preserves the complete async hook and cancellation
+    /// lifecycle when plugins add hooks around the operation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn typed_sync_with_dependencies<Direct, Fallback>(
+        descriptor: OperationDescriptor,
+        dependency_requests: Vec<DependencyRequest>,
+        direct: Direct,
+        fallback: Fallback,
+    ) -> Self
+    where
+        Direct: for<'input, 'dependencies> Fn(
+                InvocationInput<'input>,
+                &'dependencies ResolvedDependencies<'dependencies>,
+            ) -> Result<ExecutionOutcome, ExecutionOutcome>
+            + 'static,
+        Fallback: for<'input, 'dependencies> Fn(
+                InvocationInput<'input>,
+                &'dependencies ResolvedDependencies<'dependencies>,
+            ) -> Result<OperationFuture, ExecutionOutcome>
+            + 'static,
+    {
+        let dependency_plan = dependency_requests
+            .is_empty()
+            .then(CompiledOperationDependencies::empty);
+        Self {
+            descriptor,
+            dependency_requests,
+            dependency_plan,
+            hooks: CompiledHooks::empty(),
+            handler: Handler::Sync {
+                direct: Rc::new(direct),
+                fallback: Rc::new(fallback),
+            },
         }
     }
 
@@ -783,6 +1290,9 @@ impl ExecutableOperation {
 
     async fn invoke_input(&self, input: InvocationInput<'_>) -> ExecutionOutcome {
         let outcome = self.invoke_pipeline(input).await;
+        if self.hooks.is_empty() {
+            return outcome;
+        }
         self.hooks.on_error(&outcome).await;
         self.hooks.on_response(&outcome).await;
         outcome
@@ -796,6 +1306,9 @@ impl ExecutableOperation {
         let outcome = self.invoke_pipeline_controlled(input, &mut control).await;
         // Response hooks and dependency finalizers are cleanup. Once started,
         // they are shielded from the invocation cancellation signal.
+        if self.hooks.is_empty() {
+            return outcome;
+        }
         self.hooks.on_error(&outcome).await;
         self.hooks.on_response(&outcome).await;
         outcome
@@ -811,6 +1324,20 @@ impl ExecutableOperation {
                 "operation dependency plan was not compiled",
             );
         };
+        if self.hooks.is_empty() && plan.request_providers.is_empty() {
+            let dependencies = ResolvedDependencies {
+                singletons: &plan.singletons,
+                requests: &[],
+                slots: &plan.handler_slots,
+            };
+            if let Some(outcome) = self.handler.invoke_sync(input, &dependencies) {
+                return outcome.unwrap_or_else(|outcome| outcome);
+            }
+            return match self.handler.prepare(input, &dependencies) {
+                Ok(handler) => handler.await,
+                Err(outcome) => outcome,
+            };
+        }
         let requests = match plan.resolve().await {
             Ok(requests) => requests,
             Err(error) => return dependency_error_outcome(error),
@@ -820,6 +1347,15 @@ impl ExecutableOperation {
             requests: requests.as_slice(),
             slots: &plan.handler_slots,
         };
+        if self.hooks.is_empty()
+            && let Some(outcome) = self.handler.invoke_sync(input, &dependencies)
+        {
+            let outcome = outcome.unwrap_or_else(|outcome| outcome);
+            if let Err(finalizer_error) = plan.finalize(&requests).await {
+                return dependency_error_outcome(finalizer_error);
+            }
+            return outcome;
+        }
         if let Err(error) = self.hooks.pre_parse().await {
             if let Err(finalizer_error) = plan.finalize(&requests).await {
                 return dependency_error_outcome(finalizer_error);
@@ -832,7 +1368,7 @@ impl ExecutableOperation {
             }
             return dependency_error_outcome(error);
         }
-        let handler = match (self.handler)(input, &dependencies) {
+        let handler = match self.handler.prepare(input, &dependencies) {
             Ok(handler) => handler,
             Err(outcome) => {
                 if let Err(finalizer_error) = plan.finalize(&requests).await {
@@ -900,7 +1436,7 @@ impl ExecutableOperation {
             requests: requests.as_slice(),
             slots: &plan.handler_slots,
         };
-        let handler = match (self.handler)(input, &dependencies) {
+        let handler = match self.handler.prepare(input, &dependencies) {
             Ok(handler) => handler,
             Err(outcome) => {
                 if let Err(finalizer_error) = plan.finalize(&requests).await {
@@ -967,6 +1503,16 @@ struct HookScope {
 }
 
 impl HookScope {
+    fn is_empty(&self) -> bool {
+        self.on_request.is_empty()
+            && self.pre_parse.is_empty()
+            && self.pre_validate.is_empty()
+            && self.pre_handler.is_empty()
+            && self.pre_serialize.is_empty()
+            && self.on_error.is_empty()
+            && self.on_response.is_empty()
+    }
+
     fn inherited(&self, plugin: &PluginHooks) -> Self {
         let mut hooks = self.clone();
         hooks.on_request.extend(plugin.on_request.iter().cloned());
@@ -1016,6 +1562,10 @@ impl CompiledHooks {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.scope.is_empty()
+    }
+
     async fn on_request(&self) -> Result<(), DependencyError> {
         for hook in &self.scope.on_request {
             hook(self.context()).await?;
@@ -1054,7 +1604,9 @@ impl CompiledHooks {
     async fn on_error(&self, outcome: &ExecutionOutcome) {
         if matches!(
             outcome,
-            ExecutionOutcome::Success { .. } | ExecutionOutcome::StreamingSuccess { .. }
+            ExecutionOutcome::Success { .. }
+                | ExecutionOutcome::StreamingSuccess { .. }
+                | ExecutionOutcome::Upgrade { .. }
         ) {
             return;
         }
@@ -1229,7 +1781,8 @@ pub struct Plugin {
     operations: Vec<ExecutableOperation>,
     plugins: Vec<Self>,
     hooks: PluginHooks,
-    shutdown_hooks: Vec<ShutdownHook>,
+    startup_hooks: Vec<LifecycleHook>,
+    shutdown_hooks: Vec<LifecycleHook>,
 }
 
 impl Plugin {
@@ -1250,6 +1803,7 @@ impl Plugin {
                 on_error: Vec::new(),
                 on_response: Vec::new(),
             },
+            startup_hooks: Vec::new(),
             shutdown_hooks: Vec::new(),
         }
     }
@@ -1378,6 +1932,20 @@ impl Plugin {
             .push(Rc::new(move |context, outcome| {
                 Box::pin(hook(context, outcome))
             }));
+        self
+    }
+
+    /// Adds a fallible async application startup hook.
+    ///
+    /// Startup executes parent hooks before child hooks. A failure stops
+    /// startup before the server accepts requests.
+    #[must_use]
+    pub fn on_startup<Hook, HookFuture>(mut self, hook: Hook) -> Self
+    where
+        Hook: Fn() -> HookFuture + 'static,
+        HookFuture: Future<Output = Result<(), DependencyError>> + 'static,
+    {
+        self.startup_hooks.push(Rc::new(move || Box::pin(hook())));
         self
     }
 
@@ -1647,7 +2215,8 @@ pub struct ExecutableApp {
     definition: AppDefinition,
     operations: Vec<ExecutableOperation>,
     by_id: BTreeMap<OperationId, usize>,
-    shutdown_hooks: Vec<ShutdownHook>,
+    startup_hooks: Vec<LifecycleHook>,
+    shutdown_hooks: Vec<LifecycleHook>,
 }
 
 impl ExecutableApp {
@@ -1708,11 +2277,13 @@ impl ExecutableApp {
         let mut registrations = Vec::new();
         let mut scoped_operations = Vec::new();
         let mut security_schemes = Vec::new();
+        let mut startup_hooks = Vec::new();
         let mut shutdown_hooks = Vec::new();
         let mut collector = PluginCollector {
             registrations: &mut registrations,
             operations: &mut scoped_operations,
             security_schemes: &mut security_schemes,
+            startup_hooks: &mut startup_hooks,
             shutdown_hooks: &mut shutdown_hooks,
             overrides: &mut overrides,
         };
@@ -1758,6 +2329,7 @@ impl ExecutableApp {
             definition,
             operations,
             by_id,
+            startup_hooks,
             shutdown_hooks,
         })
     }
@@ -1825,6 +2397,19 @@ impl ExecutableApp {
         operation.invoke_controlled(input, control).await
     }
 
+    /// Runs application startup hooks in parent-before-child order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first startup hook failure and stops the remaining startup
+    /// sequence.
+    pub async fn startup(&self) -> Result<(), DependencyError> {
+        for hook in &self.startup_hooks {
+            hook().await?;
+        }
+        Ok(())
+    }
+
     /// Runs application shutdown hooks in child-before-parent order.
     ///
     /// Every hook runs even when an earlier hook fails. The first error in
@@ -1850,7 +2435,8 @@ struct PluginCollector<'collector> {
     registrations: &'collector mut Vec<ProviderRegistration>,
     operations: &'collector mut Vec<ScopedOperation>,
     security_schemes: &'collector mut Vec<SecuritySchemeDescriptor>,
-    shutdown_hooks: &'collector mut Vec<ShutdownHook>,
+    startup_hooks: &'collector mut Vec<LifecycleHook>,
+    shutdown_hooks: &'collector mut Vec<LifecycleHook>,
     overrides: &'collector mut TestOverrides,
 }
 
@@ -1868,6 +2454,7 @@ fn collect_plugin(
         operations: plugin_operations,
         plugins,
         hooks: plugin_hooks,
+        startup_hooks: plugin_startup_hooks,
         shutdown_hooks: plugin_shutdown_hooks,
     } = plugin;
     let path = if parent_path.is_empty() {
@@ -1881,6 +2468,7 @@ fn collect_plugin(
 
     let mut visible = inherited.clone();
     collector.security_schemes.extend(plugin_security_schemes);
+    collector.startup_hooks.extend(plugin_startup_hooks);
     collector.shutdown_hooks.extend(plugin_shutdown_hooks);
     let hooks = inherited_hooks.inherited(&plugin_hooks);
     let providers = collector.overrides.apply(&path, providers);
@@ -2200,6 +2788,7 @@ fn serialize_success(status: u16, value: impl Serialize) -> ExecutionOutcome {
             status,
             headers: Vec::new(),
             body: Some(body),
+            background: Vec::new(),
         },
         Err(_) => ExecutionOutcome::InternalError {
             code: "serialization_failed".to_owned(),
@@ -2674,8 +3263,16 @@ where
     if let InvocationInput::Http(request) = input
         && source == InputSource::Json
     {
-        let decoded = serde_json::from_slice::<T>(request.body())
-            .map_err(|error| decode_rejection(name, source, &error.to_string()))?;
+        let mut deserializer = serde_json::Deserializer::from_slice(request.body());
+        let decoded =
+            serde_path_to_error::deserialize::<_, T>(&mut deserializer).map_err(|error| {
+                decode_path_rejection(
+                    name,
+                    source,
+                    &error.path().to_string(),
+                    &error.inner().to_string(),
+                )
+            })?;
         return validate_decoded(decoded, source);
     }
 
@@ -2715,8 +3312,8 @@ fn raw_argument_value(
             .fields
             .iter()
             .filter_map(|field| {
-                raw_typed_value(request, source, &field.name, &field.ty)
-                    .map(|value| (field.name.clone(), value))
+                raw_field_value(request, source, field)
+                    .map(|(name, value)| (name.to_owned(), value))
             })
             .collect();
         let properties: serde_json::Map<String, Value> = properties;
@@ -2777,13 +3374,38 @@ fn select_model_fields(arguments: &Value, name: &str, descriptor: &TypeDescripto
             .fields
             .iter()
             .filter_map(|field| {
-                arguments
-                    .get(&field.name)
-                    .cloned()
-                    .map(|value| (field.name.clone(), value))
+                field_input_names(field).find_map(|field_name| {
+                    arguments
+                        .get(field_name)
+                        .cloned()
+                        .map(|value| (field_name.to_owned(), value))
+                })
             })
             .collect(),
     )
+}
+
+fn raw_field_value<'field>(
+    request: &dyn HttpRequestParts,
+    source: InputSource,
+    field: &'field blazingly_core::FieldDescriptor,
+) -> Option<(&'field str, Value)> {
+    field_input_names(field).find_map(|field_name| {
+        raw_typed_value(request, source, field_name, &field.ty).map(|value| (field_name, value))
+    })
+}
+
+fn field_input_names(field: &blazingly_core::FieldDescriptor) -> impl Iterator<Item = &str> {
+    std::iter::once(field.name.as_str()).chain(field.validation.iter().filter_map(
+        |rule| match rule {
+            blazingly_core::ValidationRule::Alias(alias) => Some(alias.as_str()),
+            blazingly_core::ValidationRule::MinLength(_)
+            | blazingly_core::ValidationRule::MaxLength(_)
+            | blazingly_core::ValidationRule::Email
+            | blazingly_core::ValidationRule::Custom(_)
+            | blazingly_core::ValidationRule::Nested => None,
+        },
+    ))
 }
 
 fn raw_typed_value(
@@ -2834,6 +3456,15 @@ fn missing_input(name: &str, source: InputSource) -> InputRejection {
 }
 
 fn decode_rejection(name: &str, source: InputSource, reason: &str) -> InputRejection {
+    decode_path_rejection(name, source, "", reason)
+}
+
+fn decode_path_rejection(
+    name: &str,
+    source: InputSource,
+    path: &str,
+    reason: &str,
+) -> InputRejection {
     let (code, message) = if source == InputSource::Json {
         ("invalid_json", "request body is not valid JSON".to_owned())
     } else {
@@ -2842,15 +3473,36 @@ fn decode_rejection(name: &str, source: InputSource, reason: &str) -> InputRejec
             format!("{} input could not be decoded", source_name(source)),
         )
     };
+    let mut details = json!({
+        "source": source_name(source),
+        "name": name,
+        "reason": reason
+    });
+    if !path.is_empty()
+        && let Some(details) = details.as_object_mut()
+    {
+        // A decode failure and a rule failure describe the same field, so they
+        // report one `violations` shape and one path syntax. `field` is kept
+        // alongside it for readers that predate the unified shape.
+        #[cfg(feature = "validation")]
+        {
+            let violations = blazingly_validation::decode_violations(path, reason);
+            details.insert(
+                "field".to_owned(),
+                Value::String(blazingly_validation::normalize_field_path(path)),
+            );
+            if let Ok(rendered) = serde_json::to_value(violations.violations()) {
+                details.insert("violations".to_owned(), rendered);
+            }
+        }
+        #[cfg(not(feature = "validation"))]
+        details.insert("field".to_owned(), Value::String(path.to_owned()));
+    }
     InputRejection {
         status: 422,
         code: code.to_owned(),
         message,
-        details: Some(json!({
-            "source": source_name(source),
-            "name": name,
-            "reason": reason
-        })),
+        details: Some(details),
     }
 }
 
@@ -2864,6 +3516,7 @@ const fn source_name(source: InputSource) -> &'static str {
         InputSource::Form => "form",
         InputSource::Multipart => "multipart",
         InputSource::File => "file",
+        InputSource::Stream => "stream",
     }
 }
 

@@ -24,3 +24,73 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features --locked
       - run: cargo check -p blazingly-contract --no-default-features --locked
+
+  # `--all-features` and `--no-default-features` alone do not exercise the
+  # combinations users actually select. Each entry below is a shape someone
+  # ships: a bare facade, one transport at a time, one ecosystem group at a
+  # time, and the realistic production superset.
+  #
+  # Library targets only. The integration tests in crates/blazingly/tests are
+  # written against the default feature set and reference `blazingly::mcp` and
+  # `blazingly::openapi` unconditionally, so `--all-targets` fails on every
+  # subset that omits those features. Widening this job to `--all-targets`
+  # requires gating those test files first; the `test` job above covers them
+  # under `--all-features`.
+  feature-combinations:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: facade, no default features
+            args: -p blazingly --no-default-features
+          - name: facade, default features
+            args: -p blazingly
+          - name: facade, all features
+            args: -p blazingly --all-features
+          - name: facade, native plaintext transport only
+            args: -p blazingly --no-default-features --features native
+          - name: facade, native TLS transport
+            args: -p blazingly --no-default-features --features native-tls
+          - name: facade, native HTTP/2 transport
+            args: -p blazingly --no-default-features --features native-http2
+          - name: facade, MCP over stdio
+            args: -p blazingly --no-default-features --features mcp-stdio
+          - name: facade, OpenTelemetry observability
+            args: -p blazingly --no-default-features --features observability-otel
+          - name: facade, ecosystem integrations
+            args: -p blazingly --no-default-features --features database,queue,templates
+          - name: facade, production superset
+            args: -p blazingly --features native-tls,native-http2,observability-otel
+          - name: native adapter, default features
+            args: -p blazingly-native
+          - name: native adapter, TLS only
+            args: -p blazingly-native --features tls
+          - name: native adapter, HTTP/2 only
+            args: -p blazingly-native --features http2
+          - name: native adapter, all features
+            args: -p blazingly-native --all-features
+          - name: observability, OpenTelemetry only
+            args: -p blazingly-observability --features otel
+          - name: contract, no_std
+            args: -p blazingly-contract --no-default-features
+    name: features (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --lib --locked ${{ matrix.args }}
+
+  # Documentation is part of the public surface, so broken intra-doc links and
+  # malformed doc attributes are build failures, not warnings.
+  rustdoc:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo doc --workspace --all-features --no-deps --locked

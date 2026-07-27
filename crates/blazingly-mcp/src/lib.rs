@@ -130,6 +130,7 @@ impl<'app> McpRuntime<'app> {
                 status,
                 headers: _,
                 body,
+                background: _,
             } => {
                 let body = body
                     .map(|body| {
@@ -144,6 +145,11 @@ impl<'app> McpRuntime<'app> {
             ExecutionOutcome::StreamingSuccess { .. } => Err(McpProtocolError {
                 code: -32_603,
                 message: "streaming HTTP responses cannot be projected as MCP tool results"
+                    .to_owned(),
+            }),
+            ExecutionOutcome::Upgrade { .. } => Err(McpProtocolError {
+                code: -32_603,
+                message: "HTTP protocol upgrades cannot be projected as MCP tool results"
                     .to_owned(),
             }),
             ExecutionOutcome::Rejected {
@@ -382,6 +388,7 @@ const fn input_source_name(source: InputSource) -> &'static str {
         InputSource::Form => "form",
         InputSource::Multipart => "multipart",
         InputSource::File => "file",
+        InputSource::Stream => "stream",
     }
 }
 
@@ -396,8 +403,22 @@ fn schema_value(descriptor: &TypeDescriptor) -> Value {
         }
         _ => schema_kind_value(&descriptor.schema),
     };
+    apply_known_string_format(&mut value, &descriptor.rust_name);
     value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
     value
+}
+
+fn apply_known_string_format(schema: &mut Value, rust_name: &str) {
+    let format = match rust_name {
+        "Uuid" => "uuid",
+        "Url" => "uri",
+        "IpAddress" => "ip",
+        "Date" => "date",
+        "DateTime" => "date-time",
+        "Decimal" => "decimal",
+        _ => return,
+    };
+    schema["format"] = Value::String(format.to_owned());
 }
 
 fn schema_kind_value(schema: &SchemaKind) -> Value {
@@ -442,6 +463,39 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
             ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
             ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
             ValidationRule::Email => schema["format"] = json!("email"),
+            ValidationRule::Alias(alias) => {
+                let aliases = schema
+                    .as_object_mut()
+                    .expect("validation schema must be an object")
+                    .entry("x-blazingly-aliases")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                aliases
+                    .as_array_mut()
+                    .expect("alias extension must be an array")
+                    .push(Value::String(alias.clone()));
+            }
+            ValidationRule::Custom(validator) => {
+                // Declarative constraints are encoded as `keyword=value` inside
+                // `Custom`; project the ones that map to a JSON Schema keyword
+                // so an agent reads the real bound, not an opaque string.
+                #[cfg(feature = "validation")]
+                if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
+                    constraint.apply_json_schema(schema);
+                    continue;
+                }
+                let validators = schema
+                    .as_object_mut()
+                    .expect("validation schema must be an object")
+                    .entry("x-blazingly-validators")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                validators
+                    .as_array_mut()
+                    .expect("validator extension must be an array")
+                    .push(Value::String(validator.clone()));
+            }
+            ValidationRule::Nested => {
+                schema["x-blazingly-nested-validation"] = Value::Bool(true);
+            }
         }
     }
 }

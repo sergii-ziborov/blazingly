@@ -3,6 +3,12 @@ name = "blazingly-native"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Native Compio HTTP/1 adapter for Blazingly, with optional rustls TLS and an experimental HTTP/2 path"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish.workspace = true
 
 [features]
@@ -15,9 +21,11 @@ blazingly-core.workspace = true
 blazingly-executor.workspace = true
 blazingly-http.workspace = true
 blazingly-openapi.workspace = true
+blazingly-wire.workspace = true
 compio.workspace = true
+ctrlc.workspace = true
 futures-lite.workspace = true
-httparse.workspace = true
+futures-util.workspace = true
 httpdate.workspace = true
 shiguredo_http2 = { workspace = true, optional = true }
 

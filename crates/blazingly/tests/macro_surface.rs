@@ -66,6 +66,33 @@ async fn macro_upsert(
     }))
 }
 
+#[get(
+    "/sync/{item_id}",
+    id = "macro.sync",
+    summary = "Exercise the synchronous operation fast path"
+)]
+fn sync_operation(Path(item_id): Path<u64>) -> Json<MacroOutput> {
+    Json(MacroOutput {
+        item_id,
+        message: "sync".to_owned(),
+    })
+}
+
+#[test]
+fn synchronous_operations_use_the_same_typed_http_surface() {
+    let executable =
+        ExecutableApp::new(routes![sync_operation]).expect("sync operation should compile");
+    let response = future::block_on(TestApp::new(&executable).call(Request::get("/sync/11")));
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .json::<serde_json::Value>()
+            .expect("sync response should be JSON"),
+        json!({ "item_id": 11, "message": "sync" })
+    );
+}
+
 #[test]
 fn universal_operation_and_provider_macros_share_http_mcp_and_di() {
     assert_eq!(

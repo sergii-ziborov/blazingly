@@ -1,0 +1,20 @@
+[package]
+name = "blazingly-queue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Runtime-neutral queue traits with an in-memory conformance adapter"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+futures-lite.workspace = true
+
+[lints]
+workspace = true

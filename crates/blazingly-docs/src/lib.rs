@@ -8,6 +8,8 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+pub use blazingly_deploy::KubernetesConfig;
+
 /// Configuration for a generated human/agent documentation bundle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocsBundleConfig {
@@ -69,13 +71,16 @@ pub struct ScaffoldConfig {
     pub package_name: String,
     pub blazingly_dependency: String,
     pub listen_address: String,
+    pub kubernetes: Option<KubernetesConfig>,
 }
 
 impl ScaffoldConfig {
     #[must_use]
     pub fn new(package_name: impl Into<String>) -> Self {
+        let package_name = package_name.into();
         Self {
-            package_name: package_name.into(),
+            kubernetes: Some(KubernetesConfig::new(&package_name)),
+            package_name,
             blazingly_dependency: format!(
                 "{{ version = \"{}\", features = [\"native\"] }}",
                 env!("CARGO_PKG_VERSION")
@@ -95,6 +100,20 @@ impl ScaffoldConfig {
     #[must_use]
     pub fn with_listen_address(mut self, address: impl Into<String>) -> Self {
         self.listen_address = address.into();
+        self
+    }
+
+    /// Replaces the generated container/Kubernetes settings.
+    #[must_use]
+    pub fn with_kubernetes(mut self, kubernetes: KubernetesConfig) -> Self {
+        self.kubernetes = Some(kubernetes);
+        self
+    }
+
+    /// Generates only the local Rust project.
+    #[must_use]
+    pub fn without_kubernetes(mut self) -> Self {
+        self.kubernetes = None;
         self
     }
 }
@@ -130,7 +149,7 @@ pub fn bundle(
     Ok(DocsBundle { files })
 }
 
-/// Generates a small native project that starts without Tokio.
+/// Generates a Tokio-free native project and optional Kubernetes deployment.
 #[must_use]
 pub fn scaffold(config: &ScaffoldConfig) -> DocsBundle {
     let cargo = format!(
@@ -139,6 +158,7 @@ pub fn scaffold(config: &ScaffoldConfig) -> DocsBundle {
             "name = \"{}\"\n",
             "version = \"0.1.0\"\n",
             "edition = \"2024\"\n\n",
+            "[workspace]\n\n",
             "[dependencies]\n",
             "blazingly = {}\n"
         ),
@@ -146,27 +166,51 @@ pub fn scaffold(config: &ScaffoldConfig) -> DocsBundle {
     );
     let main = format!(
         concat!(
-            "use blazingly::prelude::*;\n\n",
+            "use blazingly::prelude::*;\n",
+            "use std::num::NonZeroUsize;\n",
+            "use std::time::Duration;\n\n",
             "#[get(\"/health\", id = \"health.read\")]\n",
-            "async fn health() -> Json<&'static str> {{\n",
+            "fn health() -> Json<&'static str> {{\n",
             "    Json(\"ok\")\n",
             "}}\n\n",
+            "fn application() -> ExecutableApp {{\n",
+            "    ExecutableApp::new(routes![health])\n",
+            "        .expect(\"application contract should compile\")\n",
+            "}}\n\n",
             "fn main() -> std::io::Result<()> {{\n",
-            "    let app = ExecutableApp::new(routes![health])\n",
-            "        .expect(\"application contract should compile\");\n",
-            "    blazingly::native::Server::new(app)\n",
+            "    let address = std::env::var(\"BLAZINGLY_LISTEN_ADDRESS\")\n",
+            "        .unwrap_or_else(|_| \"{}\".to_owned());\n",
+            "    let workers = std::env::var(\"BLAZINGLY_WORKERS\")\n",
+            "        .ok()\n",
+            "        .and_then(|value| value.parse::<NonZeroUsize>().ok())\n",
+            "        .or_else(|| std::thread::available_parallelism().ok())\n",
+            "        .unwrap_or(NonZeroUsize::MIN);\n",
+            "    let max_requests_per_connection =\n",
+            "        std::env::var(\"BLAZINGLY_MAX_REQUESTS_PER_CONNECTION\")\n",
+            "            .ok()\n",
+            "            .and_then(|value| value.parse::<NonZeroUsize>().ok());\n",
+            "    let limits = blazingly::native::ServerLimits::new()\n",
+            "        .with_max_requests_per_connection(max_requests_per_connection);\n",
+            "    let (_shutdown, signal) = blazingly::native::termination_channel()?;\n",
+            "    blazingly::native::MulticoreServer::new(workers, application)\n",
+            "        .with_limits(limits)\n",
             "        .with_openapi(blazingly::openapi::OpenApiConfig::default())\n",
-            "        .serve(\"{}\")\n",
+            "        .serve_gracefully(address, signal, Duration::from_secs(25))\n",
             "}}\n"
         ),
         config.listen_address
     );
-    DocsBundle {
-        files: BTreeMap::from([
-            ("Cargo.toml".to_owned(), cargo),
-            ("src/main.rs".to_owned(), main),
-        ]),
+    let mut files = BTreeMap::from([
+        ("Cargo.toml".to_owned(), cargo),
+        ("src/main.rs".to_owned(), main),
+    ]);
+    if let Some(kubernetes) = &config.kubernetes {
+        files.extend(blazingly_deploy::scaffold_files(
+            &config.package_name,
+            kubernetes,
+        ));
     }
+    DocsBundle { files }
 }
 
 /// Generates concise Markdown describing every public API operation.
@@ -347,13 +391,18 @@ fn http_examples(app: &AppDefinition, config: &DocsBundleConfig) -> String {
         if let Some(body) = operation.contract.inputs.iter().find(|input| {
             matches!(
                 input.source,
-                InputSource::Json | InputSource::Form | InputSource::Multipart | InputSource::File
+                InputSource::Json
+                    | InputSource::Form
+                    | InputSource::Multipart
+                    | InputSource::File
+                    | InputSource::Stream
             )
         }) {
             let media_type = match body.source {
                 InputSource::Json => "application/json",
                 InputSource::Form => "application/x-www-form-urlencoded",
                 InputSource::Multipart | InputSource::File => "multipart/form-data",
+                InputSource::Stream => "application/octet-stream",
                 _ => unreachable!("body input was selected above"),
             };
             let _ = write!(
@@ -619,6 +668,7 @@ const fn input_source_name(source: InputSource) -> &'static str {
         InputSource::Form => "Form",
         InputSource::Multipart => "Multipart",
         InputSource::File => "File",
+        InputSource::Stream => "Stream",
     }
 }
 
@@ -645,6 +695,23 @@ fn write_model(output: &mut String, model: &ModelDescriptor) {
                     let _ = write!(output, ", max length {value}");
                 }
                 ValidationRule::Email => output.push_str(", email"),
+                ValidationRule::Alias(alias) => {
+                    let _ = write!(output, ", alias `{alias}`");
+                }
+                ValidationRule::Custom(validator) => {
+                    // A declarative constraint reads better as its own keyword
+                    // than as an opaque validator name.
+                    #[cfg(feature = "validation")]
+                    let rendered = blazingly_validation::Constraint::parse(validator)
+                        .map(|constraint| constraint.to_string());
+                    #[cfg(not(feature = "validation"))]
+                    let rendered: Option<String> = None;
+                    let _ = match rendered {
+                        Some(constraint) => write!(output, ", {constraint}"),
+                        None => write!(output, ", validator `{validator}`"),
+                    };
+                }
+                ValidationRule::Nested => output.push_str(", nested validation"),
             }
         }
         output.push('\n');
@@ -751,7 +818,31 @@ mod tests {
             scaffold
                 .file("src/main.rs")
                 .unwrap()
-                .contains("blazingly::native::Server")
+                .contains("blazingly::native::MulticoreServer")
+        );
+        assert!(
+            scaffold
+                .file("src/main.rs")
+                .unwrap()
+                .contains("termination_channel")
+        );
+        assert!(
+            scaffold
+                .file("deploy/kubernetes/base/hpa.yaml")
+                .unwrap()
+                .contains("apiVersion: autoscaling/v2")
+        );
+        assert!(
+            scaffold
+                .file("deploy/kubernetes/overlays/direct/service-load-balancer.yaml")
+                .unwrap()
+                .contains("type: LoadBalancer")
+        );
+        assert!(
+            scaffold
+                .file("deploy/kubernetes/overlays/nginx/ingress.yaml")
+                .unwrap()
+                .contains("ingressClassName: nginx")
         );
     }
 }

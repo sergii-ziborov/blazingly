@@ -1,0 +1,134 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
+  # `unsafe_code` is forbidden workspace-wide, so neither of the two jobs below
+  # is looking for unsafe blocks in Blazingly. They exist to catch undefined
+  # behaviour in the dependency stacks the framework drives, and to catch
+  # aliasing and initialisation mistakes in the buffer handling those stacks
+  # hand back to safe code.
+  #
+  # Miri covers crates whose tests are pure computation over in-memory buffers.
+  # It cannot cover blazingly-native: Compio reaches io_uring and IOCP through
+  # foreign functions that Miri does not implement, so that crate is covered by
+  # AddressSanitizer below instead.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo +nightly miri test -p blazingly-wire -p blazingly-queue
+
+  # AddressSanitizer covers the crates that run against real sockets, real
+  # timers, and third-party protocol codecs. blazingly-native is the important
+  # one: it owns every socket read and write, the pipelined-response write
+  # coalescing buffers, the cached `Date` header, and the only dependency tree
+  # in the workspace that contains a native I/O runtime (Compio), TLS (ring,
+  # rustls), and a canary HTTP/2 codec.
+  #
+  # blazingly-native runs on default features here. `tls` pulls ring, whose
+  # assembly cannot be instrumented by `-Zbuild-std`, so a TLS-enabled
+  # sanitizer run would report the sanitizer's own blind spots rather than the
+  # adapter's.
+  address-sanitizer:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p blazingly-native -p blazingly-wire -p blazingly-http -p blazingly-realtime
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - working-directory: fuzz
+        run: |
+          mkdir -p corpus/http1_request corpus/chunked_stream
+          printf 'GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n' > corpus/http1_request/keep-alive
+          printf '5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n' > corpus/chunked_stream/body
+      - working-directory: fuzz
+        run: cargo +nightly fuzz run http1_request -- -max_total_time=30
+      - working-directory: fuzz
+        run: cargo +nightly fuzz run chunked_stream -- -max_total_time=30
+
+  contract-semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - working-directory: crates/blazingly-contract
+        run: |
+          git fetch --tags --force origin
+          baseline="$(git describe --tags --abbrev=0 HEAD^)"
+          cargo semver-checks check-release --baseline-rev "$baseline"
+
+  # Advisory, not a gate. docs/stability.md classifies the framework Rust API
+  # as experimental: a pre-1.0 minor release may break it as long as the change
+  # is documented. This job exists so the break is visible in review and lands
+  # in CHANGELOG.md, and it must become blocking before 1.0. contract-semver
+  # above stays the hard gate. Binary-only crates are excluded because they
+  # have no library surface to compare.
+  workspace-semver:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - name: Report workspace API changes against the base revision
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          baseline="$BASE_SHA"
+          if [ -z "$baseline" ]; then
+            baseline="$(git rev-parse --verify --quiet HEAD^ || true)"
+          fi
+          if [ -z "$baseline" ]; then
+            echo "no baseline revision available; nothing to compare"
+            exit 0
+          fi
+          cargo semver-checks check-release \
+            --workspace \
+            --exclude blazingly-contract \
+            --exclude blazingly-wire-standalone \
+            --exclude cargo-blazingly \
+            --baseline-rev "$baseline"

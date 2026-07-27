@@ -1,0 +1,15 @@
+[package]
+name = "blazingly-deploy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Container and Kubernetes deployment scaffold generation for a single Blazingly application"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

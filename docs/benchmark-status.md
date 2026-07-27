@@ -4,6 +4,12 @@ An executable socket harness now lives in the separate
 `blazingly-benchmarks` repository. This keeps Axum's Tokio/Hyper stack, Actix
 Web, Node.js, and future Python dependencies out of the framework workspace.
 
+Current status: the `80,000` req/s acceptance gate is not met, and Actix Web is
+ahead of Blazingly on both throughput and tail latency. See
+"2026-07-27 competitor matrix, validated scenario" below. Everything between
+here and that section is a historical checkpoint or a transport
+microbenchmark, and none of it supersedes that result.
+
 The first Windows development checkpoint compared one-worker typed JSON over
 real HTTP/1 sockets with 128 persistent connections for 10 seconds. One
 observed run produced 23,268.66 req/s for the former async-net Blazingly
@@ -38,6 +44,67 @@ records a three-sample CPU preflight and can reject a busy host. No public
 Blazingly-versus-Axum/Actix win is claimed until the equivalent-wire run is
 repeated on an idle host.
 
+## 2026-07-27 pipelined validated diagnostic
+
+The high-load client now verifies every HTTP status and `Content-Length` while
+keeping a configurable number of requests in flight on each connection. On the
+same Windows 11 loopback machine, with four server workers, 32 connections,
+pipeline depth 16, and a five-second sample, the native adapter produced:
+
+| Native write mode | Requests/second | Errors | Host CPU before launch |
+| --- | ---: | ---: | ---: |
+| one response per write | 120,375.90 | 0 | 28.9% |
+| bounded batch, at most 16 responses | 760,329.74 | 0 | 29.8% |
+
+This matched-load change is a 6.32x improvement. It comes from bounded
+response-write coalescing on top of direct plaintext Compio I/O, not from
+skipping parsing, validation, authorization, dependency injection, handler
+execution, or typed serialization.
+
+The same client/configuration observed 602,261.85 req/s for Actix Web and
+100,738.21 req/s for Axum, both with zero errors. A larger Blazingly stretch
+sample reached 1,016,765.53 req/s with eight workers, 64 connections, and
+pipeline depth 32. The corresponding competitor samples ran under materially
+different host preflight load, so that larger set is not a fair ranking.
+
+The ordinary single-in-flight `go-wrk` sample remained 74,781.37 req/s. The
+6.32x result therefore applies specifically to high-load HTTP/1 pipelining; it
+is not presented as a universal per-request or latency improvement. All values
+are local engineering diagnostics, not publishable cross-platform claims. Raw
+evidence and the exact comparison table live in the benchmark repository.
+
+## 2026-07-27 competitor matrix, validated scenario
+
+This is the current headline result and it supersedes every throughput claim
+above for the validated scenario. Four server workers, 128 connections, one
+request in flight per connection, on the same Windows 11 loopback host. The
+host was not idle. Medians of the sampled runs:
+
+| Framework | Requests/second (median) | p50 | p99 | p99.9 |
+| --- | ---: | ---: | ---: | ---: |
+| Actix Web | 74,886 | 944us | 2.093ms | 3.197ms |
+| Blazingly | 65,650 | 1.028ms | 3.631ms | 10.101ms |
+| Axum | 47,174 | - | - | - |
+| FastAPI | 3,646 | - | - | - |
+
+Read plainly:
+
+- **The `80,000` req/s acceptance gate is NOT met.** Blazingly reached 65,650
+  req/s, 82% of the gate. Closing it requires a further 21.9%.
+- **Actix Web is ahead of Blazingly on both throughput and tail latency.** It
+  is 14.1% faster, its p99 is 1.73x lower, and its p99.9 is 3.16x lower.
+  Blazingly's p99.9 of 10.101ms is the worst number in this table.
+- Blazingly is ahead of Axum by 39.2% and ahead of FastAPI by 18.0x. Beating
+  Axum and FastAPI does not substitute for the two statements above.
+- The host was not idle, and no competitor reached 80,000 req/s on it. That is
+  context for a rerun, not a defence of the result: the gate is absolute, the
+  run was matched-load, and Actix Web won it on the same machine at the same
+  time.
+
+No "faster than Actix Web" statement may be made. The idle-host rerun, the
+allocation and RSS figures required by the measurement contract below, and a
+tail-latency investigation are all outstanding.
+
 ## Fair baselines
 
 | Target | Required baseline |
@@ -55,16 +122,16 @@ result.
 
 | Workload | Blazingly status | Benchmark status |
 | --- | --- | --- |
-| Plaintext HTTP | Compio HTTP/1 plus balanced multicore launcher and cached `Date` implemented | narrow transport median crossed 80k before equivalent-wire rerun; strict idle-host matrix pending |
+| Plaintext HTTP | direct Compio HTTP/1 plus balanced multicore launcher, cached `Date`, and bounded pipelined-response coalescing implemented | validated pipeline crossed 1M in a stretch sample; strict idle-host matrix and latency percentiles pending |
 | HTTP/1 chunked request | implemented with decoded-size/chunk limits | scenario missing |
 | TLS | optional Compio/rustls adapter implemented | handshake/throughput scenarios missing |
 | HTTP/2 | experimental Sans-I/O adapter implemented | multiplexing conformance only; benchmark missing |
 | Small/large JSON HTTP | borrowed native request and single response serialization | small typed JSON baseline runs |
-| Validated JSON operation | implemented in the shared executor | equivalent Blazingly/Axum/Actix/Fastify/FastAPI scenario implemented; clean-host matrix pending |
+| Validated JSON operation | implemented in the shared executor | 2026-07-27 matrix run: 65,650 req/s median, behind Actix Web on throughput and tail latency, acceptance gate not met; idle-host rerun pending |
 | Typed domain error | implemented in the shared executor | harness missing |
 | Path/query/header extraction | implemented with typed multiple arguments | harness missing |
 | 1/10 dependencies | compiled numeric per-operation plans; inline slots for small graphs | one dependency/state scenario implemented; 10-dependency case missing |
-| Authorization | typed header plus shared error projection | bearer-header scenario implemented; clean-host matrix pending |
+| Authorization | typed header plus shared error projection | bearer-header scenario runs inside the 2026-07-27 validated matrix; idle-host rerun pending |
 | 1/10 hooks | inherited compiled async hooks implemented | harness missing |
 | MCP discovery | implemented | harness missing |
 | MCP tool call | implemented through JSON-RPC and stdio | harness missing |
@@ -87,10 +154,13 @@ Hello-world routing is a secondary microbenchmark.
 ## Acceptance gates
 
 - `80,000` comparable validated JSON requests/second is the minimum native
-  adapter acceptance gate, not a marketing result.
+  adapter acceptance gate, not a marketing result. **Status as of 2026-07-27:
+  not met.** The validated scenario measured 65,650 req/s.
 - A public "faster than Axum/Actix" statement requires reproducible wins for
   equivalent routing, extraction, validation, handler, and serialization
-  workloads, including p95/p99 and allocations.
+  workloads, including p95/p99 and allocations. **Status as of 2026-07-27: not
+  earned against Actix Web**, which leads on throughput and on every measured
+  latency percentile.
 - Million-request-per-second experiments are a stretch profile. They must
   report cores, connection count, payload size, load-generator headroom, NIC,
   operating system, and whether the number is in-process or socket-level.

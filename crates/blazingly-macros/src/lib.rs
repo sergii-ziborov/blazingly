@@ -5,7 +5,7 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Fields, FnArg, Ident, ItemEnum, ItemFn, ItemStruct, LitBool, LitInt, LitStr, Pat,
-    PatType, ReturnType, Token, Type, TypePath, bracketed, parse_macro_input,
+    PatType, Path as SynPath, ReturnType, Token, Type, TypePath, bracketed, parse_macro_input,
 };
 
 struct OperationArgs {
@@ -53,29 +53,123 @@ struct McpArgs {
 #[derive(Default)]
 struct ModelArgs {
     rename_all: Option<LitStr>,
+    validator: Option<SynPath>,
 }
 
 impl Parse for ModelArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(Self::default());
+        let mut arguments = Self::default();
+
+        while !input.is_empty() {
+            let key = input.parse::<Ident>()?;
+            input.parse::<Token![=]>()?;
+
+            match key.to_string().as_str() {
+                "rename_all" => {
+                    if arguments.rename_all.is_some() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "`rename_all` was specified twice",
+                        ));
+                    }
+                    arguments.rename_all = Some(input.parse::<LitStr>()?);
+                }
+                "validate_with" => {
+                    if arguments.validator.is_some() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "only one model `validate_with` function may be declared",
+                        ));
+                    }
+                    arguments.validator = Some(input.parse::<SynPath>()?);
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "the supported model options are `rename_all` and `validate_with`",
+                    ));
+                }
+            }
+
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
         }
 
-        let key = input.parse::<Ident>()?;
-        if key != "rename_all" {
-            return Err(syn::Error::new(
-                key.span(),
-                "the supported model option is `rename_all`",
-            ));
+        Ok(arguments)
+    }
+}
+
+/// A declarative numeric bound written as an attribute literal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NumericLiteral {
+    Integer(i128),
+    Float(f64),
+}
+
+impl NumericLiteral {
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Integer(value) => {
+                let literal = proc_macro2::Literal::i128_suffixed(value);
+                quote!(::blazingly::validation::NumericValue::Integer(#literal))
+            }
+            Self::Float(value) => {
+                let literal = proc_macro2::Literal::f64_suffixed(value);
+                quote!(::blazingly::validation::NumericValue::Float(#literal))
+            }
         }
-        input.parse::<Token![=]>()?;
-        let rename_all = input.parse::<LitStr>()?;
-        if !input.is_empty() {
-            return Err(input.error("unexpected model option"));
+    }
+
+    fn encoded(self) -> String {
+        match self {
+            Self::Integer(value) => value.to_string(),
+            Self::Float(value) if value.fract() == 0.0 => format!("{value:.1}"),
+            Self::Float(value) => value.to_string(),
         }
-        Ok(Self {
-            rename_all: Some(rename_all),
-        })
+    }
+
+    // Comparing a mixed integer and float pair follows JSON Schema semantics.
+    #[allow(clippy::cast_precision_loss)]
+    fn widened(self) -> f64 {
+        match self {
+            Self::Integer(value) => value as f64,
+            Self::Float(value) => value,
+        }
+    }
+
+    fn exceeds(self, other: Self) -> bool {
+        if let (Self::Integer(left), Self::Integer(right)) = (self, other) {
+            return left > right;
+        }
+        self.widened() > other.widened()
+    }
+
+    fn is_zero(self) -> bool {
+        match self {
+            Self::Integer(value) => value == 0,
+            Self::Float(value) => value == 0.0,
+        }
+    }
+}
+
+/// The syntactic value shape a field's declarative rules are checked against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldShape {
+    Text,
+    Integer,
+    Float,
+    Collection,
+    Other,
+}
+
+impl FieldShape {
+    const fn is_numeric(self) -> bool {
+        matches!(self, Self::Integer | Self::Float)
+    }
+
+    const fn may_be_model(self) -> bool {
+        matches!(self, Self::Collection | Self::Other)
     }
 }
 
@@ -83,7 +177,19 @@ impl Parse for ModelArgs {
 struct FieldRules {
     min_length: Option<(usize, proc_macro2::Span)>,
     max_length: Option<(usize, proc_macro2::Span)>,
-    email: bool,
+    email: Option<proc_macro2::Span>,
+    aliases: Vec<LitStr>,
+    validator: Option<SynPath>,
+    nested: bool,
+    minimum: Option<(NumericLiteral, proc_macro2::Span)>,
+    maximum: Option<(NumericLiteral, proc_macro2::Span)>,
+    exclusive_minimum: Option<(NumericLiteral, proc_macro2::Span)>,
+    exclusive_maximum: Option<(NumericLiteral, proc_macro2::Span)>,
+    multiple_of: Option<(NumericLiteral, proc_macro2::Span)>,
+    pattern: Option<LitStr>,
+    min_items: Option<(usize, proc_macro2::Span)>,
+    max_items: Option<(usize, proc_macro2::Span)>,
+    unique_items: Option<proc_macro2::Span>,
 }
 
 struct OperationOutput {
@@ -102,6 +208,9 @@ enum OperationInputKind {
     Form,
     Multipart,
     File,
+    Stream,
+    WebSocket,
+    Extension,
     Dependency,
     DirectDependency,
 }
@@ -401,7 +510,7 @@ pub fn api_model(arguments: TokenStream, item: TokenStream) -> TokenStream {
     let arguments = parse_macro_input!(arguments as ModelArgs);
     let mut model = parse_macro_input!(item as ItemStruct);
 
-    match model_tokens(arguments, &mut model) {
+    match model_tokens(&arguments, &mut model) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.into_compile_error().into(),
     }
@@ -594,16 +703,20 @@ fn operation_tokens(
     function: &mut ItemFn,
     method: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    if function.sig.asyncness.is_none() {
-        return Err(syn::Error::new_spanned(
-            function.sig.fn_token,
-            "Blazingly operations must be async functions",
-        ));
-    }
-
+    let asynchronous = function.sig.asyncness.is_some();
     let mcp = take_mcp_arguments(&mut function.attrs)?;
     let security = take_security_arguments(&mut function.attrs)?;
     let inputs = operation_inputs(&function.sig.inputs)?;
+    if mcp.is_some()
+        && let Some(stream) = inputs
+            .iter()
+            .find(|input| matches!(input.kind, OperationInputKind::Stream))
+    {
+        return Err(syn::Error::new_spanned(
+            &stream.argument_type,
+            "streaming request bodies are HTTP-only and cannot be exposed as an MCP tool",
+        ));
+    }
     let output = operation_output(&function.sig.output)?;
     let function_name = &function.sig.ident;
     let descriptor_module = format_ident!("{function_name}");
@@ -667,7 +780,7 @@ fn operation_tokens(
             }
         },
     );
-    let executable = operation_executable(&inputs, function_name);
+    let executable = operation_executable(&inputs, function_name, asynchronous);
 
     Ok(quote! {
         #function
@@ -712,67 +825,102 @@ fn operation_tokens(
 fn operation_executable(
     inputs: &[OperationInput],
     function_name: &Ident,
+    asynchronous: bool,
 ) -> proc_macro2::TokenStream {
     let mut dependency_index = 0_usize;
-    let extracted_arguments = inputs.iter().enumerate().map(|(index, input)| {
-        let binding = format_ident!("__blazingly_argument_{index}");
-        if input.kind.is_dependency() {
-            let inner = &input.inner;
-            let index = dependency_index;
-            dependency_index += 1;
-            if matches!(input.kind, OperationInputKind::Dependency) {
-                quote! {
-                    let #binding = dependencies
-                        .get::<#inner>(#index)
-                        .map_err(::blazingly::dependency_error_outcome)?;
+    let extracted_arguments = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let binding = format_ident!("__blazingly_argument_{index}");
+            if input.kind.is_dependency() {
+                let inner = &input.inner;
+                let index = dependency_index;
+                dependency_index += 1;
+                if matches!(input.kind, OperationInputKind::Dependency) {
+                    quote! {
+                        let #binding = dependencies
+                            .get::<#inner>(#index)
+                            .map_err(::blazingly::dependency_error_outcome)?;
+                    }
+                } else {
+                    quote! {
+                        let #binding = dependencies
+                            .get_cloned::<#inner>(#index)
+                            .map_err(::blazingly::dependency_error_outcome)?;
+                    }
                 }
             } else {
+                let argument_type = &input.argument_type;
+                let name = &input.name;
+                let required = input.required;
                 quote! {
-                    let #binding = dependencies
-                        .get_cloned::<#inner>(#index)
-                        .map_err(::blazingly::dependency_error_outcome)?;
+                    let #binding = <#argument_type as ::blazingly::FromInvocation>::from_invocation(
+                        &input,
+                        #name,
+                        #required,
+                    )
+                    .map_err(::blazingly::InputRejection::into_execution_outcome)?;
                 }
             }
-        } else {
-            let argument_type = &input.argument_type;
-            let name = &input.name;
-            let required = input.required;
-            quote! {
-                let #binding = <#argument_type as ::blazingly::FromInvocation>::from_invocation(
-                    &input,
-                    #name,
-                    #required,
-                )
-                .map_err(::blazingly::InputRejection::into_execution_outcome)?;
-            }
-        }
-    });
+        })
+        .collect::<Vec<_>>();
     let dependency_requests = inputs
         .iter()
         .filter(|input| input.kind.is_dependency())
         .map(|input| {
             let inner = &input.inner;
             quote!(::blazingly::DependencyRequest::of::<#inner>())
-        });
-    let handler_arguments = (0..inputs.len()).map(|index| {
-        let binding = format_ident!("__blazingly_argument_{index}");
-        quote!(#binding)
-    });
-    quote! {
-        ::blazingly::ExecutableOperation::typed_with_dependencies(
-            descriptor(),
-            ::std::vec![#(#dependency_requests),*],
-            |input, dependencies| {
-                #(#extracted_arguments)*
-                let output = super::#function_name(#(#handler_arguments),*);
-                ::core::result::Result::Ok(
-                    ::std::boxed::Box::pin(async move {
-                        let output = output.await;
-                        ::blazingly::OperationOutput::into_execution_outcome(output)
-                    }) as ::blazingly::OperationFuture
-                )
-            },
-        )
+        })
+        .collect::<Vec<_>>();
+    let handler_arguments = (0..inputs.len())
+        .map(|index| {
+            let binding = format_ident!("__blazingly_argument_{index}");
+            quote!(#binding)
+        })
+        .collect::<Vec<_>>();
+
+    if asynchronous {
+        quote! {
+            ::blazingly::ExecutableOperation::typed_with_dependencies(
+                descriptor(),
+                ::std::vec![#(#dependency_requests),*],
+                |input, dependencies| {
+                    #(#extracted_arguments)*
+                    let output = super::#function_name(#(#handler_arguments),*);
+                    ::core::result::Result::Ok(
+                        ::std::boxed::Box::pin(async move {
+                            let output = output.await;
+                            ::blazingly::OperationOutput::into_execution_outcome(output)
+                        }) as ::blazingly::OperationFuture
+                    )
+                },
+            )
+        }
+    } else {
+        quote! {
+            ::blazingly::ExecutableOperation::typed_with_dependencies(
+                descriptor(),
+                ::std::vec![#(#dependency_requests),*],
+                |input, dependencies| {
+                    #(#extracted_arguments)*
+                    ::core::result::Result::Ok(
+                        ::std::boxed::Box::pin(async move {
+                            match ::blazingly::run_blocking(move || {
+                                super::#function_name(#(#handler_arguments),*)
+                            }).await {
+                                ::core::result::Result::Ok(output) => {
+                                    ::blazingly::OperationOutput::into_execution_outcome(output)
+                                }
+                                ::core::result::Result::Err(error) => {
+                                    ::blazingly::blocking_error_outcome(error)
+                                }
+                            }
+                        }) as ::blazingly::OperationFuture
+                    )
+                },
+            )
+        }
     }
 }
 
@@ -985,8 +1133,9 @@ fn validate_response_header(name: &LitStr, value: &LitStr) -> syn::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn model_tokens(
-    arguments: ModelArgs,
+    arguments: &ModelArgs,
     model: &mut ItemStruct,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let Fields::Named(fields) = &mut model.fields else {
@@ -996,60 +1145,64 @@ fn model_tokens(
         ));
     };
 
-    let rename_rule = model_rename_rule(&arguments)?;
+    let rename_rule = model_rename_rule(arguments)?;
 
     let mut descriptors = Vec::new();
     let mut validations = Vec::new();
+    let mut needs_probes = false;
 
     for field in &mut fields.named {
         let identifier = field
             .ident
-            .as_ref()
+            .clone()
             .expect("named fields always have identifiers");
-        let rules = take_field_rules(&mut field.attrs)?;
+        let mut rules = take_field_rules(&mut field.attrs)?;
+        for alias in &rules.aliases {
+            field
+                .attrs
+                .push(syn::parse_quote!(#[serde(alias = #alias)]));
+        }
         let field_type = &field.ty;
         let optional = wrapper_inner(field_type, "Option");
         let validation_type = optional.as_ref().unwrap_or(field_type);
+        let shape = field_shape(validation_type);
+        reject_incompatible_rules(&rules, validation_type, shape)?;
+        normalize_collection_rules(&mut rules, shape);
+        needs_probes |= shape.may_be_model();
+
         let public_name = if rename_rule == "camelCase" {
             snake_to_camel(&identifier.to_string())
         } else {
             identifier.to_string()
         };
         let public_name = LitStr::new(&public_name, identifier.span());
-        let mut rule_descriptors = Vec::new();
-
-        if let Some((minimum, _)) = rules.min_length {
-            rule_descriptors.push(quote!(::blazingly::ValidationRule::MinLength(#minimum)));
-        }
-        if let Some((maximum, _)) = rules.max_length {
-            rule_descriptors.push(quote!(::blazingly::ValidationRule::MaxLength(#maximum)));
-        }
-        if rules.email {
-            rule_descriptors.push(quote!(::blazingly::ValidationRule::Email));
-        }
-
-        if !rule_descriptors.is_empty() && !is_string_type(validation_type) {
-            return Err(syn::Error::new_spanned(
-                validation_type,
-                "length and email validation currently require `String` or `Option<String>`",
-            ));
-        }
 
         let required = optional.is_none();
+        let declared_rules = rule_descriptors(&rules);
+        let nested_descriptor = nested_rule_descriptor(validation_type, shape, rules.nested);
         descriptors.push(quote! {
             ::blazingly::FieldDescriptor::new(
                 #public_name,
                 #required,
                 <#field_type as ::blazingly::ApiSchema>::type_descriptor(),
-                ::std::vec![#(#rule_descriptors),*],
+                {
+                    let mut rules = ::std::vec![#(#declared_rules),*];
+                    #nested_descriptor
+                    rules
+                },
             )
         });
 
-        let checks = validation_checks(identifier, &public_name, &rules);
+        let checks = field_checks(&rules, shape, &public_name);
+        let nested_checks = nested_validation_checks(shape, &public_name, &rules);
+        if checks.is_empty() && nested_checks.is_empty() {
+            continue;
+        }
         if optional.is_some() {
             validations.push(quote! {
                 if let ::core::option::Option::Some(value) = &self.#identifier {
                     #checks
+                    #nested_checks
                 }
             });
         } else {
@@ -1057,6 +1210,7 @@ fn model_tokens(
                 {
                     let value = &self.#identifier;
                     #checks
+                    #nested_checks
                 }
             });
         }
@@ -1065,7 +1219,20 @@ fn model_tokens(
     let model_name = &model.ident;
     let serde_rename = arguments
         .rename_all
+        .as_ref()
         .map_or_else(|| quote!(), |rename| quote!(#[serde(rename_all = #rename)]));
+    let model_validation = arguments.validator.as_ref().map(|validator| {
+        quote! {
+            if let ::core::result::Result::Err(failure) = #validator(self) {
+                ::blazingly::validation::merge_model_violations(&mut errors, failure);
+            }
+        }
+    });
+    let probes = if needs_probes {
+        nested_probe_definitions()
+    } else {
+        quote!()
+    };
 
     Ok(quote! {
         #[derive(
@@ -1076,28 +1243,204 @@ fn model_tokens(
         #serde_rename
         #model
 
-        impl ::blazingly::ApiModel for #model_name {
-            fn model_descriptor() -> ::blazingly::ModelDescriptor {
-                ::blazingly::ModelDescriptor::new(
-                    stringify!(#model_name),
-                    ::std::vec![#(#descriptors),*],
-                )
+        const _: () = {
+            #probes
+
+            impl ::blazingly::ApiModel for #model_name {
+                fn model_descriptor() -> ::blazingly::ModelDescriptor {
+                    ::blazingly::ModelDescriptor::new(
+                        stringify!(#model_name),
+                        ::std::vec![#(#descriptors),*],
+                    )
+                }
+
+                fn validate(
+                    &self,
+                ) -> ::core::result::Result<(), ::blazingly::ValidationErrors> {
+                    let mut errors = ::blazingly::ValidationErrors::new();
+                    #(#validations)*
+                    #model_validation
+
+                    if errors.is_empty() {
+                        ::core::result::Result::Ok(())
+                    } else {
+                        ::core::result::Result::Err(errors)
+                    }
+                }
             }
+        };
+    })
+}
 
-            fn validate(
+/// Emits the autoref-specialization probes that drive recursion into models.
+///
+/// The specialized trait is implemented for the probe itself and therefore wins
+/// method resolution whenever the field type implements `ApiModel`. Otherwise
+/// resolution falls through to the reference impl, which does nothing.
+fn nested_probe_definitions() -> proc_macro2::TokenStream {
+    let value = value_probe_definitions();
+    let items = items_probe_definitions();
+    let kind = kind_probe_definitions();
+    quote! {
+        #[allow(dead_code)]
+        struct __BlazinglyValue<'probe, T>(&'probe T);
+        #[allow(dead_code)]
+        struct __BlazinglyItems<'probe, T>(&'probe [T]);
+        #[allow(dead_code)]
+        struct __BlazinglyKind<T>(::core::marker::PhantomData<T>);
+
+        #value
+        #items
+        #kind
+    }
+}
+
+fn value_probe_definitions() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(dead_code)]
+        trait __BlazinglyNestedValue {
+            fn __blazingly_nested(
                 &self,
-            ) -> ::core::result::Result<(), ::blazingly::ValidationErrors> {
-                let mut errors = ::blazingly::ValidationErrors::new();
-                #(#validations)*
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
 
-                if errors.is_empty() {
-                    ::core::result::Result::Ok(())
-                } else {
-                    ::core::result::Result::Err(errors)
+        impl<T: ::blazingly::ApiModel> __BlazinglyNestedValue for __BlazinglyValue<'_, T> {
+            fn __blazingly_nested(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            ) {
+                if let ::core::result::Result::Err(nested) =
+                    ::blazingly::ApiModel::validate(self.0)
+                {
+                    ::blazingly::merge_validation_errors(errors, field, &nested);
                 }
             }
         }
-    })
+
+        #[allow(dead_code)]
+        trait __BlazinglyPlainValue {
+            fn __blazingly_nested(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T> __BlazinglyPlainValue for &__BlazinglyValue<'_, T> {
+            fn __blazingly_nested(
+                &self,
+                _errors: &mut ::blazingly::ValidationErrors,
+                _field: &str,
+            ) {
+            }
+        }
+    }
+}
+
+fn items_probe_definitions() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(dead_code)]
+        trait __BlazinglyNestedItems {
+            fn __blazingly_nested_items(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T: ::blazingly::ApiModel> __BlazinglyNestedItems for __BlazinglyItems<'_, T> {
+            fn __blazingly_nested_items(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            ) {
+                for (index, item) in self.0.iter().enumerate() {
+                    if let ::core::result::Result::Err(nested) =
+                        ::blazingly::ApiModel::validate(item)
+                    {
+                        let prefix = ::std::format!("{}[{}]", field, index);
+                        ::blazingly::merge_validation_errors(errors, &prefix, &nested);
+                    }
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BlazinglyPlainItems {
+            fn __blazingly_nested_items(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T> __BlazinglyPlainItems for &__BlazinglyItems<'_, T> {
+            fn __blazingly_nested_items(
+                &self,
+                _errors: &mut ::blazingly::ValidationErrors,
+                _field: &str,
+            ) {
+            }
+        }
+    }
+}
+
+fn kind_probe_definitions() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(dead_code)]
+        trait __BlazinglyModelKind {
+            fn __blazingly_is_model(&self) -> bool;
+        }
+
+        impl<T: ::blazingly::ApiModel> __BlazinglyModelKind for __BlazinglyKind<T> {
+            fn __blazingly_is_model(&self) -> bool {
+                true
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BlazinglyPlainKind {
+            fn __blazingly_is_model(&self) -> bool;
+        }
+
+        impl<T> __BlazinglyPlainKind for &__BlazinglyKind<T> {
+            fn __blazingly_is_model(&self) -> bool {
+                false
+            }
+        }
+    }
+}
+
+fn nested_rule_descriptor(
+    validation_type: &Type,
+    shape: FieldShape,
+    explicit: bool,
+) -> proc_macro2::TokenStream {
+    if explicit {
+        return quote!(rules.push(::blazingly::ValidationRule::Nested););
+    }
+    if !shape.may_be_model() {
+        return quote!();
+    }
+    let probe_type = model_probe_type(validation_type, shape);
+    quote! {
+        if (&__BlazinglyKind::<#probe_type>(::core::marker::PhantomData))
+            .__blazingly_is_model()
+        {
+            rules.push(::blazingly::ValidationRule::Nested);
+        }
+    }
+}
+
+fn model_probe_type(validation_type: &Type, shape: FieldShape) -> Type {
+    if shape == FieldShape::Collection {
+        wrapper_inner(validation_type, "Vec").unwrap_or_else(|| validation_type.clone())
+    } else {
+        validation_type.clone()
+    }
 }
 
 fn model_rename_rule(arguments: &ModelArgs) -> syn::Result<String> {
@@ -1118,24 +1461,125 @@ fn model_rename_rule(arguments: &ModelArgs) -> syn::Result<String> {
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn take_field_rules(attributes: &mut Vec<Attribute>) -> syn::Result<FieldRules> {
     let mut retained = Vec::new();
     let mut rules = FieldRules::default();
 
     for attribute in attributes.drain(..) {
-        if attribute.path().is_ident("min_length") {
+        let path = attribute.path().clone();
+        if path.is_ident("min_length") {
             let value = attribute.parse_args::<LitInt>()?;
             rules.min_length = Some((value.base10_parse()?, value.span()));
-        } else if attribute.path().is_ident("max_length") {
+        } else if path.is_ident("max_length") {
             let value = attribute.parse_args::<LitInt>()?;
             rules.max_length = Some((value.base10_parse()?, value.span()));
-        } else if attribute.path().is_ident("email") {
-            rules.email = true;
+        } else if path.is_ident("min_items") {
+            let value = attribute.parse_args::<LitInt>()?;
+            rules.min_items = Some((value.base10_parse()?, value.span()));
+        } else if path.is_ident("max_items") {
+            let value = attribute.parse_args::<LitInt>()?;
+            rules.max_items = Some((value.base10_parse()?, value.span()));
+        } else if path.is_ident("unique_items") {
+            rules.unique_items = Some(attribute_span(&attribute));
+        } else if path.is_ident("minimum") {
+            rules.minimum = Some(numeric_attribute(&attribute)?);
+        } else if path.is_ident("maximum") {
+            rules.maximum = Some(numeric_attribute(&attribute)?);
+        } else if path.is_ident("exclusive_minimum") {
+            rules.exclusive_minimum = Some(numeric_attribute(&attribute)?);
+        } else if path.is_ident("exclusive_maximum") {
+            rules.exclusive_maximum = Some(numeric_attribute(&attribute)?);
+        } else if path.is_ident("multiple_of") {
+            let (factor, span) = numeric_attribute(&attribute)?;
+            if factor.is_zero() {
+                return Err(syn::Error::new(span, "`multiple_of` cannot be zero"));
+            }
+            rules.multiple_of = Some((factor, span));
+        } else if path.is_ident("pattern") {
+            let pattern = attribute.parse_args::<LitStr>()?;
+            if let Err(reason) = lint_pattern_syntax(&pattern.value()) {
+                return Err(syn::Error::new(pattern.span(), reason));
+            }
+            rules.pattern = Some(pattern);
+        } else if path.is_ident("email") {
+            rules.email = Some(attribute_span(&attribute));
+        } else if path.is_ident("alias") {
+            rules.aliases.push(attribute.parse_args::<LitStr>()?);
+        } else if path.is_ident("validate_with") {
+            if rules.validator.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attribute,
+                    "only one `validate_with` function may be declared per field",
+                ));
+            }
+            rules.validator = Some(attribute.parse_args::<SynPath>()?);
+        } else if path.is_ident("nested") {
+            rules.nested = true;
         } else {
             retained.push(attribute);
         }
     }
 
+    reject_inverted_bounds(&rules)?;
+
+    *attributes = retained;
+    Ok(rules)
+}
+
+fn attribute_span(attribute: &Attribute) -> proc_macro2::Span {
+    attribute
+        .path()
+        .segments
+        .last()
+        .map_or_else(proc_macro2::Span::call_site, |segment| segment.ident.span())
+}
+
+fn numeric_attribute(attribute: &Attribute) -> syn::Result<(NumericLiteral, proc_macro2::Span)> {
+    let expression = attribute.parse_args::<syn::Expr>()?;
+    let (negative, literal) = match &expression {
+        syn::Expr::Lit(literal) => (false, &literal.lit),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            let syn::Expr::Lit(literal) = unary.expr.as_ref() else {
+                return Err(syn::Error::new_spanned(
+                    &expression,
+                    "numeric bounds require an integer or floating-point literal",
+                ));
+            };
+            (true, &literal.lit)
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &expression,
+                "numeric bounds require an integer or floating-point literal",
+            ));
+        }
+    };
+    let span = literal.span();
+    let value = match literal {
+        syn::Lit::Int(value) => {
+            let magnitude = value.base10_parse::<i128>()?;
+            NumericLiteral::Integer(if negative { -magnitude } else { magnitude })
+        }
+        syn::Lit::Float(value) => {
+            let magnitude = value.base10_parse::<f64>()?;
+            let magnitude = if negative { -magnitude } else { magnitude };
+            if !magnitude.is_finite() {
+                return Err(syn::Error::new(span, "numeric bounds must be finite"));
+            }
+            NumericLiteral::Float(magnitude)
+        }
+        _ => {
+            return Err(syn::Error::new(
+                span,
+                "numeric bounds require an integer or floating-point literal",
+            ));
+        }
+    };
+    Ok((value, span))
+}
+
+fn reject_inverted_bounds(rules: &FieldRules) -> syn::Result<()> {
     if let (Some((minimum, span)), Some((maximum, _))) = (rules.min_length, rules.max_length)
         && minimum > maximum
     {
@@ -1144,16 +1588,221 @@ fn take_field_rules(attributes: &mut Vec<Attribute>) -> syn::Result<FieldRules> 
             "`min_length` cannot be greater than `max_length`",
         ));
     }
-
-    *attributes = retained;
-    Ok(rules)
+    if let (Some((minimum, span)), Some((maximum, _))) = (rules.min_items, rules.max_items)
+        && minimum > maximum
+    {
+        return Err(syn::Error::new(
+            span,
+            "`min_items` cannot be greater than `max_items`",
+        ));
+    }
+    if let (Some((minimum, span)), Some((maximum, _))) = (rules.minimum, rules.maximum)
+        && minimum.exceeds(maximum)
+    {
+        return Err(syn::Error::new(
+            span,
+            "`minimum` cannot be greater than `maximum`",
+        ));
+    }
+    if let (Some((minimum, span)), Some((maximum, _))) =
+        (rules.exclusive_minimum, rules.exclusive_maximum)
+        && minimum.exceeds(maximum)
+    {
+        return Err(syn::Error::new(
+            span,
+            "`exclusive_minimum` cannot be greater than `exclusive_maximum`",
+        ));
+    }
+    Ok(())
 }
 
-fn validation_checks(
-    _identifier: &Ident,
-    public_name: &LitStr,
+fn reject_incompatible_rules(
     rules: &FieldRules,
+    validation_type: &Type,
+    shape: FieldShape,
+) -> syn::Result<()> {
+    let numeric = [
+        (rules.minimum.map(|(_, span)| span), "minimum"),
+        (rules.maximum.map(|(_, span)| span), "maximum"),
+        (
+            rules.exclusive_minimum.map(|(_, span)| span),
+            "exclusive_minimum",
+        ),
+        (
+            rules.exclusive_maximum.map(|(_, span)| span),
+            "exclusive_maximum",
+        ),
+        (rules.multiple_of.map(|(_, span)| span), "multiple_of"),
+    ];
+    for (span, name) in numeric {
+        if let Some(span) = span
+            && !shape.is_numeric()
+        {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "`{name}` requires an integer or floating-point field, \
+                     but `{}` is not numeric",
+                    type_label(validation_type)
+                ),
+            ));
+        }
+    }
+
+    let collection = [
+        (rules.min_items.map(|(_, span)| span), "min_items"),
+        (rules.max_items.map(|(_, span)| span), "max_items"),
+        (rules.unique_items, "unique_items"),
+    ];
+    for (span, name) in collection {
+        if let Some(span) = span
+            && shape != FieldShape::Collection
+        {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "`{name}` requires a `Vec<T>` or `Option<Vec<T>>` field, \
+                     but `{}` is not a collection",
+                    type_label(validation_type)
+                ),
+            ));
+        }
+    }
+
+    if let Some(pattern) = &rules.pattern
+        && shape != FieldShape::Text
+    {
+        return Err(syn::Error::new(
+            pattern.span(),
+            format!(
+                "`pattern` requires a `String` or `Option<String>` field, \
+                 but `{}` is not a string",
+                type_label(validation_type)
+            ),
+        ));
+    }
+
+    if let Some(span) = rules.email
+        && shape != FieldShape::Text
+    {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`email` requires a `String` or `Option<String>` field, \
+                 but `{}` is not a string",
+                type_label(validation_type)
+            ),
+        ));
+    }
+
+    let lengths = [
+        (rules.min_length.map(|(_, span)| span), "min_length"),
+        (rules.max_length.map(|(_, span)| span), "max_length"),
+    ];
+    for (span, name) in lengths {
+        if let Some(span) = span
+            && !matches!(shape, FieldShape::Text | FieldShape::Collection)
+        {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "`{name}` requires a `String`, `Option<String>`, or `Vec<T>` field, \
+                     but `{}` is neither",
+                    type_label(validation_type)
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Folds `min_length`/`max_length` into the item bounds for collection fields.
+fn normalize_collection_rules(rules: &mut FieldRules, shape: FieldShape) {
+    if shape != FieldShape::Collection {
+        return;
+    }
+    if rules.min_items.is_none() {
+        rules.min_items = rules.min_length;
+    }
+    if rules.max_items.is_none() {
+        rules.max_items = rules.max_length;
+    }
+    rules.min_length = None;
+    rules.max_length = None;
+}
+
+fn rule_descriptors(rules: &FieldRules) -> Vec<proc_macro2::TokenStream> {
+    let mut descriptors = Vec::new();
+
+    if let Some((minimum, _)) = rules.min_length {
+        descriptors.push(quote!(::blazingly::ValidationRule::MinLength(#minimum)));
+    }
+    if let Some((maximum, _)) = rules.max_length {
+        descriptors.push(quote!(::blazingly::ValidationRule::MaxLength(#maximum)));
+    }
+    if rules.email.is_some() {
+        descriptors.push(quote!(::blazingly::ValidationRule::Email));
+    }
+    for encoded in constraint_encodings(rules) {
+        descriptors.push(quote!(::blazingly::ValidationRule::Custom(#encoded.to_owned())));
+    }
+    for alias in &rules.aliases {
+        descriptors.push(quote!(::blazingly::ValidationRule::Alias(#alias.to_owned())));
+    }
+    if let Some(validator) = &rules.validator {
+        descriptors.push(quote!(::blazingly::ValidationRule::Custom(
+            stringify!(#validator).to_owned()
+        )));
+    }
+
+    descriptors
+}
+
+/// Encodes constraints without a dedicated contract variant as `key=value`.
+fn constraint_encodings(rules: &FieldRules) -> Vec<String> {
+    let mut encodings = Vec::new();
+    let numeric = [
+        (rules.minimum, "minimum"),
+        (rules.maximum, "maximum"),
+        (rules.exclusive_minimum, "exclusive_minimum"),
+        (rules.exclusive_maximum, "exclusive_maximum"),
+        (rules.multiple_of, "multiple_of"),
+    ];
+    for (rule, keyword) in numeric {
+        if let Some((value, _)) = rule {
+            encodings.push(format!("{keyword}={}", value.encoded()));
+        }
+    }
+    if let Some(pattern) = &rules.pattern {
+        encodings.push(format!("pattern={}", pattern.value()));
+    }
+    if let Some((minimum, _)) = rules.min_items {
+        encodings.push(format!("min_items={minimum}"));
+    }
+    if let Some((maximum, _)) = rules.max_items {
+        encodings.push(format!("max_items={maximum}"));
+    }
+    if rules.unique_items.is_some() {
+        encodings.push("unique_items=true".to_owned());
+    }
+    encodings
+}
+
+fn field_checks(
+    rules: &FieldRules,
+    shape: FieldShape,
+    public_name: &LitStr,
 ) -> proc_macro2::TokenStream {
+    match shape {
+        FieldShape::Text => text_checks(rules, public_name),
+        FieldShape::Integer | FieldShape::Float => numeric_checks(rules, public_name),
+        FieldShape::Collection => collection_checks(rules, public_name),
+        FieldShape::Other => quote!(),
+    }
+}
+
+fn text_checks(rules: &FieldRules, public_name: &LitStr) -> proc_macro2::TokenStream {
     let minimum = rules.min_length.map(|(minimum, _)| {
         quote! {
             if value.chars().count() < #minimum {
@@ -1176,7 +1825,7 @@ fn validation_checks(
             }
         }
     });
-    let email = rules.email.then(|| {
+    let email = rules.email.map(|_| {
         quote! {
             if !::blazingly::is_email(value) {
                 errors.push(
@@ -1187,12 +1836,156 @@ fn validation_checks(
             }
         }
     });
+    let pattern = rules.pattern.as_ref().map(|pattern| {
+        quote! {
+            ::blazingly::validation::check_pattern(
+                &mut errors,
+                #public_name,
+                value.as_str(),
+                #pattern,
+            );
+        }
+    });
 
     quote! {
         #minimum
         #maximum
         #email
+        #pattern
     }
+}
+
+fn numeric_checks(rules: &FieldRules, public_name: &LitStr) -> proc_macro2::TokenStream {
+    let checks = [
+        (rules.minimum, quote!(check_minimum)),
+        (rules.maximum, quote!(check_maximum)),
+        (rules.exclusive_minimum, quote!(check_exclusive_minimum)),
+        (rules.exclusive_maximum, quote!(check_exclusive_maximum)),
+        (rules.multiple_of, quote!(check_multiple_of)),
+    ]
+    .into_iter()
+    .filter_map(|(rule, function)| {
+        let (bound, _) = rule?;
+        let bound = bound.tokens();
+        Some(quote! {
+            ::blazingly::validation::#function(&mut errors, #public_name, *value, #bound);
+        })
+    });
+
+    quote!(#(#checks)*)
+}
+
+fn collection_checks(rules: &FieldRules, public_name: &LitStr) -> proc_macro2::TokenStream {
+    let minimum = rules.min_items.map(|(minimum, _)| {
+        quote! {
+            ::blazingly::validation::check_min_items(
+                &mut errors,
+                #public_name,
+                value.as_slice(),
+                #minimum,
+            );
+        }
+    });
+    let maximum = rules.max_items.map(|(maximum, _)| {
+        quote! {
+            ::blazingly::validation::check_max_items(
+                &mut errors,
+                #public_name,
+                value.as_slice(),
+                #maximum,
+            );
+        }
+    });
+    let unique = rules.unique_items.map(|_| {
+        quote! {
+            ::blazingly::validation::check_unique_items(
+                &mut errors,
+                #public_name,
+                value.as_slice(),
+            );
+        }
+    });
+
+    quote! {
+        #minimum
+        #maximum
+        #unique
+    }
+}
+
+fn nested_validation_checks(
+    shape: FieldShape,
+    public_name: &LitStr,
+    rules: &FieldRules,
+) -> proc_macro2::TokenStream {
+    let nested = shape.may_be_model().then(|| {
+        if shape == FieldShape::Collection {
+            quote! {
+                (&__BlazinglyItems(value.as_slice()))
+                    .__blazingly_nested_items(&mut errors, #public_name);
+            }
+        } else {
+            quote! {
+                (&__BlazinglyValue(value)).__blazingly_nested(&mut errors, #public_name);
+            }
+        }
+    });
+    let custom = rules.validator.as_ref().map(|validator| {
+        quote! {
+            if let ::core::result::Result::Err(custom_errors) = #validator(value) {
+                ::blazingly::merge_validation_errors(
+                    &mut errors,
+                    #public_name,
+                    &custom_errors,
+                );
+            }
+        }
+    });
+    quote! {
+        #nested
+        #custom
+    }
+}
+
+const INTEGER_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+];
+
+const FLOAT_TYPES: &[&str] = &["f32", "f64"];
+
+fn field_shape(ty: &Type) -> FieldShape {
+    if is_string_type(ty) {
+        return FieldShape::Text;
+    }
+    if bare_type_matches(ty, INTEGER_TYPES) {
+        return FieldShape::Integer;
+    }
+    if bare_type_matches(ty, FLOAT_TYPES) {
+        return FieldShape::Float;
+    }
+    if wrapper_inner(ty, "Vec").is_some() {
+        return FieldShape::Collection;
+    }
+    FieldShape::Other
+}
+
+fn bare_type_matches(ty: &Type, names: &[&str]) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    path.path.segments.last().is_some_and(|segment| {
+        segment.arguments.is_none() && names.contains(&segment.ident.to_string().as_str())
+    })
+}
+
+fn type_label(ty: &Type) -> String {
+    let Type::Path(path) = ty else {
+        return "this field type".to_owned();
+    };
+    path.path.segments.last().map_or_else(
+        || "this field type".to_owned(),
+        |segment| segment.ident.to_string(),
+    )
 }
 
 fn is_string_type(ty: &Type) -> bool {
@@ -1203,6 +1996,137 @@ fn is_string_type(ty: &Type) -> bool {
         .segments
         .last()
         .is_some_and(|segment| segment.ident == "String")
+}
+
+/// Maximum pattern length accepted by `blazingly_validation::Pattern`.
+const MAX_PATTERN_CHARS: usize = 512;
+
+/// Maximum group nesting accepted by `blazingly_validation::Pattern`.
+const MAX_PATTERN_DEPTH: i32 = 16;
+
+const fn is_supported_escape(value: char) -> bool {
+    matches!(
+        value,
+        'd' | 'D'
+            | 'w'
+            | 'W'
+            | 's'
+            | 'S'
+            | 't'
+            | 'n'
+            | 'r'
+            | '\\'
+            | '.'
+            | '*'
+            | '+'
+            | '?'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '|'
+            | '^'
+            | '$'
+            | '-'
+            | '/'
+    )
+}
+
+/// Rejects patterns outside the runtime matcher's supported subset.
+///
+/// The runtime matcher stays authoritative; this check exists so the common
+/// mistakes surface at compile time instead of as a violation on every request.
+#[allow(clippy::too_many_lines)]
+fn lint_pattern_syntax(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("the pattern is empty".to_owned());
+    }
+    let characters = pattern.chars().collect::<Vec<_>>();
+    if characters.len() > MAX_PATTERN_CHARS {
+        return Err(format!(
+            "the pattern exceeds {MAX_PATTERN_CHARS} characters"
+        ));
+    }
+    let last = characters.len() - 1;
+    let mut depth = 0_i32;
+    let mut deepest = 0_i32;
+    let mut in_class = false;
+    let mut quantifiable = false;
+    let mut index = 0;
+
+    while let Some(&value) = characters.get(index) {
+        match value {
+            '\\' => {
+                let Some(&escaped) = characters.get(index + 1) else {
+                    return Err("the pattern ends with a lone backslash".to_owned());
+                };
+                if !is_supported_escape(escaped) {
+                    return Err(format!("the escape `\\{escaped}` is not supported"));
+                }
+                quantifiable = true;
+                index += 2;
+                continue;
+            }
+            '[' if !in_class => {
+                in_class = true;
+                quantifiable = false;
+            }
+            ']' if in_class => {
+                in_class = false;
+                quantifiable = true;
+            }
+            _ if in_class => {}
+            '(' => {
+                if characters.get(index + 1) == Some(&'?') {
+                    return Err(
+                        "group flags, lookaround, and non-capturing groups are not supported"
+                            .to_owned(),
+                    );
+                }
+                depth += 1;
+                deepest = deepest.max(depth);
+                quantifiable = false;
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("the pattern has an unbalanced group".to_owned());
+                }
+                quantifiable = true;
+            }
+            '*' | '+' | '?' => {
+                if !quantifiable {
+                    return Err("a quantifier has no preceding expression".to_owned());
+                }
+                quantifiable = false;
+            }
+            '{' | '}' => {
+                return Err("counted repetition `{m,n}` is not supported".to_owned());
+            }
+            '^' if index != 0 => {
+                return Err("`^` is supported only at the start of a pattern".to_owned());
+            }
+            '$' if index != last => {
+                return Err("`$` is supported only at the end of a pattern".to_owned());
+            }
+            '^' | '$' | '|' => quantifiable = false,
+            _ => quantifiable = true,
+        }
+        index += 1;
+    }
+
+    if in_class {
+        return Err("the pattern has an unterminated character class".to_owned());
+    }
+    if depth != 0 {
+        return Err("the pattern has an unbalanced group".to_owned());
+    }
+    if deepest > MAX_PATTERN_DEPTH {
+        return Err(format!("groups nest deeper than {MAX_PATTERN_DEPTH}"));
+    }
+    Ok(())
 }
 
 fn snake_to_camel(value: &str) -> String {
@@ -1354,6 +2278,7 @@ fn operation_inputs(
                 | OperationInputKind::Form
                 | OperationInputKind::Multipart
                 | OperationInputKind::File
+                | OperationInputKind::Stream
         ) {
             body_inputs += 1;
             if body_inputs > 1 {
@@ -1403,6 +2328,12 @@ fn operation_argument_name(pattern: &Pat) -> syn::Result<&Ident> {
 
 impl OperationInputKind {
     fn from_type(ty: &Type) -> Option<(Self, Type)> {
+        if type_is(ty, "WebSocketRequest") {
+            return Some((Self::WebSocket, ty.clone()));
+        }
+        if type_is(ty, "UploadBody") {
+            return Some((Self::Stream, ty.clone()));
+        }
         [
             (Self::Path, "Path"),
             (Self::Query, "Query"),
@@ -1412,6 +2343,7 @@ impl OperationInputKind {
             (Self::Form, "Form"),
             (Self::Multipart, "Multipart"),
             (Self::File, "File"),
+            (Self::Extension, "Extension"),
             (Self::Dependency, "Depends"),
         ]
         .into_iter()
@@ -1428,7 +2360,8 @@ impl OperationInputKind {
             Self::Form => Some(quote!(::blazingly::InputSource::Form)),
             Self::Multipart => Some(quote!(::blazingly::InputSource::Multipart)),
             Self::File => Some(quote!(::blazingly::InputSource::File)),
-            Self::Dependency | Self::DirectDependency => None,
+            Self::Stream => Some(quote!(::blazingly::InputSource::Stream)),
+            Self::WebSocket | Self::Extension | Self::Dependency | Self::DirectDependency => None,
         }
     }
 
@@ -1466,6 +2399,9 @@ fn success_output(ty: &Type) -> syn::Result<(u16, Option<Type>)> {
         return Ok((204, None));
     }
     if let Some(inner) = wrapper_inner(ty, "WithHeaders") {
+        return success_output(&inner);
+    }
+    if let Some(inner) = wrapper_inner(ty, "Background") {
         return success_output(&inner);
     }
     if let Some((status, inner)) = status_wrapper(ty)? {
@@ -1580,4 +2516,307 @@ fn wrapper_inner(ty: &Type, wrapper: &str) -> Option<Type> {
         return None;
     };
     Some(inner.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Attribute, FieldRules, FieldShape, Fields, ItemStruct, ModelArgs, NumericLiteral, Type,
+        constraint_encodings, field_shape, lint_pattern_syntax, model_tokens,
+        normalize_collection_rules, reject_incompatible_rules, snake_to_camel, take_field_rules,
+    };
+
+    fn field_attributes(declaration: &str) -> Vec<Attribute> {
+        let model = syn::parse_str::<ItemStruct>(&format!("struct Probe {{ {declaration} }}"))
+            .expect("fixture struct parses");
+        let Fields::Named(fields) = model.fields else {
+            panic!("fixture struct must use named fields");
+        };
+        fields
+            .named
+            .into_iter()
+            .next()
+            .expect("fixture struct declares one field")
+            .attrs
+    }
+
+    fn rules_of(declaration: &str) -> syn::Result<FieldRules> {
+        let mut attributes = field_attributes(declaration);
+        take_field_rules(&mut attributes)
+    }
+
+    fn parse_type(source: &str) -> Type {
+        syn::parse_str::<Type>(source).expect("fixture type parses")
+    }
+
+    fn rejection_message<T>(result: syn::Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("the declaration must be rejected"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn reject(declaration: &str, field_type: &str) -> String {
+        let rules = rules_of(declaration).expect("attributes parse");
+        let field_type = parse_type(field_type);
+        let shape = field_shape(&field_type);
+        reject_incompatible_rules(&rules, &field_type, shape)
+            .expect_err("the rule must be rejected")
+            .to_string()
+    }
+
+    fn expand(source: &str, arguments: &ModelArgs) -> syn::Result<String> {
+        let mut model = syn::parse_str::<ItemStruct>(source).expect("fixture model parses");
+        model_tokens(arguments, &mut model).map(|tokens| tokens.to_string())
+    }
+
+    fn expand_default(source: &str) -> syn::Result<String> {
+        expand(source, &ModelArgs::default())
+    }
+
+    #[test]
+    fn field_shapes_classify_strings_numbers_and_collections() {
+        assert_eq!(field_shape(&parse_type("String")), FieldShape::Text);
+        assert_eq!(field_shape(&parse_type("u8")), FieldShape::Integer);
+        assert_eq!(field_shape(&parse_type("i128")), FieldShape::Integer);
+        assert_eq!(field_shape(&parse_type("usize")), FieldShape::Integer);
+        assert_eq!(field_shape(&parse_type("f32")), FieldShape::Float);
+        assert_eq!(
+            field_shape(&parse_type("Vec<Address>")),
+            FieldShape::Collection
+        );
+        assert_eq!(field_shape(&parse_type("Uuid")), FieldShape::Other);
+        assert_eq!(field_shape(&parse_type("bool")), FieldShape::Other);
+    }
+
+    #[test]
+    fn numeric_rules_are_rejected_on_non_numeric_fields() {
+        for rule in [
+            "#[minimum(1)]",
+            "#[maximum(1)]",
+            "#[exclusive_minimum(1)]",
+            "#[exclusive_maximum(1)]",
+            "#[multiple_of(2)]",
+        ] {
+            let message = reject(&format!("{rule} name: String"), "String");
+            assert!(
+                message.contains("requires an integer or floating-point field"),
+                "{rule} produced {message}"
+            );
+            assert!(message.contains("String"), "{rule} produced {message}");
+        }
+    }
+
+    #[test]
+    fn collection_rules_are_rejected_outside_collections() {
+        for rule in ["#[min_items(1)]", "#[max_items(1)]", "#[unique_items]"] {
+            let message = reject(&format!("{rule} name: String"), "String");
+            assert!(
+                message.contains("requires a `Vec<T>` or `Option<Vec<T>>` field"),
+                "{rule} produced {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_rules_are_rejected_outside_strings() {
+        let message = reject("#[pattern(\"^a$\")] count: u32", "u32");
+        assert!(
+            message.contains("`pattern` requires a `String`"),
+            "{message}"
+        );
+        let message = reject("#[email] count: u32", "u32");
+        assert!(message.contains("`email` requires a `String`"), "{message}");
+    }
+
+    #[test]
+    fn length_rules_accept_strings_and_collections_but_not_numbers() {
+        let rules = rules_of("#[min_length(2)] tags: Vec<String>").expect("attributes parse");
+        let collection = parse_type("Vec<String>");
+        reject_incompatible_rules(&rules, &collection, FieldShape::Collection)
+            .expect("collections accept length rules");
+
+        let message = reject("#[min_length(2)] count: u32", "u32");
+        assert!(
+            message.contains("`min_length` requires a `String`, `Option<String>`, or `Vec<T>`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn inverted_and_degenerate_bounds_are_rejected() {
+        let message = rejection_message(rules_of("#[min_length(5)] #[max_length(2)] name: String"));
+        assert!(message.contains("`min_length` cannot be greater than `max_length`"));
+
+        let message = rejection_message(rules_of(
+            "#[min_items(5)] #[max_items(2)] tags: Vec<String>",
+        ));
+        assert!(message.contains("`min_items` cannot be greater than `max_items`"));
+
+        let message = rejection_message(rules_of("#[minimum(5)] #[maximum(2)] count: u32"));
+        assert!(message.contains("`minimum` cannot be greater than `maximum`"));
+
+        let message = rejection_message(rules_of("#[multiple_of(0)] count: u32"));
+        assert!(message.contains("`multiple_of` cannot be zero"));
+    }
+
+    #[test]
+    fn numeric_attributes_accept_negative_and_floating_point_literals() {
+        let rules = rules_of("#[minimum(-3)] #[maximum(2.5)] ratio: f64").expect("bounds parse");
+        assert_eq!(
+            rules.minimum.map(|(value, _)| value),
+            Some(NumericLiteral::Integer(-3))
+        );
+        assert_eq!(
+            rules.maximum.map(|(value, _)| value),
+            Some(NumericLiteral::Float(2.5))
+        );
+
+        let message = rejection_message(rules_of("#[minimum(\"one\")] count: u32"));
+        assert!(
+            message.contains("integer or floating-point literal"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn constraints_use_a_canonical_key_value_encoding() {
+        let rules = rules_of(
+            "#[minimum(1)] #[maximum(10.0)] #[exclusive_minimum(0)] \
+             #[exclusive_maximum(11)] #[multiple_of(2)] count: u32",
+        )
+        .expect("bounds parse");
+        assert_eq!(
+            constraint_encodings(&rules),
+            [
+                "minimum=1",
+                "maximum=10.0",
+                "exclusive_minimum=0",
+                "exclusive_maximum=11",
+                "multiple_of=2"
+            ]
+        );
+
+        let rules = rules_of("#[pattern(\"^[a-z]+$\")] slug: String").expect("pattern parses");
+        assert_eq!(constraint_encodings(&rules), ["pattern=^[a-z]+$"]);
+
+        let rules = rules_of("#[min_items(1)] #[max_items(4)] #[unique_items] tags: Vec<String>")
+            .expect("collection rules parse");
+        assert_eq!(
+            constraint_encodings(&rules),
+            ["min_items=1", "max_items=4", "unique_items=true"]
+        );
+    }
+
+    #[test]
+    fn collection_length_rules_are_folded_into_item_bounds() {
+        let mut rules = rules_of("#[min_length(2)] #[max_length(4)] tags: Vec<String>")
+            .expect("length rules parse");
+        normalize_collection_rules(&mut rules, FieldShape::Collection);
+        assert!(rules.min_length.is_none());
+        assert!(rules.max_length.is_none());
+        assert_eq!(constraint_encodings(&rules), ["min_items=2", "max_items=4"]);
+    }
+
+    #[test]
+    fn unsupported_patterns_are_rejected_when_the_macro_expands() {
+        for (pattern, fragment) in [
+            ("", "the pattern is empty"),
+            ("^a{2,3}$", "counted repetition"),
+            ("^(?:a)$", "not supported"),
+            ("^(a$", "unbalanced group"),
+            ("^a)$", "unbalanced group"),
+            ("^[a-z$", "unterminated character class"),
+            ("^*a$", "no preceding expression"),
+            (r"^\q$", "the escape `\\q` is not supported"),
+            (r"^a\", "lone backslash"),
+            ("^a$b$", "`$` is supported only at the end"),
+            ("a^b", "`^` is supported only at the start"),
+        ] {
+            let error = lint_pattern_syntax(pattern)
+                .expect_err(&format!("{pattern} must be rejected"))
+                .to_string();
+            assert!(error.contains(fragment), "{pattern} produced {error}");
+        }
+    }
+
+    #[test]
+    fn supported_patterns_pass_the_compile_time_lint() {
+        for pattern in [
+            "^[a-z][a-z0-9_]*$",
+            r"^(cat|dog)-\d+$",
+            r"\w+@\w+\.\w+",
+            "^a[^0-9]?$",
+            r"^cost\$",
+            "^[a-z-]+$",
+        ] {
+            assert!(
+                lint_pattern_syntax(pattern).is_ok(),
+                "{pattern} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_models_recurse_without_an_explicit_attribute() {
+        let expansion = expand_default("struct Order { address: Address, items: Vec<Line> }")
+            .expect("model expands");
+        assert!(expansion.contains("__blazingly_nested"));
+        assert!(expansion.contains("__blazingly_nested_items"));
+        assert!(expansion.contains("__blazingly_is_model"));
+    }
+
+    #[test]
+    fn explicit_nested_stays_accepted_and_still_marks_the_descriptor() {
+        let expansion =
+            expand_default("struct Order { #[nested] address: Address }").expect("model expands");
+        assert!(expansion.contains("ValidationRule :: Nested"));
+    }
+
+    #[test]
+    fn scalar_fields_without_rules_emit_no_validation_body() {
+        let expansion =
+            expand_default("struct Order { name: String, count: u32 }").expect("model expands");
+        assert!(!expansion.contains("__BlazinglyValue"));
+        assert!(!expansion.contains("self . name"));
+    }
+
+    #[test]
+    fn model_level_validate_with_runs_after_the_field_rules() {
+        let arguments = ModelArgs {
+            rename_all: None,
+            validator: Some(syn::parse_str("checks::validate_window").expect("path parses")),
+        };
+        let expansion = expand(
+            "struct Window { #[minimum(0)] start: i64, #[minimum(0)] end: i64 }",
+            &arguments,
+        )
+        .expect("model expands");
+        let validator = expansion
+            .find("checks :: validate_window")
+            .expect("the model validator is called");
+        let last_field_rule = expansion
+            .rfind("check_minimum")
+            .expect("field rules are emitted");
+        assert!(validator > last_field_rule);
+        assert!(expansion.contains("merge_model_violations"));
+    }
+
+    #[test]
+    fn model_arguments_reject_unknown_keys() {
+        let error = rejection_message(syn::parse_str::<ModelArgs>(
+            "rename_all = \"camelCase\", frobnicate = \"x\"",
+        ));
+        assert!(
+            error.contains("`rename_all` and `validate_with`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn snake_case_names_become_camel_case() {
+        assert_eq!(snake_to_camel("public_name"), "publicName");
+        assert_eq!(snake_to_camel("id"), "id");
+        assert_eq!(snake_to_camel("a_b_c"), "aBC");
+    }
 }

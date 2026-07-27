@@ -304,7 +304,11 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
     if let Some(input) = operation.contract.inputs.iter().find(|input| {
         matches!(
             input.source,
-            InputSource::Json | InputSource::Form | InputSource::Multipart | InputSource::File
+            InputSource::Json
+                | InputSource::Form
+                | InputSource::Multipart
+                | InputSource::File
+                | InputSource::Stream
         )
     }) {
         value["requestBody"] = json!({
@@ -458,7 +462,11 @@ fn input_source_name(source: InputSource) -> &'static str {
         InputSource::Query => "query",
         InputSource::Header => "header",
         InputSource::Cookie => "cookie",
-        InputSource::Json | InputSource::Form | InputSource::Multipart | InputSource::File => {
+        InputSource::Json
+        | InputSource::Form
+        | InputSource::Multipart
+        | InputSource::File
+        | InputSource::Stream => {
             unreachable!("body inputs are OpenAPI request bodies")
         }
     }
@@ -469,6 +477,7 @@ fn request_media_type(source: InputSource) -> &'static str {
         InputSource::Json => "application/json",
         InputSource::Form => "application/x-www-form-urlencoded",
         InputSource::Multipart | InputSource::File => "multipart/form-data",
+        InputSource::Stream => "application/octet-stream",
         InputSource::Path | InputSource::Query | InputSource::Header | InputSource::Cookie => {
             unreachable!("parameter inputs do not have a request body media type")
         }
@@ -489,8 +498,22 @@ fn schema_value(descriptor: &TypeDescriptor) -> Value {
         }
         _ => schema_kind_value(&descriptor.schema),
     };
+    apply_known_string_format(&mut value, &descriptor.rust_name);
     value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
     value
+}
+
+fn apply_known_string_format(schema: &mut Value, rust_name: &str) {
+    let format = match rust_name {
+        "Uuid" => "uuid",
+        "Url" => "uri",
+        "IpAddress" => "ip",
+        "Date" => "date",
+        "DateTime" => "date-time",
+        "Decimal" => "decimal",
+        _ => return,
+    };
+    schema["format"] = Value::String(format.to_owned());
 }
 
 fn schema_kind_value(schema: &SchemaKind) -> Value {
@@ -619,6 +642,39 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
             ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
             ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
             ValidationRule::Email => schema["format"] = json!("email"),
+            ValidationRule::Alias(alias) => {
+                let aliases = schema
+                    .as_object_mut()
+                    .expect("validation schema must be an object")
+                    .entry("x-blazingly-aliases")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                aliases
+                    .as_array_mut()
+                    .expect("alias extension must be an array")
+                    .push(Value::String(alias.clone()));
+            }
+            ValidationRule::Custom(validator) => {
+                // Declarative constraints are encoded as `keyword=value` inside
+                // `Custom`; project the ones that map to a JSON Schema keyword
+                // instead of leaving them as opaque validator strings.
+                #[cfg(feature = "validation")]
+                if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
+                    constraint.apply_json_schema(schema);
+                    continue;
+                }
+                let validators = schema
+                    .as_object_mut()
+                    .expect("validation schema must be an object")
+                    .entry("x-blazingly-validators")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                validators
+                    .as_array_mut()
+                    .expect("validator extension must be an array")
+                    .push(Value::String(validator.clone()));
+            }
+            ValidationRule::Nested => {
+                schema["x-blazingly-nested-validation"] = Value::Bool(true);
+            }
         }
     }
 }

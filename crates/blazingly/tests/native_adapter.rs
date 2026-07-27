@@ -1,17 +1,18 @@
-#![cfg(feature = "native")]
+﻿#![cfg(feature = "native")]
 
-use blazingly::{ExecutableApp, Json, StreamingBody, api_model, get, post, routes};
+use blazingly::{
+    BodyStream, BodyStreamError, ExecutableApp, Json, StreamingBody, UploadBody, api_model, get,
+    post, routes,
+};
 use futures_lite::future;
 use futures_lite::io::Cursor;
 #[cfg(feature = "native-http2")]
 use futures_lite::io::{AsyncRead, AsyncWrite};
 use std::io::{Read as _, Write as _};
 use std::num::NonZeroUsize;
-#[cfg(feature = "native-http2")]
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "native-http2")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -25,6 +26,32 @@ async fn health() -> Json<&'static str> {
 #[derive(Clone, Debug)]
 struct Echo {
     value: String,
+}
+
+#[api_model]
+#[derive(Clone, Debug)]
+struct UploadSummary {
+    bytes: u64,
+    chunks: u64,
+}
+
+static UPLOAD_CHUNKS_OBSERVED: AtomicUsize = AtomicUsize::new(0);
+
+#[post(
+    "/upload",
+    id = "upload.stream",
+    summary = "Consume a streaming upload"
+)]
+async fn upload(mut body: UploadBody) -> Json<UploadSummary> {
+    let mut bytes = 0_u64;
+    let mut chunks = 0_u64;
+    while let Some(chunk) = body.next_chunk().await {
+        let chunk = chunk.expect("native upload stream");
+        bytes = bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        chunks += 1;
+        UPLOAD_CHUNKS_OBSERVED.fetch_add(1, Ordering::Release);
+    }
+    Json(UploadSummary { bytes, chunks })
 }
 
 #[post("/echo", id = "echo.create", summary = "Echo JSON")]
@@ -44,9 +71,65 @@ async fn stream() -> StreamingBody {
     StreamingBody::from_chunks([b"blazing".to_vec(), b"ly".to_vec()])
 }
 
+static H2_FAST_RAN: AtomicBool = AtomicBool::new(false);
+static H2_FAST_BODY_POLLED: AtomicBool = AtomicBool::new(false);
+
+struct SlowH2Body(bool);
+
+impl BodyStream for SlowH2Body {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, BodyStreamError>>> {
+        if self.0 {
+            return Poll::Ready(None);
+        }
+        if H2_FAST_BODY_POLLED.load(Ordering::Acquire) {
+            self.0 = true;
+            return Poll::Ready(Some(Ok(b"slow-after-fast-body".to_vec())));
+        }
+        context.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+struct FastH2Body(bool);
+
+impl BodyStream for FastH2Body {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, BodyStreamError>>> {
+        if self.0 {
+            return Poll::Ready(None);
+        }
+        self.0 = true;
+        H2_FAST_BODY_POLLED.store(true, Ordering::Release);
+        Poll::Ready(Some(Ok(b"fast-body".to_vec())))
+    }
+}
+
+#[get("/h2-slow", id = "http2.slow", summary = "Wait for a sibling stream")]
+async fn h2_slow() -> StreamingBody {
+    for _ in 0..1_000 {
+        if H2_FAST_RAN.load(Ordering::Acquire) {
+            return StreamingBody::new(SlowH2Body(false));
+        }
+        future::yield_now().await;
+    }
+    StreamingBody::once("handler-blocked")
+}
+
+#[get("/h2-fast", id = "http2.fast", summary = "Release a sibling stream")]
+#[allow(clippy::unused_async)]
+async fn h2_fast() -> StreamingBody {
+    H2_FAST_RAN.store(true, Ordering::Release);
+    StreamingBody::new(FastH2Body(false))
+}
+
 fn server(max_body_bytes: usize) -> blazingly::native::Server {
-    let app =
-        ExecutableApp::new(routes![health, echo, stream]).expect("operation graph should compile");
+    let app = ExecutableApp::new(routes![health, echo, stream, upload, h2_slow, h2_fast])
+        .expect("operation graph should compile");
     blazingly::native::Server::new(app)
         .with_max_body_bytes(max_body_bytes)
         .with_openapi(blazingly::openapi::OpenApiConfig::new(
@@ -137,6 +220,61 @@ fn native_http1_adapter_rejects_oversized_and_decodes_chunked_requests() {
 }
 
 #[test]
+fn native_http1_starts_streaming_handler_before_the_complete_upload_arrives() {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
+
+    UPLOAD_CHUNKS_OBSERVED.store(0, Ordering::Release);
+    let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
+    let address = probe.local_addr().expect("address");
+    drop(probe);
+    let (shutdown, signal) = blazingly::native::shutdown_channel();
+    let server_thread = std::thread::spawn(move || {
+        server(128 * 1024).serve_gracefully(address, signal, Duration::from_secs(2))
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut client = loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+            Err(error) => panic!("server did not start: {error}"),
+        }
+    };
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+
+    let total = 64 * 1024;
+    let head = format!(
+        "POST /upload HTTP/1.1\r\nhost: localhost\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n"
+    );
+    client.write_all(head.as_bytes()).expect("request head");
+    client.write_all(b"hello").expect("first upload bytes");
+    let observed_deadline = Instant::now() + Duration::from_secs(2);
+    while UPLOAD_CHUNKS_OBSERVED.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < observed_deadline,
+            "handler did not observe a chunk before the complete body"
+        );
+        std::thread::yield_now();
+    }
+    client
+        .write_all(&vec![b'x'; total - 5])
+        .expect("remaining upload bytes");
+    let mut response = String::new();
+    client.read_to_string(&mut response).expect("response");
+    shutdown.shutdown();
+    server_thread
+        .join()
+        .expect("server thread")
+        .expect("graceful server");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.contains(&format!("\"bytes\":{total}")));
+    assert!(response.contains("\"chunks\":"));
+}
+
+#[test]
 fn multicore_launcher_builds_thread_local_apps_and_shuts_down_gracefully() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
@@ -177,6 +315,53 @@ fn multicore_launcher_builds_thread_local_apps_and_shuts_down_gracefully() {
         assert!(response.ends_with("\"ok\""));
     }
     assert_eq!(worker_apps.load(Ordering::Relaxed), 2);
+
+    shutdown.shutdown();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn native_http1_coalesces_pipelined_responses_without_reordering() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+
+    let (shutdown, signal) = blazingly::native::shutdown_channel();
+    let server_thread = std::thread::spawn(move || {
+        blazingly::native::MulticoreServer::new(NonZeroUsize::new(1).unwrap(), || {
+            ExecutableApp::new(routes![health]).expect("pipeline app should compile")
+        })
+        .serve_gracefully(address, signal, Duration::from_secs(2))
+        .expect("pipeline server should stop cleanly");
+    });
+
+    let mut stream = (0..100)
+        .find_map(|_| {
+            std::net::TcpStream::connect(address).ok().or_else(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            })
+        })
+        .expect("pipeline listener should start");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(
+            concat!(
+                "GET /health HTTP/1.1\r\nhost: localhost\r\n\r\n",
+                "GET /health HTTP/1.1\r\nhost: localhost\r\n\r\n",
+                "GET /health HTTP/1.1\r\nhost: localhost\r\n\r\n",
+                "GET /health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut responses = String::new();
+    stream.read_to_string(&mut responses).unwrap();
+
+    assert_eq!(responses.matches("HTTP/1.1 200 OK\r\n").count(), 4);
+    assert_eq!(responses.matches("\r\n\r\n\"ok\"").count(), 4);
 
     shutdown.shutdown();
     server_thread.join().unwrap();
@@ -226,13 +411,15 @@ fn native_request_timeout_cancels_the_operation_on_the_compio_timer() {
 fn native_http2_adapter_multiplexes_prior_knowledge_streams() {
     use shiguredo_http2::{Connection, Event, HeaderField, Limits};
 
+    H2_FAST_RAN.store(false, Ordering::Release);
+    H2_FAST_BODY_POLLED.store(false, Ordering::Release);
     let mut client = Connection::client(Limits::default());
     client.initiate().unwrap();
     let first = client
         .start_stream(
             vec![
                 HeaderField::new(":method", "GET").unwrap(),
-                HeaderField::new(":path", "/health").unwrap(),
+                HeaderField::new(":path", "/h2-slow").unwrap(),
                 HeaderField::new(":scheme", "http").unwrap(),
                 HeaderField::new(":authority", "localhost").unwrap(),
             ],
@@ -243,7 +430,7 @@ fn native_http2_adapter_multiplexes_prior_knowledge_streams() {
         .start_stream(
             vec![
                 HeaderField::new(":method", "GET").unwrap(),
-                HeaderField::new(":path", "/missing").unwrap(),
+                HeaderField::new(":path", "/h2-fast").unwrap(),
                 HeaderField::new(":scheme", "http").unwrap(),
                 HeaderField::new(":authority", "localhost").unwrap(),
             ],
@@ -265,6 +452,7 @@ fn native_http2_adapter_multiplexes_prior_knowledge_streams() {
     let mut first_has_date = false;
     let mut first_body = Vec::new();
     let mut second_status = None;
+    let mut second_body = Vec::new();
     while let Some(event) = client.poll_event() {
         match event {
             Event::HeadersReceived {
@@ -284,13 +472,17 @@ fn native_http2_adapter_multiplexes_prior_knowledge_streams() {
             Event::DataReceived {
                 stream_id, data, ..
             } if stream_id == first => first_body.extend_from_slice(&data),
+            Event::DataReceived {
+                stream_id, data, ..
+            } if stream_id == second => second_body.extend_from_slice(&data),
             _ => {}
         }
     }
     assert_eq!(first_status.as_deref(), Some(b"200".as_slice()));
     assert!(first_has_date);
-    assert_eq!(first_body, b"\"ok\"");
-    assert_eq!(second_status.as_deref(), Some(b"404".as_slice()));
+    assert_eq!(first_body, b"slow-after-fast-body");
+    assert_eq!(second_status.as_deref(), Some(b"200".as_slice()));
+    assert_eq!(second_body, b"fast-body");
 }
 
 #[cfg(feature = "native-http2")]

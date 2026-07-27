@@ -1,11 +1,21 @@
-[package]
+﻿[package]
 name = "blazingly-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Runtime-neutral MCP server for Blazingly operations: JSON-RPC lifecycle, Streamable HTTP, resources, and prompts"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish.workspace = true
 
+[features]
+validation = ["dep:blazingly-validation"]
+
 [dependencies]
+blazingly-validation = { workspace = true, optional = true }
 blazingly-core.workspace = true
 blazingly-executor.workspace = true
 serde = { workspace = true, features = ["std"] }

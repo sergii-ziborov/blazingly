@@ -4,7 +4,7 @@ use blazingly_contract::{InvalidOperationId, OperationContract};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -215,6 +215,258 @@ impl fmt::Debug for StreamingBody {
 impl ApiSchema for StreamingBody {
     fn type_descriptor() -> TypeDescriptor {
         TypeDescriptor::scalar("StreamingBody", SchemaKind::Binary)
+    }
+}
+
+/// A transport error after an HTTP connection has switched protocols.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeIoError {
+    pub code: String,
+    pub message: String,
+}
+
+impl UpgradeIoError {
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for UpgradeIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UpgradeIoError {}
+
+/// Runtime-neutral byte I/O owned after an HTTP protocol upgrade.
+///
+/// Native and edge adapters implement this trait without exposing their socket
+/// or runtime types to handlers.
+pub type UpgradeReadFuture<'io> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, UpgradeIoError>> + 'io>>;
+pub type UpgradeWriteFuture<'io> = Pin<Box<dyn Future<Output = Result<(), UpgradeIoError>> + 'io>>;
+
+pub trait UpgradedIo: 'static {
+    fn read(&mut self) -> UpgradeReadFuture<'_>;
+
+    fn write(&mut self, bytes: Vec<u8>) -> UpgradeWriteFuture<'_>;
+
+    fn shutdown(&mut self) -> UpgradeWriteFuture<'_>;
+}
+
+pub type UpgradeFuture = Pin<Box<dyn Future<Output = Result<(), UpgradeIoError>> + 'static>>;
+pub type UpgradeHandler = Box<dyn FnOnce(Box<dyn UpgradedIo>) -> UpgradeFuture + 'static>;
+
+/// A validated HTTP protocol switch plus its post-handshake session handler.
+pub struct HttpUpgrade {
+    protocol: &'static str,
+    headers: Vec<ResponseHeader>,
+    handler: Option<UpgradeHandler>,
+}
+
+impl HttpUpgrade {
+    #[must_use]
+    pub fn new(
+        protocol: &'static str,
+        headers: Vec<ResponseHeader>,
+        handler: impl FnOnce(Box<dyn UpgradedIo>) -> UpgradeFuture + 'static,
+    ) -> Self {
+        Self {
+            protocol,
+            headers,
+            handler: Some(Box::new(handler)),
+        }
+    }
+
+    #[must_use]
+    pub const fn protocol(&self) -> &'static str {
+        self.protocol
+    }
+
+    #[must_use]
+    pub fn headers(&self) -> &[ResponseHeader] {
+        &self.headers
+    }
+
+    pub fn extend_headers(&mut self, headers: impl IntoIterator<Item = ResponseHeader>) {
+        self.headers.extend(headers);
+    }
+
+    /// Runs the one-shot upgraded protocol session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter or upgraded protocol error produced by the session.
+    pub async fn run(mut self, io: Box<dyn UpgradedIo>) -> Result<(), UpgradeIoError> {
+        let handler = self.handler.take().ok_or_else(|| {
+            UpgradeIoError::new(
+                "upgrade_already_consumed",
+                "the protocol upgrade handler has already been consumed",
+            )
+        })?;
+        handler(io).await
+    }
+}
+
+impl fmt::Debug for HttpUpgrade {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpUpgrade")
+            .field("protocol", &self.protocol)
+            .field("headers", &self.headers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApiSchema for HttpUpgrade {
+    fn type_descriptor() -> TypeDescriptor {
+        TypeDescriptor::scalar("HttpUpgrade", SchemaKind::Binary)
+    }
+}
+
+/// A failure produced by work scheduled after an HTTP response is sent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackgroundTaskError {
+    pub code: String,
+    pub message: String,
+}
+
+impl BackgroundTaskError {
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for BackgroundTaskError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BackgroundTaskError {}
+
+pub type BackgroundFuture =
+    Pin<Box<dyn Future<Output = Result<(), BackgroundTaskError>> + 'static>>;
+
+/// One runtime-neutral task that begins after the response body is written.
+pub struct BackgroundTask {
+    task: Option<Box<dyn FnOnce() -> BackgroundFuture + 'static>>,
+}
+
+impl BackgroundTask {
+    #[must_use]
+    pub fn new<Task, TaskFuture>(task: Task) -> Self
+    where
+        Task: FnOnce() -> TaskFuture + 'static,
+        TaskFuture: Future<Output = Result<(), BackgroundTaskError>> + 'static,
+    {
+        Self {
+            task: Some(Box::new(move || Box::pin(task()))),
+        }
+    }
+
+    #[must_use]
+    pub fn infallible<Task, TaskFuture>(task: Task) -> Self
+    where
+        Task: FnOnce() -> TaskFuture + 'static,
+        TaskFuture: Future<Output = ()> + 'static,
+    {
+        Self::new(move || async move {
+            task().await;
+            Ok(())
+        })
+    }
+
+    /// Runs this task exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the task failure or an already-consumed error.
+    pub async fn run(mut self) -> Result<(), BackgroundTaskError> {
+        let task = self.task.take().ok_or_else(|| {
+            BackgroundTaskError::new(
+                "background_task_consumed",
+                "background task has already been consumed",
+            )
+        })?;
+        task().await
+    }
+}
+
+impl fmt::Debug for BackgroundTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackgroundTask")
+            .finish_non_exhaustive()
+    }
+}
+
+/// A typed response carrying work that starts after its wire body is sent.
+#[derive(Debug)]
+pub struct Background<T> {
+    response: T,
+    tasks: Vec<BackgroundTask>,
+}
+
+impl<T> Background<T> {
+    #[must_use]
+    pub fn new(response: T) -> Self {
+        Self {
+            response,
+            tasks: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn task(mut self, task: BackgroundTask) -> Self {
+        self.tasks.push(task);
+        self
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (T, Vec<BackgroundTask>) {
+        (self.response, self.tasks)
+    }
+}
+
+impl<T: ApiSchema> ApiSchema for Background<T> {
+    fn type_descriptor() -> TypeDescriptor {
+        T::type_descriptor()
+    }
+}
+
+/// Ergonomic after-response task decoration.
+pub trait BackgroundExt: Sized {
+    #[must_use]
+    fn background(self, task: BackgroundTask) -> Background<Self> {
+        Background::new(self).task(task)
+    }
+}
+
+impl<T> BackgroundExt for T {}
+
+/// Prefixes nested model violations while preserving stable codes/messages.
+pub fn merge_validation_errors(
+    target: &mut ValidationErrors,
+    prefix: &str,
+    nested: &ValidationErrors,
+) {
+    for violation in nested.violations() {
+        let field = if violation.field.is_empty() {
+            prefix.to_owned()
+        } else {
+            format!("{prefix}.{}", violation.field)
+        };
+        target.push(field, violation.code.clone(), violation.message.clone());
     }
 }
 

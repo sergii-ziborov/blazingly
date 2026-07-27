@@ -3,6 +3,12 @@ name = "blazingly-di"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Compiled dependency-injection graph, provider lifetimes, and numeric slot plans for Blazingly"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish.workspace = true
 
 [dependencies]

@@ -209,7 +209,10 @@ fn form_cookie_and_every_http_method_share_the_compiled_router() {
 #[test]
 fn file_upload_has_the_same_typed_http_and_mcp_operation() {
     let executable = executable();
-    let app = TestApp::new(&executable);
+    // `/upload` declares `#[security("upload_key")]`. Dispatch now fails closed
+    // when a declared scheme has no verifier, so this transport-shape test opts
+    // out explicitly instead of registering an unrelated verifier.
+    let app = TestApp::new(&executable).with_unverified_security_schemes(true);
     let boundary = "blazingly-boundary";
     let body = format!(
         "--{boundary}\r\n\

@@ -1,0 +1,29 @@
+[package]
+name = "blazingly-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+blazingly-wire = { path = "../crates/blazingly-wire" }
+libfuzzer-sys = "0.4"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "http1_request"
+path = "fuzz_targets/http1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked_stream"
+path = "fuzz_targets/chunked_stream.rs"
+test = false
+doc = false
+bench = false

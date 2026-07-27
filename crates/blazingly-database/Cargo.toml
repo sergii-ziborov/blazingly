@@ -1,0 +1,21 @@
+[package]
+name = "blazingly-database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Trait seam that schedules synchronous database and ORM clients on the Blazingly blocking pool"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+blazingly-executor.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+
+[lints]
+workspace = true

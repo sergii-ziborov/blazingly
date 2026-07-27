@@ -1,11 +1,21 @@
-[package]
+﻿[package]
 name = "blazingly-openapi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Generates OpenAPI documents and browser UI assets from the Blazingly operation model"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish.workspace = true
 
+[features]
+validation = ["dep:blazingly-validation"]
+
 [dependencies]
+blazingly-validation = { workspace = true, optional = true }
 blazingly-core.workspace = true
 serde_json.workspace = true
 
