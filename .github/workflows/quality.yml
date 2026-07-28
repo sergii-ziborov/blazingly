@@ -20,6 +20,19 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
+  # Enforces deny.toml. The banned-crate list is the point: "Tokio-free, no
+  # Hyper, no Axum" is a claim a reviewer checks with `cargo tree`, so it is
+  # checked here rather than trusted.
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo +stable deny --all-features check bans licenses sources
+
   # `unsafe_code` is forbidden workspace-wide, so neither of the two jobs below
   # is looking for unsafe blocks in Blazingly. They exist to catch undefined
   # behaviour in the dependency stacks the framework drives, and to catch

@@ -98,6 +98,8 @@ this workspace as a submodule. It is consumed both by `blazingly-native` and by
 a standard-library, thread-per-connection example server that uses no async at
 all.
 `blazingly-native` contains the Compio adapter and no Tokio, Hyper, or Axum.
+That is not a claim you have to take on trust: `deny.toml` bans those crates at
+any depth and CI enforces it, so a pull request that would introduce one fails.
 The core and public handler model remain socket- and runtime-neutral and impose
 no unconditional `Send + Sync` bounds. Cloudflare will receive a separate
 adapter over the same operation graph; no Compio, socket, TLS, or native HTTP
@@ -321,7 +323,8 @@ The framework workspace contains:
 - `blazingly-wire`: framework- and runtime-independent HTTP/1 parsing and
   response framing, developed in its own repository and vendored here as a
   submodule;
-- `blazingly-native`: Tokio-free Compio HTTP/1 and experimental HTTP/2 adapter;
+- `blazingly-native`: Tokio-free Compio HTTP/1 adapter, plus an HTTP/2 adapter
+  kept outside the release contour (see [stability](docs/stability.md));
 - `cargo-blazingly`: application discovery, autoreload, diagnostics, and
   production build/run CLI;
 - `blazingly-docs`: API/AI bundles, examples, client starter, and project

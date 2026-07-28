@@ -12,7 +12,40 @@ production trials, not a promise that every public Rust API is frozen.
 | Typed operation contracts | versioned | Breaking changes require a new minor `0.y` release before 1.0 |
 | Framework Rust API | experimental | Breaking changes require a new minor `0.y` release and migration notes |
 | Native HTTP/1 wire behavior | preview | Protocol fixes may change internals; accepted HTTP semantics remain tested |
-| HTTP/2, deployment, CLI, ecosystem adapters | experimental | No compatibility guarantee until promoted |
+| HTTP/2 | out of the release contour | Off by default, behind `native-http2`, excluded from every release gate. See below |
+| Deployment, CLI, ecosystem adapters | experimental | No compatibility guarantee until promoted |
+
+## HTTP/2 is deliberately outside the release contour
+
+HTTP/2 is not a blocker for any Blazingly release, and its status does not
+propagate to the rest of the framework. The reasoning is worth recording,
+because it looks like a gap and is not.
+
+Every Rust framework that advertises HTTP/2 gets it from the same crate:
+hyperium's `h2`. Axum reaches it through Hyper, Actix Web through
+`actix-http`, tonic and reqwest depend on it directly. `h2` needs no Tokio
+runtime — its manifest asks only for Tokio's `io-util` traits — but it does put
+`tokio` and `tokio-util` in the dependency graph. `deny.toml` forbids exactly
+that, on purpose: a framework whose position is "no Tokio, no Hyper, no Axum"
+cannot hold that position while vendoring one of them for trait definitions.
+
+The current `shiguredo_http2` adapter stays available behind the
+`native-http2` feature. It is pinned to a canary release from an upstream whose
+README states that its specification changes actively and that it accepts
+neither issues nor pull requests without prior discussion. That is a reasonable
+basis for an experiment and an unreasonable one for a supported surface, so it
+is treated as the former.
+
+A supported HTTP/2 will live in a separate `blazingly-http2` repository, built
+the same way `blazingly-contract` and `blazingly-wire` are. Both plausible
+starting points are permissively licensed: `h2` is MIT and
+`shiguredo_http2` is Apache-2.0, so either can be forked outright with its
+copyright notice preserved. Forking with attribution is both cheaper and safer
+than reimplementing from a reading of the source, which produces derivative-work
+exposure without the licence that would have covered it.
+
+Until that repository exists, no release gate mentions HTTP/2 and no
+documentation claims it as a supported transport.
 
 Patch releases must remain source-compatible within one `0.y` line. A minor
 release may break a pre-1.0 Rust API, but the change must be documented.
@@ -66,5 +99,5 @@ release may break the framework Rust API. It must become blocking before
 8. Tag the release.
 
 The first `1.0.0` requires a stable facade, documented support window,
-production HTTP/1 hardening, a non-canary HTTP/2 dependency, independent
-security review, and at least two real applications exercising the public API.
+production HTTP/1 hardening, independent security review, and at least two real
+applications exercising the public API. HTTP/2 is not on that list.

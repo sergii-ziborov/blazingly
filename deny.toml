@@ -1,0 +1,58 @@
+# Supply-chain and dependency policy.
+#
+# The bans list below is the load-bearing one. Blazingly's positioning is that
+# it does not run on the Tokio runtime and does not embed Hyper or Axum, and
+# that claim is only worth making if it is mechanically checked. A reviewer can
+# verify it with `cargo tree`, so CI verifies it too: any pull request that
+# introduces one of these crates, at any depth, fails.
+#
+# This is deliberately stricter than "no Tokio runtime". `tokio` with only the
+# `io-util` feature is just trait definitions and would be technically harmless,
+# which is exactly why it is the likely way the dependency would arrive. The
+# hyperium `h2` crate, for example, needs nothing from Tokio but its
+# `AsyncRead`/`AsyncWrite` traits. Adopting it would still put `tokio` in the
+# tree, and that is a decision to take explicitly by editing this file, not a
+# thing to discover after the fact.
+
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "allow"
+# Third-party crates must carry a version requirement. Workspace-internal
+# crates legitimately do not yet: they are path dependencies of an unpublished
+# workspace. `cargo publish` refuses a bare path dependency anyway, so the
+# release process catches what this exemption lets through.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+deny = [
+    { name = "tokio", reason = "Blazingly is a Tokio-free framework; see the note at the top of this file" },
+    { name = "tokio-util", reason = "arrives only alongside Tokio" },
+    { name = "hyper", reason = "Blazingly ships its own HTTP/1 stack" },
+    { name = "hyper-util", reason = "arrives only alongside Hyper" },
+    { name = "axum", reason = "competing framework; must never be a dependency" },
+    { name = "actix-web", reason = "competing framework; must never be a dependency" },
+    { name = "actix-http", reason = "competing framework; must never be a dependency" },
+]
+
+[licenses]
+# Every dependency must be usable in a permissively licensed project.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
