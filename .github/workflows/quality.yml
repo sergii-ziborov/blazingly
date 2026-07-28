@@ -73,15 +73,20 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@cargo-fuzz
+      # `cargo-fuzz` is a third-party subcommand on PATH, not a rustup
+      # component, so `cargo +nightly fuzz` does not resolve it. The toolchain
+      # action above already makes nightly the default, which is what cargo-fuzz
+      # needs, so the plain form is both correct and sufficient.
+      - run: cargo fuzz --version
       - working-directory: fuzz
         run: |
           mkdir -p corpus/http1_request corpus/chunked_stream
           printf 'GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n' > corpus/http1_request/keep-alive
           printf '5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n' > corpus/chunked_stream/body
       - working-directory: fuzz
-        run: cargo +nightly fuzz run http1_request -- -max_total_time=30
+        run: cargo fuzz run http1_request -- -max_total_time=30
       - working-directory: fuzz
-        run: cargo +nightly fuzz run chunked_stream -- -max_total_time=30
+        run: cargo fuzz run chunked_stream -- -max_total_time=30
 
   contract-semver:
     runs-on: ubuntu-latest
@@ -90,13 +95,16 @@ jobs:
         with:
           submodules: true
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # cargo-semver-checks needs a newer rustc than the MSRV this workspace
+      # builds against, so it runs under stable while the crate itself keeps
+      # its 1.88 floor everywhere else.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
       - working-directory: crates/blazingly-contract
         run: |
           git fetch --tags --force origin
           baseline="$(git describe --tags --abbrev=0 HEAD^)"
-          cargo semver-checks check-release --baseline-rev "$baseline"
+          cargo +stable semver-checks check-release --baseline-rev "$baseline"
 
   # Advisory, not a gate. docs/stability.md classifies the framework Rust API
   # as experimental: a pre-1.0 minor release may break it as long as the change
@@ -112,7 +120,7 @@ jobs:
         with:
           submodules: true
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
       - name: Report workspace API changes against the base revision
         env:

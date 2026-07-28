@@ -1727,10 +1727,27 @@ mod tests {
         metrics.finish(HttpMethod::Get, Some("/items"), 200, Duration::ZERO, false);
         let first = metrics.prometheus();
         let second = metrics.prometheus();
-        assert_eq!(first, second);
+        // Only the application-owned families must be identical across scrapes.
+        // The `process_*` families read live resident set size and CPU time, so
+        // they legitimately differ between two consecutive renders.
+        assert_eq!(
+            application_families(&first),
+            application_families(&second),
+            "scraping the metrics endpoint must not change the app's own series"
+        );
         assert_eq!(metrics.requests_total(), 1);
         assert_eq!(metrics.in_flight(), 0);
         assert!(second.contains("blazingly_http_requests_total 1"));
+    }
+
+    /// Keeps the `blazingly_*` families and drops the live process gauges.
+    fn application_families(exposition: &str) -> String {
+        exposition
+            .lines()
+            .filter(|line| !line.contains("process_resident_memory_bytes"))
+            .filter(|line| !line.contains("process_cpu_seconds_total"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

@@ -10,6 +10,9 @@ permissions:
 jobs:
   test:
     strategy:
+      # One platform failing must not cancel the others: a platform-specific
+      # break is exactly what this matrix exists to surface.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
