@@ -5,6 +5,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -17,6 +18,72 @@ pub use blazingly_contract::{
     ResponseDescriptor, ResponseHeader, SchemaKind, SecurityLocation, SecurityRequirement,
     SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationErrors, ValidationRule,
 };
+
+// ---------------------------------------------------------------------------
+// Response body sizing
+// ---------------------------------------------------------------------------
+
+/// Distinct response shapes tracked per thread before slots start colliding.
+const RESPONSE_HINT_SLOTS: usize = 32;
+/// Floor for a learned hint, matching what `serde_json::to_vec` starts with.
+const MIN_RESPONSE_HINT: usize = 128;
+/// Ceiling for a learned hint, so one outsized response cannot make every
+/// later response of that shape reserve megabytes.
+const MAX_RESPONSE_HINT: usize = 1 << 20;
+
+thread_local! {
+    /// Last observed encoded size per response shape, direct mapped.
+    ///
+    /// A JSON body is grown from nothing on every request, which for an 18 KB
+    /// listing means about nine reallocations and 32 KB of copying that the
+    /// previous request already knew the answer to. The table is advisory: a
+    /// stale or colliding entry only changes the initial capacity, never the
+    /// bytes produced.
+    static RESPONSE_SIZE_HINTS: std::cell::RefCell<[(usize, usize); RESPONSE_HINT_SLOTS]> =
+        const { std::cell::RefCell::new([(0, 0); RESPONSE_HINT_SLOTS]) };
+}
+
+/// A per-monomorphization key for `T`.
+///
+/// `type_name` returns a `&'static str` whose address is stable within one
+/// monomorphization. Two types that share an address share a size hint, which
+/// costs at most one reallocation.
+fn response_shape_key<T: ?Sized>() -> usize {
+    core::any::type_name::<T>().as_ptr() as usize
+}
+
+fn response_hint_slot(key: usize) -> usize {
+    (key >> 4) % RESPONSE_HINT_SLOTS
+}
+
+/// Returns the capacity to reserve for the next body of shape `T`.
+#[must_use]
+pub fn response_size_hint<T: ?Sized>() -> usize {
+    let key = response_shape_key::<T>();
+    RESPONSE_SIZE_HINTS.with_borrow(|hints| {
+        let (stored_key, hint) = hints[response_hint_slot(key)];
+        if stored_key == key {
+            hint.max(MIN_RESPONSE_HINT)
+        } else {
+            MIN_RESPONSE_HINT
+        }
+    })
+}
+
+/// Records the encoded size of a body of shape `T`.
+///
+/// The recorded value carries an eighth of headroom so a body that grows
+/// slightly from one request to the next still fits the reserved capacity.
+pub fn record_response_size<T: ?Sized>(size: usize) {
+    let key = response_shape_key::<T>();
+    let hint = size
+        .saturating_add(size / 8)
+        .saturating_add(32)
+        .clamp(MIN_RESPONSE_HINT, MAX_RESPONSE_HINT);
+    RESPONSE_SIZE_HINTS.with_borrow_mut(|hints| {
+        hints[response_hint_slot(key)] = (key, hint);
+    });
+}
 
 /// A typed JSON request body.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +156,128 @@ impl UploadFile {
 impl ApiSchema for UploadFile {
     fn type_descriptor() -> TypeDescriptor {
         TypeDescriptor::scalar("UploadFile", SchemaKind::Binary)
+    }
+}
+
+/// A JSON response body the operation encoded itself.
+///
+/// [`Json<T>`] is encoded *after* the operation has returned, so the value it
+/// wraps has to own everything it prints. An operation that reads from a lock
+/// guard, an arena, or a shared corpus therefore has to clone every string it
+/// wants to include, and those clones are freed again a few microseconds later
+/// once the body has been written.
+///
+/// `PreparedJson<T>` moves the encode step inside the operation, where those
+/// borrows are still alive, and carries the finished bytes to the transport
+/// untouched. A listing operation can build a borrowed view over the store,
+/// encode it while it still holds the read guard, and never allocate an owned
+/// mirror of the data at all.
+///
+/// The type parameter carries the *documented* schema and nothing else: the
+/// operation still advertises `T` in `OpenAPI`, MCP, and compatibility
+/// analysis, exactly as `Json<T>` would.
+///
+/// # Contract
+///
+/// The framework does not re-parse the bytes, so it cannot check them against
+/// `T`. The operation asserts that the body it encoded is a valid instance of
+/// the schema it declares. Use [`PreparedJson::encode`] with a value whose
+/// serialized shape matches `T`; [`PreparedJson::from_bytes`] hands the same
+/// obligation to the caller for bytes produced some other way.
+///
+/// # Examples
+///
+/// ```
+/// use blazingly_core::{ApiSchema, PreparedJson, SchemaKind, TypeDescriptor};
+/// use serde::Serialize;
+///
+/// # struct Page;
+/// # impl ApiSchema for Page {
+/// #     fn type_descriptor() -> TypeDescriptor {
+/// #         TypeDescriptor::scalar("Page", SchemaKind::Object)
+/// #     }
+/// # }
+/// #[derive(Serialize)]
+/// struct BorrowedPage<'store> {
+///     items: Vec<&'store str>,
+/// }
+///
+/// let store = vec![String::from("first"), String::from("second")];
+/// let view = BorrowedPage {
+///     items: store.iter().map(String::as_str).collect(),
+/// };
+/// let body = PreparedJson::<Page>::encode(&view).expect("the view encodes");
+/// assert_eq!(body.as_bytes(), br#"{"items":["first","second"]}"#);
+/// ```
+pub struct PreparedJson<T> {
+    body: Vec<u8>,
+    schema: PhantomData<fn() -> T>,
+}
+
+impl<T> PreparedJson<T> {
+    /// Adopts bytes the caller has already encoded.
+    ///
+    /// The bytes are sent verbatim; see the type-level contract note.
+    #[must_use]
+    pub const fn from_bytes(body: Vec<u8>) -> Self {
+        Self {
+            body,
+            schema: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.body
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.body
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.body.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    /// Encodes `value` into the response body now.
+    ///
+    /// `value` may borrow from anything alive at the call site, which is the
+    /// whole point: it is encoded before the borrow ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `serde_json` failure when `value` cannot be encoded, for
+    /// instance because a map key is not a string.
+    pub fn encode<V>(value: &V) -> Result<Self, serde_json::Error>
+    where
+        V: Serialize + ?Sized,
+    {
+        let mut body = Vec::with_capacity(response_size_hint::<V>());
+        serde_json::to_writer(&mut body, value)?;
+        record_response_size::<V>(body.len());
+        Ok(Self::from_bytes(body))
+    }
+}
+
+impl<T> fmt::Debug for PreparedJson<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedJson")
+            .field("bytes", &self.body.len())
+            .finish()
+    }
+}
+
+impl<T: ApiSchema> ApiSchema for PreparedJson<T> {
+    fn type_descriptor() -> TypeDescriptor {
+        T::type_descriptor()
     }
 }
 
@@ -973,10 +1162,65 @@ macro_rules! descriptors {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BuildError, HttpMethod, InputDescriptor, InputSource, OperationDescriptor,
-        ResponseDescriptor, SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind,
-        TypeDescriptor,
+        ApiSchema, App, BuildError, HttpMethod, InputDescriptor, InputSource, MAX_RESPONSE_HINT,
+        MIN_RESPONSE_HINT, OperationDescriptor, PreparedJson, ResponseDescriptor, SchemaKind,
+        SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
+        record_response_size, response_size_hint,
     };
+
+    struct DocumentedPage;
+
+    impl ApiSchema for DocumentedPage {
+        fn type_descriptor() -> TypeDescriptor {
+            TypeDescriptor::scalar("DocumentedPage", SchemaKind::Object)
+        }
+    }
+
+    struct HintProbe;
+
+    #[test]
+    fn prepared_json_encodes_a_borrowed_view() {
+        let owned = [String::from("alpha"), String::from("beta")];
+        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let body = PreparedJson::<DocumentedPage>::encode(&borrowed).expect("the view encodes");
+        assert_eq!(body.as_bytes(), br#"["alpha","beta"]"#);
+        assert_eq!(body.len(), 16);
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn prepared_json_reports_the_declared_schema_not_its_bytes() {
+        assert_eq!(
+            PreparedJson::<DocumentedPage>::type_descriptor(),
+            DocumentedPage::type_descriptor()
+        );
+    }
+
+    #[test]
+    fn prepared_json_carries_adopted_bytes_verbatim() {
+        let body =
+            PreparedJson::<DocumentedPage>::from_bytes(b"{\"already\":\"encoded\"}".to_vec());
+        assert_eq!(body.into_bytes(), b"{\"already\":\"encoded\"}".to_vec());
+    }
+
+    #[test]
+    fn an_unseen_response_shape_reserves_the_floor() {
+        assert_eq!(response_size_hint::<HintProbe>(), MIN_RESPONSE_HINT);
+    }
+
+    #[test]
+    fn a_recorded_response_shape_reserves_headroom() {
+        record_response_size::<(u8, HintProbe)>(8192);
+        let hint = response_size_hint::<(u8, HintProbe)>();
+        assert!(hint > 8192, "the hint should leave room to grow: {hint}");
+        assert!(hint <= MAX_RESPONSE_HINT);
+    }
+
+    #[test]
+    fn an_outsized_response_cannot_pin_the_hint_above_the_ceiling() {
+        record_response_size::<(u16, HintProbe)>(usize::MAX);
+        assert_eq!(response_size_hint::<(u16, HintProbe)>(), MAX_RESPONSE_HINT);
+    }
 
     fn operation(id: &str, method: HttpMethod, path: &str) -> OperationDescriptor {
         OperationDescriptor::new(

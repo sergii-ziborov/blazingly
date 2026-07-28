@@ -1239,6 +1239,18 @@ struct Expired;
 /// The Compio runtime owns the only timer source. In-memory transports used by
 /// protocol tests run outside a runtime, so those connections stay unbounded
 /// instead of panicking on a missing runtime.
+///
+/// `compio::time::timeout` is deliberately not used. It builds the two branches
+/// as trait objects and shuffles their poll order on every poll, so an
+/// operation the proactor completes inline still inserts and removes a
+/// timer-wheel entry about half the time. IOCP and `io_uring` both finish a
+/// socket write into free send-buffer space without ever parking, which is the
+/// common case on a keep-alive connection, and the timer is pure overhead
+/// there. Polling the operation first and arming the timer only once the
+/// operation parks keeps the deadline while leaving the timer wheel untouched
+/// on the fast path. The deadline then runs from the moment the operation
+/// parks rather than from submission; the difference is the cost of one
+/// submission, and the later start is the conservative direction.
 async fn within<Operation>(
     deadline: Duration,
     operation: Operation,
@@ -1249,9 +1261,15 @@ where
     if compio::runtime::Runtime::try_with_current(|_| ()).is_err() {
         return Ok(operation.await);
     }
-    compio::time::timeout(deadline, operation)
-        .await
-        .map_err(|_| Expired)
+    let mut operation = std::pin::pin!(operation);
+    let mut expiry = std::pin::pin!(compio::time::sleep(deadline));
+    std::future::poll_fn(move |context| {
+        if let Poll::Ready(output) = operation.as_mut().poll(context) {
+            return Poll::Ready(Ok(output));
+        }
+        expiry.as_mut().poll(context).map(|()| Err(Expired))
+    })
+    .await
 }
 
 fn remaining(deadline: Instant) -> Duration {
@@ -3798,6 +3816,68 @@ mod tests {
 
         assert!(written.starts_with("HTTP/1.1 408 "), "{written}");
         assert!(written.contains("request_timeout"), "{written}");
+    }
+
+    /// A transport that reads one scripted request and then never accepts a
+    /// byte, modelling a peer that stopped draining its receive window.
+    struct StalledWriter {
+        input: Vec<u8>,
+    }
+
+    impl AsyncRead for StalledWriter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.input.is_empty() {
+                return Poll::Pending;
+            }
+            let read = self.input.len().min(buffer.len());
+            buffer[..read].copy_from_slice(&self.input[..read]);
+            self.input.drain(..read);
+            Poll::Ready(Ok(read))
+        }
+    }
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn write_deadline_abandons_a_peer_that_never_drains_the_response() {
+        // The deadline arms its timer only once the operation parks, so this
+        // covers the path where the write genuinely blocks. Without a bounded
+        // write, a peer that stops reading pins a connection forever.
+        let limits = ServerLimits::new().with_write_timeout(Duration::from_millis(50));
+        let server = Server::new(ping_app()).with_limits(limits);
+        let runtime = Runtime::new().expect("the Compio runtime starts");
+
+        let error = runtime.block_on(async {
+            let mut transport = StalledWriter {
+                input: b"GET /ping HTTP/1.1\r\nhost: localhost\r\n\r\n".to_vec(),
+            };
+            server
+                .serve_io(&mut transport)
+                .await
+                .expect_err("a stalled write must expire instead of hanging")
+        });
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
     }
 
     #[test]

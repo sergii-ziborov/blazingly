@@ -4,8 +4,8 @@ use base64::Engine;
 use blazingly_core::{
     Accepted, ApiError, ApiModel, ApiSchema, App, AppDefinition, Background, BackgroundTask,
     BodyStreamError, Cookie, Created, File, Form, Header, HttpUpgrade, InputSource, Json,
-    Multipart, NoContent, OperationDescriptor, OperationFailure, OperationId, Path, Query,
-    ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
+    Multipart, NoContent, OperationDescriptor, OperationFailure, OperationId, Path, PreparedJson,
+    Query, ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
     StreamingBody, TypeDescriptor, UploadFile, WithHeaders,
 };
 pub use blazingly_di::DependencyError;
@@ -883,7 +883,7 @@ where
     ) -> Result<Self, InputRejection> {
         let decoded = match input {
             InvocationInput::Http(request) => {
-                let descriptor = T::type_descriptor();
+                let descriptor = cached_type_descriptor::<T>();
                 let parts = parse_multipart_request(*request)?;
                 let value = multipart_argument_value(&parts, name, required, &descriptor)?;
                 serde_json::from_value(value).map_err(|error| {
@@ -1013,6 +1013,17 @@ impl<T: Serialize> OperationOutput for Created<T> {
 impl<T: Serialize> OperationOutput for Accepted<T> {
     fn into_execution_outcome(self) -> ExecutionOutcome {
         serialize_success(202, self.0)
+    }
+}
+
+impl<T> OperationOutput for PreparedJson<T> {
+    fn into_execution_outcome(self) -> ExecutionOutcome {
+        ExecutionOutcome::Success {
+            status: 200,
+            headers: Vec::new(),
+            body: Some(self.into_bytes()),
+            background: Vec::new(),
+        }
     }
 }
 
@@ -2782,14 +2793,26 @@ fn internal_dependency_error(
     }
 }
 
-fn serialize_success(status: u16, value: impl Serialize) -> ExecutionOutcome {
-    match serde_json::to_vec(&value) {
-        Ok(body) => ExecutionOutcome::Success {
-            status,
-            headers: Vec::new(),
-            body: Some(body),
-            background: Vec::new(),
-        },
+/// Encodes a success body, reserving what the previous body of this shape
+/// needed.
+///
+/// `serde_json::to_vec` starts from a 128-byte buffer and doubles, so an 18 KB
+/// listing pays about nine reallocations and copies its own body roughly twice
+/// over before it reaches the transport. The shape key is per-monomorphization,
+/// so each response type learns its own size independently; a stale or
+/// colliding hint changes only the initial capacity, never the bytes produced.
+fn serialize_success<T: Serialize>(status: u16, value: T) -> ExecutionOutcome {
+    let mut body = Vec::with_capacity(blazingly_core::response_size_hint::<T>());
+    match serde_json::to_writer(&mut body, &value) {
+        Ok(()) => {
+            blazingly_core::record_response_size::<T>(body.len());
+            ExecutionOutcome::Success {
+                status,
+                headers: Vec::new(),
+                body: Some(body),
+                background: Vec::new(),
+            }
+        }
         Err(_) => ExecutionOutcome::InternalError {
             code: "serialization_failed".to_owned(),
             message: "operation response could not be serialized".to_owned(),
@@ -3250,6 +3273,43 @@ fn multipart_rejection(reason: &str) -> InputRejection {
     }
 }
 
+thread_local! {
+    /// Type descriptors already built on this thread, keyed by the address of
+    /// the monomorphized `type_descriptor` function.
+    ///
+    /// A descriptor is a compile-time constant of its type, but building one
+    /// allocates a `String` per field name, a nested `TypeDescriptor` per field
+    /// and a `Vec` per rule list — around thirty allocations for a
+    /// seven-field query model, repeated on every single request.
+    ///
+    /// Keying on the function address is sound because two distinct types can
+    /// only share one address if the linker folded their `type_descriptor`
+    /// bodies together, and folding requires the bodies to be byte-identical
+    /// and therefore to produce identical descriptors. Extra entries (the same
+    /// type instantiated in two crates) cost only a duplicate cache line.
+    static TYPE_DESCRIPTORS: std::cell::RefCell<Vec<(usize, Rc<TypeDescriptor>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Returns the descriptor for `T`, building it at most once per thread.
+fn cached_type_descriptor<T: ApiSchema>() -> Rc<TypeDescriptor> {
+    let key = <T as ApiSchema>::type_descriptor as fn() -> TypeDescriptor as usize;
+    let cached = TYPE_DESCRIPTORS.with_borrow(|cache| {
+        cache
+            .iter()
+            .find(|(cached_key, _)| *cached_key == key)
+            .map(|(_, descriptor)| Rc::clone(descriptor))
+    });
+    if let Some(descriptor) = cached {
+        return descriptor;
+    }
+    // Built outside the borrow: a generated descriptor may itself reach back
+    // into this cache for a nested model.
+    let descriptor = Rc::new(T::type_descriptor());
+    TYPE_DESCRIPTORS.with_borrow_mut(|cache| cache.push((key, Rc::clone(&descriptor))));
+    descriptor
+}
+
 fn extract_argument<T>(
     input: &InvocationInput<'_>,
     name: &str,
@@ -3259,7 +3319,8 @@ fn extract_argument<T>(
 where
     T: ApiSchema + DeserializeOwned,
 {
-    let descriptor = T::type_descriptor();
+    // A JSON body is decoded straight from the request bytes and never
+    // consults the descriptor, so it is not built at all on that path.
     if let InvocationInput::Http(request) = input
         && source == InputSource::Json
     {
@@ -3276,6 +3337,7 @@ where
         return validate_decoded(decoded, source);
     }
 
+    let descriptor = cached_type_descriptor::<T>();
     let value = match input {
         InvocationInput::Http(request) => {
             raw_argument_value(*request, name, source, required, &descriptor)?

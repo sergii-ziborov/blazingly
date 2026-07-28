@@ -138,6 +138,7 @@ version = "0.0.1"
 dependencies = [
  "blazingly-contract",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

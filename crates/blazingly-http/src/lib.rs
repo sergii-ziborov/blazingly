@@ -1887,12 +1887,12 @@ mod tests {
         ConnectionInfo, HttpApp, HttpMiddleware, HttpRequestContext, Request, Response, TestApp,
     };
     use blazingly_core::{
-        HttpMethod, OperationDescriptor, ResponseDescriptor, SecurityLocation, SecurityRequirement,
-        SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
+        HttpMethod, OperationDescriptor, PreparedJson, ResponseDescriptor, SecurityLocation,
+        SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
     };
     use blazingly_executor::{
         ExecutableApp, ExecutableOperation, ExecutionOutcome, Extension, FromInvocation,
-        OperationFuture,
+        OperationFuture, OperationOutput,
     };
     use futures_lite::future;
     use serde_json::{Value, json};
@@ -1985,6 +1985,55 @@ mod tests {
             .as_str()
             .expect("stable error code")
             .to_owned()
+    }
+
+    /// An operation that encodes a view borrowed from a value it owns, which
+    /// `Json<T>` cannot express because the borrow ends when the operation
+    /// returns.
+    fn prepared_operation() -> ExecutableOperation {
+        let descriptor = OperationDescriptor::new(
+            HttpMethod::Get,
+            "/prepared",
+            "http.prepared",
+            "Encodes a borrowed view inside the operation",
+            None,
+            vec![ResponseDescriptor::success(
+                200,
+                Some(TypeDescriptor::new("Titles")),
+            )],
+        )
+        .expect("test operation id should be valid");
+        ExecutableOperation::typed(descriptor, |_| {
+            Ok(Box::pin(async move {
+                let owned = [String::from("first"), String::from("second")];
+                let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let body = PreparedJson::<TitlesSchema>::encode(&borrowed)
+                    .expect("the borrowed view encodes");
+                OperationOutput::into_execution_outcome(body)
+            }) as OperationFuture)
+        })
+    }
+
+    struct TitlesSchema;
+
+    impl blazingly_core::ApiSchema for TitlesSchema {
+        fn type_descriptor() -> TypeDescriptor {
+            TypeDescriptor::new("Titles")
+        }
+    }
+
+    #[test]
+    fn a_prepared_body_reaches_the_wire_verbatim_as_json() {
+        let executable = ExecutableApp::new([prepared_operation()])
+            .expect("prepared operation graph should compile");
+        let response = future::block_on(TestApp::new(&executable).call(Request::get("/prepared")));
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.get_header("content-type"),
+            Some("application/json")
+        );
+        assert_eq!(response.body(), br#"["first","second"]"#);
     }
 
     #[test]
