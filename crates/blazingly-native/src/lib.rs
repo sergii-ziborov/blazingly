@@ -2558,7 +2558,16 @@ async fn serve_native_connection(
 }
 
 async fn native_read_more(io: &mut TcpStream, buffer: &mut Vec<u8>) -> io::Result<usize> {
-    let result = CompioAsyncReadExt::append(io, std::mem::take(buffer)).await;
+    let mut taken = std::mem::take(buffer);
+    // Compio's `append` writes into a vector's spare capacity and nothing else.
+    // Without this reservation the connection buffer stops growing the moment
+    // it is full, the next read reports zero bytes, and the caller cannot tell
+    // that apart from a closed peer: every request whose head plus body
+    // exceeded one buffer was answered `400 incomplete_body`.
+    if taken.capacity() - taken.len() < READ_CHUNK_BYTES {
+        taken.reserve(READ_CHUNK_BYTES);
+    }
+    let result = CompioAsyncReadExt::append(io, taken).await;
     *buffer = result.1;
     result.0
 }

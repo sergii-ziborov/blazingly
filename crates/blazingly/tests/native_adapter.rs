@@ -219,6 +219,71 @@ fn native_http1_adapter_rejects_oversized_and_decodes_chunked_requests() {
     assert!(chunked_response.ends_with(r#"{"value":"yes"}"#));
 }
 
+/// A buffered JSON body larger than the connection read buffer must arrive.
+///
+/// Regression: the connection buffer was allocated once with
+/// `Vec::with_capacity(READ_CHUNK_BYTES)` and handed to Compio's `append`,
+/// which only ever fills a vector's spare capacity. Once the buffer was full
+/// the next read returned zero bytes, the adapter read that as end of stream,
+/// and every request with a body over roughly 8 KiB was answered
+/// `400 incomplete_body`. That is the default path for every `Json<T>` handler,
+/// so an ordinary bulk POST could not be received at all.
+#[test]
+fn native_http1_accepts_a_buffered_body_larger_than_the_read_buffer() {
+    // Comfortably past one read buffer, and past two, so a single extra
+    // reservation would not be enough to make this pass by accident.
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
+
+    // The defect lives in the plaintext socket path, which the in-memory
+    // `exchange` helper does not exercise, so this drives a real connection.
+    let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
+    let address = probe.local_addr().expect("address");
+    drop(probe);
+    let (shutdown, signal) = blazingly::native::shutdown_channel();
+    let server_thread = std::thread::spawn(move || {
+        server(1024 * 1024).serve_gracefully(address, signal, Duration::from_secs(2))
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut client = loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+            Err(error) => panic!("server did not start: {error}"),
+        }
+    };
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+
+    // Comfortably past one read buffer, and past two, so a single extra
+    // reservation would not be enough to make this pass by accident.
+    let filler = "x".repeat(40 * 1024);
+    let body = serde_json::to_vec(&serde_json::json!({ "value": filler })).expect("request JSON");
+    let head = format!(
+        "POST /echo HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    client.write_all(head.as_bytes()).expect("request head");
+    client.write_all(&body).expect("request body");
+
+    let mut response = String::new();
+    client.read_to_string(&mut response).expect("response");
+    shutdown.shutdown();
+    server_thread
+        .join()
+        .expect("server thread")
+        .expect("graceful shutdown");
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 "),
+        "a {}-byte buffered body must be accepted, got: {}",
+        body.len(),
+        response.lines().next().unwrap_or_default()
+    );
+    assert!(response.contains(&filler), "echoed body should round-trip");
+}
+
 #[test]
 fn native_http1_starts_streaming_handler_before_the_complete_upload_arrives() {
     use std::net::{TcpListener, TcpStream};
