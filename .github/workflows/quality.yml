@@ -72,23 +72,23 @@ jobs:
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@nightly
-      # `taiki-e/install-action@cargo-fuzz` reports success but leaves no
-      # `cargo-fuzz` on PATH, so install it directly. It is also a third-party
-      # subcommand rather than a rustup component, which is why the `+nightly`
-      # form cannot resolve it; the toolchain action above already makes
-      # nightly the default, which is what cargo-fuzz needs.
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz --version
+      # `taiki-e/install-action@cargo-fuzz` reports success but leaves no
+      # `cargo-fuzz` on PATH, so install it directly. `+nightly` is required on
+      # both the install and the run: rust-toolchain.toml pins this repository
+      # to the 1.88 MSRV, cargo-fuzz's own dependencies need 1.91 or newer to
+      # build, and the fuzz targets need nightly codegen flags.
+      - run: cargo +nightly install cargo-fuzz --locked
+      - run: cargo +nightly fuzz --version
       - working-directory: fuzz
         run: |
           mkdir -p corpus/http1_request corpus/chunked_stream
           printf 'GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n' > corpus/http1_request/keep-alive
           printf '5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n' > corpus/chunked_stream/body
       - working-directory: fuzz
-        run: cargo fuzz run http1_request -- -max_total_time=30
+        run: cargo +nightly fuzz run http1_request -- -max_total_time=30
       - working-directory: fuzz
-        run: cargo fuzz run chunked_stream -- -max_total_time=30
+        run: cargo +nightly fuzz run chunked_stream -- -max_total_time=30
 
   contract-semver:
     runs-on: ubuntu-latest
@@ -142,7 +142,7 @@ jobs:
             echo "no baseline revision available; nothing to compare"
             exit 0
           fi
-          cargo semver-checks check-release \
+          cargo +stable semver-checks check-release \
             --workspace \
             --exclude blazingly-contract \
             --exclude blazingly-wire-standalone \
