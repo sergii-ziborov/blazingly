@@ -121,7 +121,20 @@ pub struct File<T>(pub T);
 ///
 /// Native and Cloudflare adapters may obtain these bytes differently; neither
 /// storage nor socket APIs leak into the operation contract.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// # Wire forms
+///
+/// Deserialization accepts two shapes, because the same type serves two very
+/// different transports:
+///
+/// * the plain object — `field_name`, `file_name`, `content_type`, `bytes` —
+///   which is what [`Serialize`] produces and what an MCP client sends;
+/// * a one-entry *slot token* the multipart extractor writes in place of the
+///   bytes, resolved through [`UploadSlots`] instead of through the document.
+///
+/// The second form exists so that `Multipart<T>` never has to render megabytes
+/// of upload payload as a JSON array of numbers; see [`UploadSlots`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UploadFile {
     pub field_name: String,
     pub file_name: Option<String>,
@@ -156,6 +169,213 @@ impl UploadFile {
 impl ApiSchema for UploadFile {
     fn type_descriptor() -> TypeDescriptor {
         TypeDescriptor::scalar("UploadFile", SchemaKind::Binary)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-band upload transfer
+// ---------------------------------------------------------------------------
+
+/// The reserved object key that stands for an upload parked in a slot.
+///
+/// The `$` prefix and the path separator keep it clear of any identifier a
+/// `#[api_model]` field could be named, and of any key an MCP client is likely
+/// to send by accident.
+const UPLOAD_SLOT_KEY: &str = "$blazingly::upload";
+
+thread_local! {
+    /// Uploads parked for the extraction currently running on this thread.
+    ///
+    /// A typed multipart body is decoded by handing `T` a JSON document built
+    /// from the parts. Text parts belong in that document; upload bytes do not.
+    /// A five-megabyte image rendered as a JSON array costs one `Value` per
+    /// byte — hundreds of megabytes of resident memory and a full
+    /// serialize/deserialize round trip — to arrive at the `Vec<u8>` the
+    /// extractor already held.
+    ///
+    /// So the bytes travel beside the document instead of inside it: the
+    /// extractor parks each upload here, writes a one-entry token in its place,
+    /// and [`UploadFile`]'s deserializer takes the upload back out. The
+    /// document stays small enough to be irrelevant, and the bytes are moved,
+    /// never re-encoded.
+    static UPLOAD_SLOTS: std::cell::RefCell<Vec<Option<UploadFile>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The extraction scope that owns the uploads parked inside it.
+///
+/// Slots opened through this guard are released when it is dropped, whether
+/// the decode succeeded, failed, or never reached them. The guard restores the
+/// table to the length it had on acquisition, so two extractions on one thread
+/// — sequential or nested — cannot see each other's slots.
+///
+/// This is framework plumbing between the executor and [`UploadFile`]'s
+/// deserializer; applications never name it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct UploadSlots {
+    base: usize,
+    /// A slot index only means anything on the thread that parked it, so the
+    /// guard must not travel to another one.
+    thread_bound: PhantomData<*const ()>,
+}
+
+impl UploadSlots {
+    /// Opens a scope for the uploads of one extraction.
+    #[must_use]
+    pub fn acquire() -> Self {
+        Self {
+            base: UPLOAD_SLOTS.with_borrow(Vec::len),
+            thread_bound: PhantomData,
+        }
+    }
+
+    /// Parks `upload` and returns the token that stands for it in the document.
+    ///
+    /// The token is a one-entry object; the bytes stay in the slot table until
+    /// [`UploadFile`]'s deserializer moves them into the decoded value, or
+    /// until this guard is dropped.
+    #[must_use]
+    pub fn park(&self, upload: UploadFile) -> blazingly_json::Value {
+        let index = UPLOAD_SLOTS.with_borrow_mut(|slots| {
+            slots.push(Some(upload));
+            slots.len() - 1
+        });
+        let mut token = blazingly_json::Map::new();
+        token.insert(
+            UPLOAD_SLOT_KEY.to_owned(),
+            blazingly_json::Value::from(index),
+        );
+        blazingly_json::Value::Object(token)
+    }
+}
+
+impl Drop for UploadSlots {
+    fn drop(&mut self) {
+        UPLOAD_SLOTS.with_borrow_mut(|slots| slots.truncate(self.base));
+    }
+}
+
+/// Moves the upload parked at `index` out of the slot table.
+///
+/// Returns `None` for an index that was never parked, was already taken, or
+/// belongs to an extraction that has already ended — which is also what a
+/// forged token in a request body produces.
+fn take_parked_upload(index: usize) -> Option<UploadFile> {
+    UPLOAD_SLOTS.with_borrow_mut(|slots| slots.get_mut(index).and_then(Option::take))
+}
+
+/// Fields understood by [`UploadFile`]'s deserializer.
+enum UploadField {
+    Slot,
+    FieldName,
+    FileName,
+    ContentType,
+    Bytes,
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for UploadField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+            type Value = UploadField;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an uploaded file field name")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<UploadField, E> {
+                Ok(match value {
+                    UPLOAD_SLOT_KEY => UploadField::Slot,
+                    "field_name" => UploadField::FieldName,
+                    "file_name" => UploadField::FileName,
+                    "content_type" => UploadField::ContentType,
+                    "bytes" => UploadField::Bytes,
+                    _ => UploadField::Unknown,
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct UploadFileVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UploadFileVisitor {
+    type Value = UploadFile;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an uploaded file")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<UploadFile, A::Error> {
+        use serde::de::Error as _;
+
+        let mut field_name: Option<String> = None;
+        let mut file_name: Option<Option<String>> = None;
+        let mut content_type: Option<Option<String>> = None;
+        let mut bytes: Option<Vec<u8>> = None;
+
+        while let Some(key) = map.next_key::<UploadField>()? {
+            match key {
+                UploadField::Slot => {
+                    let index = map.next_value::<usize>()?;
+                    let upload = take_parked_upload(index).ok_or_else(|| {
+                        A::Error::custom("uploaded file bytes are no longer available")
+                    })?;
+                    // Drain the rest so the caller's map access finishes cleanly.
+                    while map
+                        .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                        .is_some()
+                    {}
+                    return Ok(upload);
+                }
+                UploadField::FieldName => {
+                    if field_name.is_some() {
+                        return Err(A::Error::duplicate_field("field_name"));
+                    }
+                    field_name = Some(map.next_value()?);
+                }
+                UploadField::FileName => {
+                    if file_name.is_some() {
+                        return Err(A::Error::duplicate_field("file_name"));
+                    }
+                    file_name = Some(map.next_value()?);
+                }
+                UploadField::ContentType => {
+                    if content_type.is_some() {
+                        return Err(A::Error::duplicate_field("content_type"));
+                    }
+                    content_type = Some(map.next_value()?);
+                }
+                UploadField::Bytes => {
+                    if bytes.is_some() {
+                        return Err(A::Error::duplicate_field("bytes"));
+                    }
+                    bytes = Some(map.next_value()?);
+                }
+                UploadField::Unknown => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(UploadFile {
+            field_name: field_name.ok_or_else(|| A::Error::missing_field("field_name"))?,
+            file_name: file_name.unwrap_or_default(),
+            content_type: content_type.unwrap_or_default(),
+            bytes: bytes.ok_or_else(|| A::Error::missing_field("bytes"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for UploadFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["field_name", "file_name", "content_type", "bytes"];
+        deserializer.deserialize_struct("UploadFile", FIELDS, UploadFileVisitor)
     }
 }
 
@@ -1165,7 +1385,7 @@ mod tests {
         ApiSchema, App, BuildError, HttpMethod, InputDescriptor, InputSource, MAX_RESPONSE_HINT,
         MIN_RESPONSE_HINT, OperationDescriptor, PreparedJson, ResponseDescriptor, SchemaKind,
         SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
-        record_response_size, response_size_hint,
+        UploadFile, UploadSlots, record_response_size, response_size_hint,
     };
 
     struct DocumentedPage;
@@ -1220,6 +1440,106 @@ mod tests {
     fn an_outsized_response_cannot_pin_the_hint_above_the_ceiling() {
         record_response_size::<(u16, HintProbe)>(usize::MAX);
         assert_eq!(response_size_hint::<(u16, HintProbe)>(), MAX_RESPONSE_HINT);
+    }
+
+    #[test]
+    fn a_parked_upload_leaves_only_a_token_in_the_document() {
+        let slots = UploadSlots::acquire();
+        let token = slots.park(
+            UploadFile::new("cover", vec![7; 1 << 20])
+                .with_file_name("cover.png")
+                .with_content_type("image/png"),
+        );
+
+        let encoded = blazingly_json::to_string(&token).expect("the token encodes");
+        assert!(
+            encoded.len() < 64,
+            "a megabyte of upload left {} bytes in the document: {encoded}",
+            encoded.len()
+        );
+
+        let decoded: UploadFile = blazingly_json::from_value(token).expect("the token resolves");
+        assert_eq!(decoded.field_name, "cover");
+        assert_eq!(decoded.file_name.as_deref(), Some("cover.png"));
+        assert_eq!(decoded.content_type.as_deref(), Some("image/png"));
+        assert_eq!(decoded.bytes.len(), 1 << 20);
+        assert!(decoded.bytes.iter().all(|byte| *byte == 7));
+    }
+
+    #[test]
+    fn an_upload_slot_does_not_outlive_its_extraction() {
+        let token = {
+            let slots = UploadSlots::acquire();
+            slots.park(UploadFile::new("gone", vec![1, 2, 3]))
+        };
+        let error = blazingly_json::from_value::<UploadFile>(token)
+            .expect_err("a released slot cannot be resolved");
+        assert!(error.to_string().contains("no longer available"), "{error}");
+    }
+
+    #[test]
+    fn an_upload_slot_can_only_be_taken_once() {
+        let slots = UploadSlots::acquire();
+        let token = slots.park(UploadFile::new("once", vec![9]));
+        let first: UploadFile =
+            blazingly_json::from_value(token.clone()).expect("the first take resolves");
+        assert_eq!(first.bytes, vec![9]);
+        assert!(blazingly_json::from_value::<UploadFile>(token).is_err());
+    }
+
+    #[test]
+    fn two_extractions_on_one_thread_cannot_see_each_others_slots() {
+        let outer = UploadSlots::acquire();
+        let outer_token = outer.park(UploadFile::new("outer", vec![1]));
+        let inner_token = {
+            let inner = UploadSlots::acquire();
+            inner.park(UploadFile::new("inner", vec![2]))
+        };
+
+        assert!(blazingly_json::from_value::<UploadFile>(inner_token).is_err());
+        let resolved: UploadFile =
+            blazingly_json::from_value(outer_token).expect("the outer slot survives");
+        assert_eq!(resolved.field_name, "outer");
+    }
+
+    #[test]
+    fn the_object_form_an_mcp_client_sends_still_decodes() {
+        let value = blazingly_json::json!({
+            "field_name": "avatar",
+            "file_name": "a.png",
+            "content_type": "image/png",
+            "bytes": [1, 2, 3]
+        });
+        let upload: UploadFile =
+            blazingly_json::from_value(value).expect("the object form decodes");
+        assert_eq!(
+            upload,
+            UploadFile::new("avatar", vec![1, 2, 3])
+                .with_file_name("a.png")
+                .with_content_type("image/png")
+        );
+    }
+
+    #[test]
+    fn an_upload_survives_its_own_serialized_form() {
+        let upload = UploadFile::new("report", vec![4, 5, 6]).with_file_name("r.bin");
+        let encoded = blazingly_json::to_value(&upload).expect("the upload encodes");
+        let decoded: UploadFile = blazingly_json::from_value(encoded).expect("the upload decodes");
+        assert_eq!(decoded, upload);
+    }
+
+    #[test]
+    fn the_object_form_defaults_metadata_and_still_demands_the_rest() {
+        let minimal: UploadFile =
+            blazingly_json::from_value(blazingly_json::json!({"field_name": "a", "bytes": []}))
+                .expect("optional metadata may be absent");
+        assert!(minimal.file_name.is_none());
+        assert!(minimal.content_type.is_none());
+
+        let error =
+            blazingly_json::from_value::<UploadFile>(blazingly_json::json!({"field_name": "a"}))
+                .expect_err("bytes are required");
+        assert!(error.to_string().contains("bytes"), "{error}");
     }
 
     fn operation(id: &str, method: HttpMethod, path: &str) -> OperationDescriptor {

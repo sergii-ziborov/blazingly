@@ -6,7 +6,7 @@ use blazingly_core::{
     BodyStreamError, Cookie, Created, File, Form, Header, HttpUpgrade, InputSource, Json,
     Multipart, NoContent, OperationDescriptor, OperationFailure, OperationId, Path, PreparedJson,
     Query, ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
-    StreamingBody, TypeDescriptor, UploadFile, WithHeaders,
+    StreamingBody, TypeDescriptor, UploadFile, UploadSlots, WithHeaders,
 };
 pub use blazingly_di::DependencyError;
 use blazingly_di::{
@@ -885,7 +885,12 @@ where
             InvocationInput::Http(request) => {
                 let descriptor = cached_type_descriptor::<T>();
                 let parts = parse_multipart_request(*request)?;
-                let value = multipart_argument_value(&parts, name, required, &descriptor)?;
+                // Upload bytes travel beside the document, not inside it: the
+                // document only carries a slot token per binary part, and this
+                // guard owns the parked bytes until `T` has taken them or the
+                // decode has failed.
+                let slots = UploadSlots::acquire();
+                let value = multipart_argument_value(&parts, name, required, &descriptor, &slots)?;
                 blazingly_json::from_value(value).map_err(|error| {
                     decode_rejection(name, InputSource::Multipart, &error.to_string())
                 })?
@@ -3095,6 +3100,7 @@ fn multipart_argument_value(
     name: &str,
     required: bool,
     descriptor: &TypeDescriptor,
+    slots: &UploadSlots,
 ) -> Result<Value, InputRejection> {
     if let Some(model) = &descriptor.model {
         let mut properties = blazingly_json::Map::new();
@@ -3103,7 +3109,7 @@ fn multipart_argument_value(
                 .iter()
                 .filter(|part| part.name == field.name)
                 .collect::<Vec<_>>();
-            if let Some(value) = multipart_parts_value(&matching, &field.ty)? {
+            if let Some(value) = multipart_parts_value(&matching, &field.ty, slots)? {
                 properties.insert(field.name.clone(), value);
             }
         }
@@ -3117,7 +3123,7 @@ fn multipart_argument_value(
         .iter()
         .filter(|part| part.name == name)
         .collect::<Vec<_>>();
-    multipart_parts_value(&matching, descriptor)?.map_or_else(
+    multipart_parts_value(&matching, descriptor, slots)?.map_or_else(
         || {
             if required {
                 Err(missing_input(name, InputSource::Multipart))
@@ -3132,12 +3138,13 @@ fn multipart_argument_value(
 fn multipart_parts_value(
     parts: &[&MultipartPart<'_>],
     descriptor: &TypeDescriptor,
+    slots: &UploadSlots,
 ) -> Result<Option<Value>, InputRejection> {
     if let SchemaKind::Array(item_schema) = &descriptor.schema {
         let values = if let Some(item) = &descriptor.items {
             parts
                 .iter()
-                .map(|part| multipart_part_value(part, item))
+                .map(|part| multipart_part_value(part, item, slots))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             parts
@@ -3149,17 +3156,21 @@ fn multipart_parts_value(
     }
     parts
         .first()
-        .map(|part| multipart_part_value(part, descriptor))
+        .map(|part| multipart_part_value(part, descriptor, slots))
         .transpose()
 }
 
 fn multipart_part_value(
     part: &MultipartPart<'_>,
     descriptor: &TypeDescriptor,
+    slots: &UploadSlots,
 ) -> Result<Value, InputRejection> {
     if descriptor.schema == SchemaKind::Binary {
-        return blazingly_json::to_value(part.to_upload())
-            .map_err(|_| multipart_rejection("uploaded file metadata could not be decoded"));
+        // The upload is parked whole and the document carries only its slot
+        // token. Encoding the bytes here would turn a megabyte of image into a
+        // million `Value::Number`s that the very next step decodes back into
+        // the `Vec<u8>` this part already owns.
+        return Ok(slots.park(part.to_upload()));
     }
     multipart_scalar_value(part, &descriptor.schema)
 }
@@ -3587,4 +3598,176 @@ macro_rules! routes {
     ($($operation:ident),* $(,)?) => {
         ::std::vec![$($operation::executable()),*]
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FromInvocation, HttpRequestParts, InvocationInput, multipart_argument_value,
+        parse_multipart_request,
+    };
+    use blazingly_core::{
+        ApiModel, ApiSchema, FieldDescriptor, InputSource, ModelDescriptor, Multipart, SchemaKind,
+        TypeDescriptor, UploadFile, UploadSlots, ValidationErrors,
+    };
+    use serde::Deserialize;
+    use std::borrow::Cow;
+
+    const BOUNDARY: &str = "blazingly-test";
+
+    #[derive(Deserialize)]
+    struct CoverUpload {
+        title: String,
+        attachments: Vec<UploadFile>,
+    }
+
+    impl ApiModel for CoverUpload {
+        fn model_descriptor() -> ModelDescriptor {
+            ModelDescriptor::new(
+                "CoverUpload",
+                vec![
+                    FieldDescriptor::new(
+                        "title",
+                        true,
+                        TypeDescriptor::scalar("String", SchemaKind::String),
+                        Vec::new(),
+                    ),
+                    FieldDescriptor::new(
+                        "attachments",
+                        true,
+                        <Vec<UploadFile> as ApiSchema>::type_descriptor(),
+                        Vec::new(),
+                    ),
+                ],
+            )
+        }
+
+        fn validate(&self) -> Result<(), ValidationErrors> {
+            Ok(())
+        }
+    }
+
+    struct Request {
+        content_type: String,
+        body: Vec<u8>,
+    }
+
+    impl HttpRequestParts for Request {
+        fn value(&self, source: InputSource, name: &str, index: usize) -> Option<Cow<'_, str>> {
+            if source == InputSource::Header
+                && name.eq_ignore_ascii_case("content-type")
+                && index == 0
+            {
+                Some(Cow::Borrowed(&self.content_type))
+            } else {
+                None
+            }
+        }
+
+        fn body(&self) -> &[u8] {
+            &self.body
+        }
+    }
+
+    /// Builds a body with one `title` text part and one upload part per fill.
+    fn request(fills: &[(u8, usize)]) -> Request {
+        let total: usize = fills.iter().map(|(_, size)| size).sum();
+        let mut body = Vec::with_capacity(total + 512);
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nrelease\r\n"
+            )
+            .as_bytes(),
+        );
+        for (index, &(fill, size)) in fills.iter().enumerate() {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"attachments\"; \
+                     filename=\"cover{index}.png\"\r\nContent-Type: image/png\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.resize(body.len() + size, fill);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        Request {
+            content_type: format!("multipart/form-data; boundary={BOUNDARY}"),
+            body,
+        }
+    }
+
+    #[test]
+    fn a_typed_upload_never_becomes_a_json_array() {
+        let request = request(&[(b'x', 1 << 20)]);
+        let parts = parse_multipart_request(&request).expect("the multipart body parses");
+        let descriptor = <CoverUpload as ApiSchema>::type_descriptor();
+        let slots = UploadSlots::acquire();
+        let document = multipart_argument_value(&parts, "input", true, &descriptor, &slots)
+            .expect("the document builds");
+
+        let encoded = blazingly_json::to_string(&document).expect("the document encodes");
+        assert!(
+            encoded.len() < 256,
+            "a megabyte of upload left {} bytes in the document: {encoded}",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn a_typed_multipart_model_carries_text_and_upload_bytes() {
+        let request = request(&[(b'x', 4096)]);
+        let Multipart(input) = Multipart::<CoverUpload>::from_invocation(
+            &InvocationInput::Http(&request),
+            "input",
+            true,
+        )
+        .expect("the typed multipart body decodes");
+
+        assert_eq!(input.title, "release");
+        assert_eq!(input.attachments.len(), 1);
+        let attachment = &input.attachments[0];
+        assert_eq!(attachment.field_name, "attachments");
+        assert_eq!(attachment.file_name.as_deref(), Some("cover0.png"));
+        assert_eq!(attachment.content_type.as_deref(), Some("image/png"));
+        assert_eq!(attachment.bytes.len(), 4096);
+        assert!(attachment.bytes.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn repeated_upload_parts_reach_the_handler_in_order() {
+        let request = request(&[(b'a', 8), (b'b', 16)]);
+        let Multipart(input) = Multipart::<CoverUpload>::from_invocation(
+            &InvocationInput::Http(&request),
+            "input",
+            true,
+        )
+        .expect("the typed multipart body decodes");
+
+        assert_eq!(input.attachments.len(), 2);
+        assert_eq!(input.attachments[0].bytes, vec![b'a'; 8]);
+        assert_eq!(input.attachments[1].bytes, vec![b'b'; 16]);
+        assert_eq!(
+            input.attachments[1].file_name.as_deref(),
+            Some("cover1.png")
+        );
+    }
+
+    #[test]
+    fn a_forged_slot_token_in_a_text_part_is_rejected() {
+        // A nested-model text part is parsed as JSON, so a client can write
+        // whatever it likes there. It must not be able to name a slot.
+        let slots = UploadSlots::acquire();
+        let token = slots.park(UploadFile::new("real", vec![1, 2, 3]));
+        let forged = blazingly_json::to_string(&token).expect("the token encodes");
+        drop(slots);
+
+        let error = blazingly_json::from_str::<blazingly_json::Value>(&forged)
+            .map_err(|error| error.to_string())
+            .and_then(|value| {
+                blazingly_json::from_value::<UploadFile>(value).map_err(|error| error.to_string())
+            })
+            .expect_err("a token outside its extraction resolves to nothing");
+        assert!(error.contains("no longer available"), "{error}");
+    }
 }
