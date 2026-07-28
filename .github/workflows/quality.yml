@@ -72,11 +72,13 @@ jobs:
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
-      # `cargo-fuzz` is a third-party subcommand on PATH, not a rustup
-      # component, so `cargo +nightly fuzz` does not resolve it. The toolchain
-      # action above already makes nightly the default, which is what cargo-fuzz
-      # needs, so the plain form is both correct and sufficient.
+      # `taiki-e/install-action@cargo-fuzz` reports success but leaves no
+      # `cargo-fuzz` on PATH, so install it directly. It is also a third-party
+      # subcommand rather than a rustup component, which is why the `+nightly`
+      # form cannot resolve it; the toolchain action above already makes
+      # nightly the default, which is what cargo-fuzz needs.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz --version
       - working-directory: fuzz
         run: |
@@ -91,19 +93,25 @@ jobs:
   contract-semver:
     runs-on: ubuntu-latest
     steps:
+      # The contract is checked out standalone rather than as a submodule.
+      # cargo-semver-checks resolves the baseline ref with its own git
+      # implementation, which cannot follow the gitlink `.git` file a submodule
+      # working tree uses, so `--baseline-rev` fails to find tags that plain
+      # `git describe` finds without trouble.
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          repository: ${{ github.repository_owner }}/blazingly-contract
           fetch-depth: 0
+          path: contract
       # cargo-semver-checks needs a newer rustc than the MSRV this workspace
       # builds against, so it runs under stable while the crate itself keeps
       # its 1.88 floor everywhere else.
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
-      - working-directory: crates/blazingly-contract
+      - working-directory: contract
         run: |
-          git fetch --tags --force origin
           baseline="$(git describe --tags --abbrev=0 HEAD^)"
+          echo "comparing against $baseline"
           cargo +stable semver-checks check-release --baseline-rev "$baseline"
 
   # Advisory, not a gate. docs/stability.md classifies the framework Rust API
