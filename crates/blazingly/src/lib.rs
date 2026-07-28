@@ -75,9 +75,9 @@ pub mod prelude {
     pub use crate::mcp;
     #[cfg(feature = "middleware")]
     pub use crate::middleware::{
-        Compression, Cors, IpNetwork, MemoryRateLimitStore, ProxyHeaders, RateLimit,
-        RateLimitDecision, RateLimitQuota, RateLimitStore, StaticFiles, StaticFilesError,
-        TrustedHost,
+        Compression, ContentEncoding, Cors, IpNetwork, MemoryRateLimitStore, ProxyHeaders,
+        RateLimit, RateLimitDecision, RateLimitQuota, RateLimitStore, StaticFiles,
+        StaticFilesError, TrustedHost,
     };
     #[cfg(feature = "observability")]
     pub use crate::observability::{

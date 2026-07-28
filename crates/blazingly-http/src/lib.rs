@@ -494,6 +494,25 @@ impl Response {
         self.stream.is_some()
     }
 
+    /// Takes the pull-based streaming body, leaving the response buffered.
+    ///
+    /// A middleware layer that transforms a streamed body, such as a
+    /// chunk-wise content encoder, takes the source stream here and installs
+    /// its wrapper with [`Response::set_body_stream`].
+    #[must_use]
+    pub fn take_body_stream(&mut self) -> Option<StreamingBody> {
+        self.stream.take()
+    }
+
+    /// Installs a pull-based streaming body, discarding any buffered bytes.
+    ///
+    /// The caller owns the framing headers: a streamed body has no known
+    /// length, so `content-length` must be removed rather than left stale.
+    pub fn set_body_stream(&mut self, stream: StreamingBody) {
+        self.body.clear();
+        self.stream = Some(stream);
+    }
+
     #[must_use]
     pub const fn is_upgrade(&self) -> bool {
         self.upgrade.is_some()

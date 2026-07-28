@@ -48,6 +48,7 @@ const DEFAULT_MAX_HEADER_BYTES: usize = blazingly_wire::DEFAULT_MAX_HEADER_BYTES
 const DEFAULT_MAX_HEADERS: usize = blazingly_wire::DEFAULT_MAX_HEADERS;
 const DEFAULT_MAX_CHUNKS: usize = blazingly_wire::DEFAULT_MAX_CHUNKS;
 const DEFAULT_MAX_PIPELINE_BATCH: usize = 16;
+const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 const MAX_PIPELINE_WRITE_BYTES: usize = 64 * 1024;
 const MAX_HEADER_CAPACITY: usize = blazingly_wire::MAX_HEADER_CAPACITY;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -1281,6 +1282,103 @@ fn resolve_address(address: impl ToSocketAddrs) -> io::Result<SocketAddr> {
     })
 }
 
+/// The expectation a request declared through its `Expect` header.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Expectation {
+    /// No expectation applies to this request.
+    None,
+    /// The peer withholds its body until an interim `100 Continue` arrives.
+    Continue,
+    /// The peer declared an expectation this server cannot meet.
+    Unsupported,
+}
+
+/// Classifies the `Expect` header of one parsed request head.
+///
+/// RFC 9110 section 10.1.1 defines `100-continue` as the only expectation, so
+/// any other token is one the server cannot meet. An HTTP/1.0 peer never
+/// receives an interim response, so its expectation is ignored instead.
+fn request_expectation(parsed: &ParsedHead, buffer: &[u8]) -> Expectation {
+    let mut expectation = Expectation::None;
+    for header in parsed.headers.iter() {
+        if !header
+            .name
+            .text(buffer)
+            .is_some_and(|name| name.eq_ignore_ascii_case("expect"))
+        {
+            continue;
+        }
+        let Some(value) = header.value.text(buffer) else {
+            return Expectation::Unsupported;
+        };
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if !token.eq_ignore_ascii_case("100-continue") {
+                return Expectation::Unsupported;
+            }
+            expectation = Expectation::Continue;
+        }
+    }
+    if expectation == Expectation::Continue && is_http_1_0(parsed, buffer) {
+        return Expectation::None;
+    }
+    expectation
+}
+
+/// Reports whether the request line declared HTTP/1.0.
+///
+/// The wire parser keeps the protocol version private, so the version token is
+/// read back from the request line the parser already validated.
+fn is_http_1_0(parsed: &ParsedHead, buffer: &[u8]) -> bool {
+    buffer
+        .get(..parsed.head_bytes)
+        .and_then(|head| head.split(|byte| *byte == b'\n').next())
+        .is_some_and(|line| line.trim_ascii_end().ends_with(b"HTTP/1.0"))
+}
+
+/// Whether the framing declares body bytes the peer still has to send.
+const fn expects_request_body(body: BodyFraming) -> bool {
+    match body {
+        BodyFraming::ContentLength(length) => length > 0,
+        BodyFraming::Chunked => true,
+    }
+}
+
+/// Whether a declared `Content-Length` already exceeds the configured limit.
+const fn body_exceeds_limit(body: BodyFraming, limits: ServerLimits) -> bool {
+    match body {
+        BodyFraming::ContentLength(length) => length > limits.max_body_bytes,
+        BodyFraming::Chunked => false,
+    }
+}
+
+/// Writes the interim `100 Continue` response ahead of the request body.
+async fn write_continue<IO>(io: &mut IO, write_timeout: Duration) -> io::Result<()>
+where
+    IO: AsyncWrite + Unpin,
+{
+    write_all_within(io, CONTINUE_RESPONSE, write_timeout).await?;
+    flush_within(io, write_timeout).await
+}
+
+/// Writes the interim `100 Continue` response on the plaintext socket.
+///
+/// Coalesced pipelined responses are flushed first, so the interim status can
+/// never be reordered behind a final one or merged into the same write.
+async fn write_continue_native(
+    io: &mut TcpStream,
+    wire: &mut Vec<u8>,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    flush_native_pending(io, wire, write_timeout).await?;
+    wire.clear();
+    wire.extend_from_slice(CONTINUE_RESPONSE);
+    native_write_all(io, wire, write_timeout).await
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve_connection<IO>(
     app: &HttpApp,
@@ -1382,6 +1480,145 @@ where
             }
             buffer.extend_from_slice(&read_chunk[..read]);
         };
+
+        // The expectation is answered before any body byte is read, so a
+        // request that is rejected anyway never makes the peer send a body.
+        let expectation = request_expectation(&parsed, &buffer);
+        if expectation == Expectation::Unsupported {
+            write_rejection(
+                io,
+                &mut wire_response,
+                417,
+                "expectation_failed",
+                "the Expect header requested an unsupported expectation",
+                limits.write_timeout,
+            )
+            .await?;
+            return Ok(ConnectionOutcome::Completed);
+        }
+        if body_exceeds_limit(parsed.body, limits) {
+            write_rejection(
+                io,
+                &mut wire_response,
+                413,
+                "payload_too_large",
+                "request body exceeds the configured limit",
+                limits.write_timeout,
+            )
+            .await?;
+            return Ok(ConnectionOutcome::Completed);
+        }
+        if expectation == Expectation::Continue && expects_request_body(parsed.body) {
+            write_continue(io, limits.write_timeout).await?;
+        }
+
+        let request_method = framework_method(parsed.method);
+        let streams_request_body = parsed.target.text(&buffer).is_some_and(|target| {
+            app.request_body_source(request_method, target)
+                == Some(blazingly_core::InputSource::Stream)
+        });
+        if streams_request_body {
+            let dispatched = {
+                let mut reader = CompatChunkReader { io: &mut *io };
+                dispatch_streaming(
+                    app,
+                    limits,
+                    &mut reader,
+                    &mut buffer,
+                    &parsed,
+                    peer_addr,
+                    scheme,
+                    request_timeout,
+                )
+                .await
+            };
+            let mut response = match dispatched {
+                Ok(response) => response,
+                Err(StreamingRequestError::Io(error)) => return Err(error),
+                Err(StreamingRequestError::Protocol(rejection)) => {
+                    write_rejection(
+                        io,
+                        &mut wire_response,
+                        rejection.status,
+                        rejection.code,
+                        rejection.message,
+                        limits.write_timeout,
+                    )
+                    .await?;
+                    return Ok(ConnectionOutcome::Completed);
+                }
+                Err(StreamingRequestError::Incomplete(message)) => {
+                    write_rejection(
+                        io,
+                        &mut wire_response,
+                        400,
+                        "incomplete_body",
+                        message,
+                        limits.write_timeout,
+                    )
+                    .await?;
+                    return Ok(ConnectionOutcome::Completed);
+                }
+            };
+            completed_requests += 1;
+            let request_limit_reached = limits
+                .max_requests_per_connection
+                .is_some_and(|limit| completed_requests >= limit.get());
+            let keep_alive = parsed.keep_alive
+                && !request_limit_reached
+                && !shutdown.is_some_and(|shutdown| shutdown.requested.load(Ordering::Acquire));
+            let send_body = parsed.method != blazingly_wire::Method::Head
+                && !matches!(response.status(), 204 | 304)
+                && !(parsed.method == blazingly_wire::Method::Connect
+                    && (200..300).contains(&response.status()));
+            let send_content_length = response.status() != 204
+                && !(parsed.method == blazingly_wire::Method::Connect
+                    && (200..300).contains(&response.status()));
+            if let Some(upgrade) = response.take_upgrade() {
+                if ownership == TransportOwnership::Borrowed {
+                    write_rejection(
+                        io,
+                        &mut wire_response,
+                        501,
+                        "upgrade_transport_unsupported",
+                        "this borrowed transport cannot transfer ownership for an upgrade",
+                        limits.write_timeout,
+                    )
+                    .await?;
+                    return Ok(ConnectionOutcome::Completed);
+                }
+                wire_response.clear();
+                with_cached_date(|date| {
+                    blazingly_wire::encode_upgrade_response(
+                        &mut wire_response,
+                        response.headers(),
+                        date,
+                    )
+                })?;
+                write_all_within(io, &wire_response, limits.write_timeout).await?;
+                flush_within(io, limits.write_timeout).await?;
+                schedule_background(response.take_background_tasks());
+                return Ok(ConnectionOutcome::Upgraded {
+                    upgrade,
+                    buffered: std::mem::take(&mut buffer),
+                });
+            }
+            write_response(
+                io,
+                &mut wire_response,
+                &mut response,
+                keep_alive,
+                send_body,
+                send_content_length,
+                limits.write_timeout,
+            )
+            .await?;
+            schedule_background(response.take_background_tasks());
+            if !keep_alive {
+                return Ok(ConnectionOutcome::Completed);
+            }
+            continue;
+        }
 
         let mut decoded_chunked = None;
         let request_bytes = match parsed.body {
@@ -1620,12 +1857,7 @@ where
     }
 }
 
-/// Plaintext Compio fast path.
-///
-/// `compio::io::compat::AsyncStream` is required for generic TLS and HTTP/2
-/// adapters, but it owns a second read/write buffer and boxes each in-flight
-/// compatibility operation. Plain HTTP/1 can pass owned buffers directly to
-/// Compio, avoiding those copies and per-request I/O allocations.
+/// Why a streaming request could not be dispatched to completion.
 enum StreamingRequestError {
     Io(io::Error),
     Protocol(Rejection),
@@ -1675,15 +1907,58 @@ async fn send_streaming_chunk(
     }
 }
 
-async fn native_stream_read(
-    io: &mut TcpStream,
+/// A transport that yields request-body bytes one owned chunk at a time.
+///
+/// The plaintext socket hands owned buffers straight to Compio while every
+/// other transport reads through `futures-io`. Both feed the same streaming
+/// upload loop, so a TLS peer gets the same backpressure, deadlines, and
+/// decoded-size limits as a plaintext one.
+trait BodyChunkReader {
+    /// Reads the next body chunk, yielding an empty vector at end of input.
+    fn read_chunk(&mut self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + '_>>;
+}
+
+/// Streaming body reader over the plaintext Compio socket.
+struct NativeChunkReader<'io> {
+    io: &'io mut TcpStream,
+}
+
+impl BodyChunkReader for NativeChunkReader<'_> {
+    fn read_chunk(&mut self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + '_>> {
+        Box::pin(async move {
+            let result =
+                CompioAsyncReadExt::append(&mut *self.io, Vec::with_capacity(READ_CHUNK_BYTES))
+                    .await;
+            result.0.map(|_| result.1)
+        })
+    }
+}
+
+/// Streaming body reader over any generic transport, TLS included.
+struct CompatChunkReader<'io, IO> {
+    io: &'io mut IO,
+}
+
+impl<IO> BodyChunkReader for CompatChunkReader<'_, IO>
+where
+    IO: AsyncRead + Unpin,
+{
+    fn read_chunk(&mut self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + '_>> {
+        Box::pin(async move {
+            let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
+            let read = self.io.read(&mut chunk).await?;
+            chunk.truncate(read);
+            Ok(chunk)
+        })
+    }
+}
+
+async fn read_body_chunk(
+    reader: &mut dyn BodyChunkReader,
     mut response_future: Pin<&mut dyn Future<Output = Response>>,
     response: &mut Option<Response>,
 ) -> io::Result<Vec<u8>> {
-    let mut read = Box::pin(async {
-        let result = CompioAsyncReadExt::append(io, Vec::with_capacity(READ_CHUNK_BYTES)).await;
-        result.0.map(|_| result.1)
-    });
+    let mut read = reader.read_chunk();
     if response.is_none() {
         enum Activity {
             Read(io::Result<Vec<u8>>),
@@ -1705,10 +1980,10 @@ async fn native_stream_read(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn dispatch_streaming_native(
+async fn dispatch_streaming(
     app: &HttpApp,
     limits: ServerLimits,
-    io: &mut TcpStream,
+    reader: &mut dyn BodyChunkReader,
     buffer: &mut Vec<u8>,
     parsed: &ParsedHead,
     peer_addr: Option<SocketAddr>,
@@ -1750,7 +2025,7 @@ async fn dispatch_streaming_native(
                 if buffer.is_empty() {
                     let Ok(chunk) = within(
                         limits.body_read_timeout,
-                        native_stream_read(io, response_future.as_mut(), &mut response),
+                        read_body_chunk(&mut *reader, response_future.as_mut(), &mut response),
                     )
                     .await
                     else {
@@ -1817,7 +2092,7 @@ async fn dispatch_streaming_native(
                     StreamingChunk::NeedMore => {
                         let Ok(chunk) = within(
                             limits.body_read_timeout,
-                            native_stream_read(io, response_future.as_mut(), &mut response),
+                            read_body_chunk(&mut *reader, response_future.as_mut(), &mut response),
                         )
                         .await
                         else {
@@ -1852,6 +2127,12 @@ async fn dispatch_streaming_native(
     })
 }
 
+/// Plaintext Compio fast path.
+///
+/// `compio::io::compat::AsyncStream` is required for generic TLS and HTTP/2
+/// adapters, but it owns a second read/write buffer and boxes each in-flight
+/// compatibility operation. Plain HTTP/1 can pass owned buffers directly to
+/// Compio, avoiding those copies and per-request I/O allocations.
 #[allow(clippy::too_many_lines)]
 async fn serve_native_connection(
     app: &HttpApp,
@@ -1953,6 +2234,38 @@ async fn serve_native_connection(
             }
         };
 
+        // The expectation is answered before any body byte is read, so a
+        // request that is rejected anyway never makes the peer send a body.
+        let expectation = request_expectation(&parsed, &buffer);
+        if expectation == Expectation::Unsupported {
+            write_rejection_native(
+                &mut io,
+                &mut wire_response,
+                417,
+                "expectation_failed",
+                "the Expect header requested an unsupported expectation",
+                limits.write_timeout,
+            )
+            .await?;
+            return Ok(());
+        }
+        if body_exceeds_limit(parsed.body, limits) {
+            write_rejection_native(
+                &mut io,
+                &mut wire_response,
+                413,
+                "payload_too_large",
+                "request body exceeds the configured limit",
+                limits.write_timeout,
+            )
+            .await?;
+            return Ok(());
+        }
+        if expectation == Expectation::Continue && expects_request_body(parsed.body) {
+            write_continue_native(&mut io, &mut wire_response, limits.write_timeout).await?;
+            buffered_responses = 0;
+        }
+
         let request_method = framework_method(parsed.method);
         let request_target = parsed
             .target
@@ -1962,18 +2275,21 @@ async fn serve_native_connection(
             == Some(blazingly_core::InputSource::Stream)
         {
             flush_native_pending(&mut io, &mut wire_response, limits.write_timeout).await?;
-            let mut response = match dispatch_streaming_native(
-                app,
-                limits,
-                &mut io,
-                &mut buffer,
-                &parsed,
-                peer_addr,
-                scheme,
-                request_timeout,
-            )
-            .await
-            {
+            let dispatched = {
+                let mut reader = NativeChunkReader { io: &mut io };
+                dispatch_streaming(
+                    app,
+                    limits,
+                    &mut reader,
+                    &mut buffer,
+                    &parsed,
+                    peer_addr,
+                    scheme,
+                    request_timeout,
+                )
+                .await
+            };
+            let mut response = match dispatched {
                 Ok(response) => response,
                 Err(StreamingRequestError::Io(error)) => return Err(error),
                 Err(StreamingRequestError::Protocol(rejection)) => {
@@ -3080,6 +3396,97 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Appends one ordered observation to the per-test event log.
+    fn record(event: impl Into<String>) {
+        EVENTS.with(|events| events.borrow_mut().push(event.into()));
+    }
+
+    fn recorded_events() -> Vec<String> {
+        EVENTS.with(|events| events.borrow().clone())
+    }
+
+    fn clear_events() {
+        EVENTS.with(|events| events.borrow_mut().clear());
+    }
+
+    fn event_position(events: &[String], event: &str) -> usize {
+        events
+            .iter()
+            .position(|recorded| recorded == event)
+            .unwrap_or_else(|| panic!("{event} was never recorded: {events:?}"))
+    }
+
+    /// An in-memory transport releasing one scripted segment per read.
+    ///
+    /// Every released segment and every interim status the server writes is
+    /// appended to the event log, so a test can assert how client writes,
+    /// server writes, and handler progress interleave.
+    struct StagedTransport {
+        segments: Vec<(&'static str, Vec<u8>)>,
+        next: usize,
+        written: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl StagedTransport {
+        fn new(segments: Vec<(&'static str, Vec<u8>)>) -> Self {
+            Self {
+                segments,
+                next: 0,
+                written: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn written(&self) -> String {
+            String::from_utf8_lossy(&self.written.borrow()).into_owned()
+        }
+    }
+
+    impl AsyncRead for StagedTransport {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let Some((label, bytes)) = self.segments.get(self.next).cloned() else {
+                return Poll::Ready(Ok(0));
+            };
+            assert!(
+                bytes.len() <= buffer.len(),
+                "a staged segment must fit one read"
+            );
+            self.next += 1;
+            record(format!("client:{label}"));
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+    }
+
+    impl AsyncWrite for StagedTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if buffer.starts_with(b"HTTP/1.1 100 ") {
+                record("server:continue");
+            }
+            self.written.borrow_mut().extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct StampMiddleware;
 
     impl HttpMiddleware for StampMiddleware {
@@ -3197,6 +3604,66 @@ mod tests {
         })
     }
 
+    /// A streaming upload operation that records every chunk it observes.
+    fn logging_upload_operation() -> ExecutableOperation {
+        let descriptor = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/staged-upload",
+            "upload.staged",
+            "Staged upload",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .expect("the staged upload descriptor is valid")
+        .with_inputs(vec![InputDescriptor::new(
+            "body",
+            InputSource::Stream,
+            true,
+            TypeDescriptor::scalar("UploadBody", SchemaKind::Binary),
+        )]);
+        ExecutableOperation::typed(descriptor, |input| {
+            let mut body = UploadBody::from_invocation(&input, "body", true)?;
+            Ok(Box::pin(async move {
+                let mut bytes = 0_usize;
+                while let Some(chunk) = body.next_chunk().await {
+                    match chunk {
+                        Ok(chunk) => {
+                            record(format!("handler:{}", String::from_utf8_lossy(&chunk)));
+                            bytes += chunk.len();
+                        }
+                        Err(error) => {
+                            return ExecutionOutcome::InternalError {
+                                code: error.code,
+                                message: error.message,
+                            };
+                        }
+                    }
+                }
+                ExecutionOutcome::Success {
+                    status: 200,
+                    headers: vec![ResponseHeader::new("content-type", "text/plain")],
+                    body: Some(format!("bytes={bytes}").into_bytes()),
+                    background: Vec::new(),
+                }
+            }) as OperationFuture)
+        })
+    }
+
+    /// A POST route without a declared body input, so the adapter buffers the
+    /// request body instead of streaming it.
+    fn buffered_post_operation() -> ExecutableOperation {
+        let descriptor = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/buffered",
+            "buffered.post",
+            "Buffered post",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .expect("the buffered descriptor is valid");
+        ExecutableOperation::empty(descriptor, || async { Json("stored") })
+    }
+
     #[cfg(feature = "http2")]
     fn never_completing_operation() -> ExecutableOperation {
         let descriptor = OperationDescriptor::new(
@@ -3217,6 +3684,15 @@ mod tests {
     /// Runs one request against a real accepted socket through the same entry
     /// point the accept loop uses, and returns every byte the server wrote.
     fn native_exchange(operations: Vec<ExecutableOperation>, request: Vec<u8>) -> Vec<u8> {
+        native_exchange_with_limits(operations, request, ServerLimits::new())
+    }
+
+    /// Runs [`native_exchange`] with explicit wire limits.
+    fn native_exchange_with_limits(
+        operations: Vec<ExecutableOperation>,
+        request: Vec<u8>,
+        limits: ServerLimits,
+    ) -> Vec<u8> {
         let runtime = Runtime::new().expect("the Compio runtime starts");
         runtime.block_on(async move {
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
@@ -3237,7 +3713,7 @@ mod tests {
                     peer,
                     None,
                     super::ConnectionSetup {
-                        limits: ServerLimits::new(),
+                        limits,
                         request_timeout: None,
                         #[cfg(feature = "tls")]
                         tls_acceptor: None,
@@ -3674,6 +4150,274 @@ mod tests {
         assert!(
             completed,
             "a reset stream must drop its handler instead of holding the connection open"
+        );
+    }
+
+    #[test]
+    fn generic_transport_streams_a_body_before_the_client_finishes_it() {
+        clear_events();
+        let server = Server::new(
+            ExecutableApp::new([logging_upload_operation()]).expect("the upload app compiles"),
+        );
+        let mut transport = StagedTransport::new(vec![
+            (
+                "head",
+                b"POST /staged-upload HTTP/1.1\r\nhost: localhost\r\ncontent-length: 8\r\nconnection: close\r\n\r\n".to_vec(),
+            ),
+            ("first", b"aaaa".to_vec()),
+            ("last", b"bbbb".to_vec()),
+        ]);
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let events = recorded_events();
+        assert!(
+            event_position(&events, "handler:aaaa") < event_position(&events, "client:last"),
+            "the generic transport buffered the whole body before dispatch: {events:?}"
+        );
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 200 "), "{written}");
+        assert!(written.ends_with("bytes=8"), "{written}");
+    }
+
+    #[test]
+    fn owned_generic_transport_streams_uploads_like_the_plaintext_socket() {
+        let server = Server::new(
+            ExecutableApp::new([upload_operation("/upload", "upload.consume", true)])
+                .expect("the upload app compiles"),
+        );
+        let transport = ScriptedTransport::closing(
+            b"POST /upload HTTP/1.1\r\nhost: localhost\r\ncontent-length: 11\r\nconnection: close\r\n\r\nhello world",
+        );
+        let written = transport.output();
+
+        future::block_on(server.serve_owned_io(transport)).expect("the connection completes");
+
+        let written = String::from_utf8_lossy(&written.borrow()).into_owned();
+        assert!(written.starts_with("HTTP/1.1 200 "), "{written}");
+        assert!(
+            written.ends_with("bytes=11"),
+            "the owned generic transport did not reach the streaming seam: {written}"
+        );
+    }
+
+    #[test]
+    fn generic_transport_streams_a_chunked_upload() {
+        let server = Server::new(
+            ExecutableApp::new([upload_operation("/upload", "upload.consume", true)])
+                .expect("the upload app compiles"),
+        );
+        let mut transport = ScriptedTransport::closing(
+            b"POST /upload HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        );
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let written = transport.written();
+        assert!(written.ends_with("bytes=11"), "{written}");
+    }
+
+    #[test]
+    fn generic_transport_enforces_the_chunk_count_limit_while_streaming() {
+        let limits = ServerLimits::new().with_max_chunks(1);
+        let server = Server::new(
+            ExecutableApp::new([upload_operation("/upload", "upload.consume", true)])
+                .expect("the upload app compiles"),
+        )
+        .with_limits(limits);
+        let mut transport = ScriptedTransport::closing(
+            b"POST /upload HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        );
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 413 "), "{written}");
+        assert!(written.contains("too_many_chunks"), "{written}");
+    }
+
+    #[test]
+    fn generic_transport_answers_a_truncated_upload_with_400() {
+        let server = Server::new(
+            ExecutableApp::new([upload_operation("/upload", "upload.consume", true)])
+                .expect("the upload app compiles"),
+        );
+        let mut transport = ScriptedTransport::closing(
+            b"POST /upload HTTP/1.1\r\nhost: localhost\r\ncontent-length: 11\r\nconnection: close\r\n\r\nhell",
+        );
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 400 "), "{written}");
+        assert!(written.contains("incomplete_body"), "{written}");
+    }
+
+    #[test]
+    fn interim_continue_precedes_the_request_body_on_the_generic_transport() {
+        clear_events();
+        let server = Server::new(
+            ExecutableApp::new([buffered_post_operation()]).expect("the buffered app compiles"),
+        );
+        let mut transport = StagedTransport::new(vec![
+            (
+                "head",
+                b"POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 5\r\nexpect: 100-continue\r\nconnection: close\r\n\r\n".to_vec(),
+            ),
+            ("body", b"hello".to_vec()),
+        ]);
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        assert_eq!(
+            recorded_events(),
+            ["client:head", "server:continue", "client:body"],
+            "the interim response must be written before the body is read"
+        );
+        let written = transport.written();
+        assert!(
+            written.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 "),
+            "{written}"
+        );
+        assert_eq!(
+            written.matches("100 Continue").count(),
+            1,
+            "the interim response was sent more than once: {written}"
+        );
+    }
+
+    #[test]
+    fn interim_continue_precedes_a_streamed_upload_on_the_generic_transport() {
+        clear_events();
+        let server = Server::new(
+            ExecutableApp::new([logging_upload_operation()]).expect("the upload app compiles"),
+        );
+        let mut transport = StagedTransport::new(vec![
+            (
+                "head",
+                b"POST /staged-upload HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4\r\nexpect: 100-continue\r\nconnection: close\r\n\r\n".to_vec(),
+            ),
+            ("body", b"aaaa".to_vec()),
+        ]);
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        assert_eq!(
+            recorded_events(),
+            [
+                "client:head",
+                "server:continue",
+                "client:body",
+                "handler:aaaa"
+            ],
+            "the streaming path must answer the expectation before reading the body"
+        );
+    }
+
+    #[test]
+    fn interim_continue_is_written_on_the_plaintext_socket() {
+        let response = native_exchange(
+            vec![buffered_post_operation()],
+            b"POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 5\r\nexpect: 100-continue\r\nconnection: close\r\n\r\nhello"
+                .to_vec(),
+        );
+
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(
+            response.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 "),
+            "{response}"
+        );
+        assert_eq!(
+            response.matches("100 Continue").count(),
+            1,
+            "the interim response was sent more than once: {response}"
+        );
+    }
+
+    #[test]
+    fn unknown_expectation_is_answered_with_417_on_the_generic_transport() {
+        let server = Server::new(
+            ExecutableApp::new([buffered_post_operation()]).expect("the buffered app compiles"),
+        );
+        let mut transport = ScriptedTransport::closing(
+            b"POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 5\r\nexpect: the-moon\r\n\r\nhello",
+        );
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 417 "), "{written}");
+        assert!(written.contains("expectation_failed"), "{written}");
+        assert!(!written.contains("100 Continue"), "{written}");
+    }
+
+    #[test]
+    fn unknown_expectation_is_answered_with_417_on_the_plaintext_socket() {
+        let response = native_exchange(
+            vec![buffered_post_operation()],
+            b"POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 5\r\nexpect: the-moon\r\n\r\nhello"
+                .to_vec(),
+        );
+
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(response.starts_with("HTTP/1.1 417 "), "{response}");
+        assert!(response.contains("expectation_failed"), "{response}");
+    }
+
+    #[test]
+    fn an_oversized_expected_body_is_answered_with_413_without_an_interim_response() {
+        let server = Server::new(
+            ExecutableApp::new([buffered_post_operation()]).expect("the buffered app compiles"),
+        )
+        .with_limits(ServerLimits::new().with_max_body_bytes(8));
+        let mut transport = ScriptedTransport::closing(
+            b"POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4096\r\nexpect: 100-continue\r\n\r\n",
+        );
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 413 "), "{written}");
+        assert!(written.contains("payload_too_large"), "{written}");
+        assert!(
+            !written.contains("100 Continue"),
+            "a rejected request must not be invited to send its body: {written}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_streamed_body_is_answered_with_413_on_the_plaintext_socket() {
+        let response = native_exchange_with_limits(
+            vec![upload_operation("/upload", "upload.consume", true)],
+            b"POST /upload HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4096\r\nexpect: 100-continue\r\n\r\n"
+                .to_vec(),
+            ServerLimits::new().with_max_body_bytes(8),
+        );
+
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(
+            !response.contains("100 Continue"),
+            "a rejected upload must not be invited to send its body: {response}"
+        );
+        assert!(response.contains("payload_too_large"), "{response}");
+    }
+
+    #[test]
+    fn an_http_1_0_expectation_is_ignored() {
+        let server = Server::new(
+            ExecutableApp::new([buffered_post_operation()]).expect("the buffered app compiles"),
+        );
+        let mut transport = ScriptedTransport::closing(
+            b"POST /buffered HTTP/1.0\r\nhost: localhost\r\ncontent-length: 5\r\nexpect: 100-continue\r\n\r\nhello",
+        );
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 200 "), "{written}");
+        assert!(
+            !written.contains("100 Continue"),
+            "an HTTP/1.0 peer must never receive an interim response: {written}"
         );
     }
 

@@ -6,7 +6,7 @@
 //! in-memory, and future Worker adapters therefore share the same behavior
 //! without taking a dependency on Tokio.
 
-use blazingly_core::HttpMethod;
+use blazingly_core::{BodyStream, BodyStreamError, HttpMethod, StreamingBody};
 use blazingly_http::{HttpMiddleware, HttpRequestContext, HttpRequestView, Response};
 use brotli::CompressorWriter;
 use flate2::Compression as GzipLevel;
@@ -18,11 +18,14 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Cross-origin request policy and preflight handler.
@@ -936,6 +939,115 @@ impl Compression {
         self.brotli_quality = quality;
         self
     }
+
+    /// Wraps a pull-based body in a chunk-wise encoder for `encoding`.
+    ///
+    /// Every source chunk is written, flushed out of the encoder, and yielded
+    /// before the next chunk is pulled, so a live stream such as Server-Sent
+    /// Events is delivered event by event instead of sitting in the encoder's
+    /// buffer. The encoder trailer is emitted as a final chunk when the source
+    /// ends. A producer error terminates the compressed stream without that
+    /// trailer, so a truncated body never decodes as a complete one.
+    ///
+    /// The caller owns the `Content-Encoding` and `Vary` headers.
+    /// [`Compression::on_response`] applies this automatically to a streaming
+    /// response; this method is public so a handler can encode a stream it
+    /// builds itself.
+    #[must_use]
+    pub fn compress_stream(
+        &self,
+        source: StreamingBody,
+        encoding: ContentEncoding,
+    ) -> StreamingBody {
+        StreamingBody::new(CompressedStream {
+            source,
+            encoder: Some(ChunkEncoder::new(
+                encoding,
+                self.gzip_level,
+                self.brotli_quality,
+            )),
+        })
+    }
+
+    /// Wraps a streamed response body in a chunk-wise encoder.
+    ///
+    /// The buffered path's `minimum_size` check cannot apply here: the length
+    /// is unknown before the producer finishes, and waiting for it would defeat
+    /// streaming. Every other guard is the same, and the encoder flushes per
+    /// chunk so a live stream such as SSE stays live.
+    fn compress_streaming(
+        &self,
+        method: HttpMethod,
+        accepted: Option<&str>,
+        response: &mut Response,
+    ) {
+        if method == HttpMethod::Head
+            || response.status() < 200
+            || matches!(response.status(), 204 | 206 | 304)
+            || response.get_header("content-encoding").is_some()
+            || response
+                .get_header("cache-control")
+                .is_some_and(|value| value.split(',').any(|part| part.trim() == "no-transform"))
+            || !compressible(response.get_header("content-type"))
+        {
+            return;
+        }
+        let Some(encoding) = preferred_encoding(accepted) else {
+            return;
+        };
+        let Some(source) = response.take_body_stream() else {
+            return;
+        };
+        response.set_body_stream(self.compress_stream(source, encoding));
+        // An encoded stream has no length known in advance, so a stale
+        // `content-length` would frame the response incorrectly.
+        response.remove_header("content-length");
+        response.set_header("content-encoding", encoding.as_str());
+        append_vary(response, "accept-encoding");
+        weaken_validator(response);
+    }
+
+    fn compress_buffered(
+        &self,
+        method: HttpMethod,
+        accepted: Option<&str>,
+        response: &mut Response,
+    ) {
+        if method == HttpMethod::Head
+            || response.is_streaming()
+            || response.body().len() < self.minimum_size
+            || response.status() < 200
+            // 206 carries a Content-Range measured in the selected
+            // representation's bytes, which re-encoding would invalidate.
+            || matches!(response.status(), 204 | 206 | 304)
+            || response.get_header("content-encoding").is_some()
+            || response
+                .get_header("cache-control")
+                .is_some_and(|value| value.split(',').any(|part| part.trim() == "no-transform"))
+            || !compressible(response.get_header("content-type"))
+        {
+            return;
+        }
+        let Some(encoding) = preferred_encoding(accepted) else {
+            return;
+        };
+        let compressed = match encoding {
+            ContentEncoding::Brotli => compress_brotli(response.body(), self.brotli_quality),
+            ContentEncoding::Gzip => compress_gzip(response.body(), self.gzip_level),
+        };
+        let Ok(compressed) = compressed else {
+            return;
+        };
+        if compressed.len() >= response.body().len() {
+            return;
+        }
+        if response.replace_body(compressed) {
+            response.remove_header("content-length");
+            response.set_header("content-encoding", encoding.as_str());
+            append_vary(response, "accept-encoding");
+            weaken_validator(response);
+        }
+    }
 }
 
 impl Default for Compression {
@@ -951,52 +1063,150 @@ impl HttpMiddleware for Compression {
         _operation: Option<&blazingly_core::OperationDescriptor>,
         response: &mut Response,
     ) {
-        if context.request().method() == HttpMethod::Head
-            || response.is_streaming()
-            || response.body().len() < self.minimum_size
-            || response.status() < 200
-            || matches!(response.status(), 204 | 304)
-            || response.get_header("content-encoding").is_some()
-            || response
-                .get_header("cache-control")
-                .is_some_and(|value| value.split(',').any(|part| part.trim() == "no-transform"))
-            || !compressible(response.get_header("content-type"))
-        {
-            return;
-        }
-        let accepted = joined_header(context.request(), "accept-encoding");
-        let Some(encoding) = preferred_encoding(accepted.as_deref()) else {
-            return;
-        };
-        let compressed = match encoding {
-            Encoding::Brotli => compress_brotli(response.body(), self.brotli_quality),
-            Encoding::Gzip => compress_gzip(response.body(), self.gzip_level),
-        };
-        let Ok(compressed) = compressed else {
-            return;
-        };
-        if compressed.len() >= response.body().len() {
-            return;
-        }
-        if response.replace_body(compressed) {
-            response.remove_header("content-length");
-            response.set_header("content-encoding", encoding.as_str());
-            append_vary(response, "accept-encoding");
+        let request = context.request();
+        let accepted = joined_header(request, "accept-encoding");
+        if response.is_streaming() {
+            self.compress_streaming(request.method(), accepted.as_deref(), response);
+        } else {
+            self.compress_buffered(request.method(), accepted.as_deref(), response);
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Encoding {
+/// A negotiated response content coding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentEncoding {
+    /// Brotli, sent as `Content-Encoding: br`.
     Brotli,
+    /// Deflate in a gzip wrapper, sent as `Content-Encoding: gzip`.
     Gzip,
 }
 
-impl Encoding {
-    const fn as_str(self) -> &'static str {
+impl ContentEncoding {
+    /// Token used in `Accept-Encoding` and `Content-Encoding`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Brotli => "br",
             Self::Gzip => "gzip",
+        }
+    }
+}
+
+/// Picks the best supported coding for an `Accept-Encoding` field value.
+///
+/// Returns `None` when the client accepts neither Brotli nor gzip.
+#[must_use]
+pub fn negotiate_encoding(accepted: Option<&str>) -> Option<ContentEncoding> {
+    preferred_encoding(accepted)
+}
+
+/// A stateful encoder that flushes after every chunk.
+///
+/// Both variants are boxed so the enum stays small; the Brotli encoder state is
+/// far larger than the gzip one.
+enum ChunkEncoder {
+    Brotli(Box<CompressorWriter<Vec<u8>>>),
+    Gzip(Box<GzEncoder<Vec<u8>>>),
+}
+
+impl ChunkEncoder {
+    fn new(encoding: ContentEncoding, gzip_level: u32, brotli_quality: u32) -> Self {
+        match encoding {
+            ContentEncoding::Brotli => Self::Brotli(Box::new(CompressorWriter::new(
+                Vec::new(),
+                4096,
+                brotli_quality.min(11),
+                22,
+            ))),
+            ContentEncoding::Gzip => Self::Gzip(Box::new(GzEncoder::new(
+                Vec::new(),
+                GzipLevel::new(gzip_level.min(9)),
+            ))),
+        }
+    }
+
+    /// Encodes one chunk and flushes it, so the bytes are decodable now rather
+    /// than after the encoder's window fills.
+    fn encode(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::Brotli(encoder) => {
+                encoder.write_all(chunk)?;
+                encoder.flush()?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+            Self::Gzip(encoder) => {
+                encoder.write_all(chunk)?;
+                encoder.flush()?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+        }
+    }
+
+    /// Writes the encoder trailer once the source stream has ended.
+    fn finish(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            // `into_inner` finishes the Brotli stream. It cannot surface a write
+            // failure, and the sink is an in-memory buffer that cannot fail.
+            Self::Brotli(encoder) => Ok(encoder.into_inner()),
+            Self::Gzip(encoder) => (*encoder).finish(),
+        }
+    }
+}
+
+/// Pull stream that compresses each source chunk as it arrives.
+struct CompressedStream {
+    source: StreamingBody,
+    /// Taken once the stream is finished or has failed, which is also the
+    /// signal that no trailer may be written.
+    encoder: Option<ChunkEncoder>,
+}
+
+impl BodyStream for CompressedStream {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, BodyStreamError>>> {
+        let this = self.get_mut();
+        loop {
+            if this.encoder.is_none() {
+                return Poll::Ready(None);
+            }
+            // `StreamingBody::next_chunk` forwards exactly one `poll_next` and
+            // keeps no state between calls, so polling a fresh future once is
+            // the same as pulling the source once.
+            let mut next = pin!(this.source.next_chunk());
+            match next.as_mut().poll(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(bytes))) => {
+                    let coder = this.encoder.as_mut().expect("encoder is present");
+                    match coder.encode(&bytes) {
+                        // A zero-length chunk terminates a chunked transfer
+                        // body, so pull again instead of yielding one.
+                        Ok(encoded) if encoded.is_empty() => {}
+                        Ok(encoded) => return Poll::Ready(Some(Ok(encoded))),
+                        Err(error) => {
+                            this.encoder = None;
+                            return Poll::Ready(Some(Err(BodyStreamError::new(
+                                "compression_failed",
+                                error.to_string(),
+                            ))));
+                        }
+                    }
+                }
+                // The producer failed. Dropping the encoder without its trailer
+                // keeps the truncated body from decoding as a complete one.
+                Poll::Ready(Some(Err(error))) => {
+                    this.encoder = None;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    let encoder = this.encoder.take().expect("encoder is present");
+                    return Poll::Ready(Some(encoder.finish().map_err(|error| {
+                        BodyStreamError::new("compression_failed", error.to_string())
+                    })));
+                }
+            }
         }
     }
 }
@@ -1179,18 +1389,52 @@ impl StaticFiles {
         if not_modified(request, &etag, modified) {
             return self.decorate(Response::empty(304), &etag, modified);
         }
-        let (body, length) = if head {
-            (Vec::new(), metadata.len())
+        let total = metadata.len();
+        // A range applies to GET only, and only where the alternative would be a
+        // 200; the 304 and error paths have already returned.
+        let outcome = if head {
+            RangeOutcome::Full
         } else {
-            let Ok(body) = fs::read(path) else {
-                return json_error(500, "static_read_failed", "static asset could not be read");
-            };
-            let length = body.len() as u64;
-            (body, length)
+            requested_range(request, total, &etag, modified)
         };
-        let mut response = Response::from_bytes(200, body);
+        let (mut response, length) = match outcome {
+            RangeOutcome::Unsatisfiable => {
+                let response = json_error(
+                    416,
+                    "range_not_satisfiable",
+                    "requested range is outside the asset",
+                )
+                .with_header("accept-ranges", "bytes")
+                .with_header("content-range", format!("bytes */{total}"));
+                return self.decorate(response, &etag, modified);
+            }
+            RangeOutcome::Partial { start, end } => {
+                let length = end - start + 1;
+                let wanted = usize::try_from(length).unwrap_or(usize::MAX);
+                // A short read means the file changed after its metadata was
+                // read, so the promised Content-Range no longer holds.
+                let body = read_range(path, start, length)
+                    .ok()
+                    .filter(|body| body.len() == wanted);
+                let Some(body) = body else {
+                    return json_error(500, "static_read_failed", "static asset could not be read");
+                };
+                let mut response = Response::from_bytes(206, body);
+                response.set_header("content-range", format!("bytes {start}-{end}/{total}"));
+                (response, length)
+            }
+            RangeOutcome::Full if head => (Response::empty(200), total),
+            RangeOutcome::Full => {
+                let Ok(body) = fs::read(path) else {
+                    return json_error(500, "static_read_failed", "static asset could not be read");
+                };
+                let length = body.len() as u64;
+                (Response::from_bytes(200, body), length)
+            }
+        };
         response.set_header("content-type", mime_type(path));
         response.set_header("content-length", length.to_string());
+        response.set_header("accept-ranges", "bytes");
         self.decorate(response, &etag, modified)
     }
 
@@ -1469,7 +1713,7 @@ fn compressible(content_type: Option<&str>) -> bool {
     })
 }
 
-fn preferred_encoding(value: Option<&str>) -> Option<Encoding> {
+fn preferred_encoding(value: Option<&str>) -> Option<ContentEncoding> {
     let value = value?;
     let mut brotli = None;
     let mut gzip = None;
@@ -1494,9 +1738,21 @@ fn preferred_encoding(value: Option<&str>) -> Option<Encoding> {
     if brotli <= 0.0 && gzip <= 0.0 {
         None
     } else if brotli >= gzip {
-        Some(Encoding::Brotli)
+        Some(ContentEncoding::Brotli)
     } else {
-        Some(Encoding::Gzip)
+        Some(ContentEncoding::Gzip)
+    }
+}
+
+/// Downgrades a strong validator after re-encoding, because the bytes no longer
+/// match the entity tag the origin computed for the identity coding.
+fn weaken_validator(response: &mut Response) {
+    let weakened = response
+        .get_header("etag")
+        .filter(|etag| !etag.starts_with("W/"))
+        .map(|etag| format!("W/{etag}"));
+    if let Some(weakened) = weakened {
+        response.set_header("etag", weakened);
     }
 }
 
@@ -1601,15 +1857,147 @@ fn not_modified(request: &dyn HttpRequestView, etag: &str, modified: Option<Syst
     let (Ok(since), Some(modified)) = (httpdate::parse_http_date(header), modified) else {
         return false;
     };
-    let since = since
-        .duration_since(UNIX_EPOCH)
+    matches!(
+        (unix_seconds(modified), unix_seconds(since)),
+        (Some(modified), Some(since)) if modified <= since
+    )
+}
+
+/// How a `Range` request header applies to a representation of known length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeOutcome {
+    /// No usable range: answer with the complete representation.
+    Full,
+    /// A satisfiable single range, inclusive at both ends.
+    Partial { start: u64, end: u64 },
+    /// A well-formed range that lies outside the representation.
+    Unsatisfiable,
+}
+
+/// One parsed `byte-range-spec`, before it is resolved against a length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeSpec {
+    /// `first-pos "-" last-pos`.
+    Bounded { first: u64, last: u64 },
+    /// `first-pos "-"`.
+    From(u64),
+    /// `"-" suffix-length`.
+    Suffix(u64),
+}
+
+/// Resolves the `Range` and `If-Range` headers of a GET against the asset.
+fn requested_range(
+    request: &dyn HttpRequestView,
+    total: u64,
+    etag: &str,
+    modified: Option<SystemTime>,
+) -> RangeOutcome {
+    let Some(header) = request.header_value("range", 0) else {
+        return RangeOutcome::Full;
+    };
+    // Conflicting Range fields are ambiguous, and a stale If-Range validator
+    // means the client's cached prefix no longer belongs to this asset.
+    if request.header_value("range", 1).is_some() || !if_range_matches(request, etag, modified) {
+        return RangeOutcome::Full;
+    }
+    parse_range(header).map_or(RangeOutcome::Full, |spec| resolve_range(spec, total))
+}
+
+/// Parses a single-range `bytes=` header. A malformed or multi-range header
+/// yields `None`, which RFC 9110 lets the origin answer with the full body.
+fn parse_range(header: &str) -> Option<RangeSpec> {
+    let (unit, spec) = header.trim().split_once('=')?;
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let (first, last) = (first.trim(), last.trim());
+    if first.is_empty() {
+        return Some(RangeSpec::Suffix(range_number(last)?));
+    }
+    let first = range_number(first)?;
+    if last.is_empty() {
+        return Some(RangeSpec::From(first));
+    }
+    let last = range_number(last)?;
+    (last >= first).then_some(RangeSpec::Bounded { first, last })
+}
+
+const fn resolve_range(spec: RangeSpec, total: u64) -> RangeOutcome {
+    match spec {
+        // A zero-length suffix selects nothing, and no range of a zero-length
+        // representation is satisfiable.
+        RangeSpec::Suffix(0) => RangeOutcome::Unsatisfiable,
+        RangeSpec::Suffix(_) if total == 0 => RangeOutcome::Unsatisfiable,
+        RangeSpec::Suffix(length) => RangeOutcome::Partial {
+            start: total.saturating_sub(length),
+            end: total - 1,
+        },
+        RangeSpec::From(first) | RangeSpec::Bounded { first, .. } if first >= total => {
+            RangeOutcome::Unsatisfiable
+        }
+        RangeSpec::From(first) => RangeOutcome::Partial {
+            start: first,
+            end: total - 1,
+        },
+        RangeSpec::Bounded { first, last } => RangeOutcome::Partial {
+            start: first,
+            end: if last < total { last } else { total - 1 },
+        },
+    }
+}
+
+fn range_number(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// RFC 9110 section 13.1.5: a range is honoured only while the client's
+/// validator still matches, and only a strong validator qualifies.
+fn if_range_matches(
+    request: &dyn HttpRequestView,
+    etag: &str,
+    modified: Option<SystemTime>,
+) -> bool {
+    let Some(validator) = request.header_value("if-range", 0) else {
+        return true;
+    };
+    let validator = validator.trim();
+    if validator.starts_with('"') {
+        return validator == etag;
+    }
+    if validator.starts_with("W/") {
+        return false;
+    }
+    let (Ok(supplied), Some(modified)) = (httpdate::parse_http_date(validator), modified) else {
+        return false;
+    };
+    matches!(
+        (unix_seconds(supplied), unix_seconds(modified)),
+        (Some(supplied), Some(modified)) if supplied == modified
+    )
+}
+
+/// Reads only the requested slice so a range over a large asset never loads the
+/// whole file.
+fn read_range(path: &Path, start: u64, length: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut body = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+    file.take(length).read_to_end(&mut body)?;
+    Ok(body)
+}
+
+fn unix_seconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
         .ok()
-        .map(|age| age.as_secs());
-    let modified = modified
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|age| age.as_secs());
-    matches!((modified, since), (Some(modified), Some(since)) if modified <= since)
+        .map(|age| age.as_secs())
 }
 
 fn etag_matches(header: &str, etag: &str) -> bool {
@@ -1626,8 +2014,13 @@ fn etag_matches(header: &str, etag: &str) -> bool {
 mod tests {
     use super::*;
     use blazingly_http::Request;
+    use std::collections::VecDeque;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Waker;
+
+    /// The exact bytes of the asset every static test mount serves.
+    const ASSET: &str = "export const answer = 42;";
 
     /// A request view that can carry repeated header fields, which the
     /// map-backed test [`Request`] cannot express.
@@ -1701,9 +2094,63 @@ mod tests {
         }
     }
 
+    /// A source stream that stays pending until the test hands it more data,
+    /// which is how a live event stream behaves between events.
+    #[derive(Default)]
+    struct PacedState {
+        ready: VecDeque<Result<Vec<u8>, BodyStreamError>>,
+        ended: bool,
+    }
+
+    struct PacedSource {
+        state: Rc<RefCell<PacedState>>,
+    }
+
+    impl BodyStream for PacedSource {
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Vec<u8>, BodyStreamError>>> {
+            let mut state = self.state.borrow_mut();
+            if let Some(item) = state.ready.pop_front() {
+                return Poll::Ready(Some(item));
+            }
+            if state.ended {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn paced_stream(state: &Rc<RefCell<PacedState>>) -> StreamingBody {
+        StreamingBody::new(PacedSource {
+            state: Rc::clone(state),
+        })
+    }
+
+    fn poll_chunk(stream: &mut StreamingBody) -> Poll<Option<Result<Vec<u8>, BodyStreamError>>> {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut chunk = pin!(stream.next_chunk());
+        chunk.as_mut().poll(&mut context)
+    }
+
+    fn ready_chunk(stream: &mut StreamingBody) -> Vec<u8> {
+        match poll_chunk(stream) {
+            Poll::Ready(Some(Ok(chunk))) => chunk,
+            other => panic!("expected a ready chunk, got {other:?}"),
+        }
+    }
+
+    fn gunzip(encoded: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(encoded).read_to_end(&mut decoded)?;
+        Ok(decoded)
+    }
+
     fn static_mount(label: &str) -> (TempDir, StaticFiles) {
         let directory = TempDir::new(label);
-        directory.write("app.js", "export const answer = 42;");
+        directory.write("app.js", ASSET);
         directory.write("index.html", "<!doctype html><title>app</title>");
         let files = StaticFiles::new("/static", &directory.path)
             .expect("mount")
@@ -1755,11 +2202,11 @@ mod tests {
     fn brotli_wins_equal_quality_negotiation() {
         assert!(matches!(
             preferred_encoding(Some("gzip, br")),
-            Some(Encoding::Brotli)
+            Some(ContentEncoding::Brotli)
         ));
         assert!(matches!(
             preferred_encoding(Some("br;q=0.2, gzip;q=0.8")),
-            Some(Encoding::Gzip)
+            Some(ContentEncoding::Gzip)
         ));
     }
 
@@ -2033,5 +2480,286 @@ mod tests {
         assert_eq!(mime_type(Path::new("a/b.svg")), "image/svg+xml");
         assert_eq!(mime_type(Path::new("a/b.bin")), "application/octet-stream");
         assert_eq!(mime_type(Path::new("a/b")), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_satisfiable_range_returns_partial_content() {
+        let (_directory, files) = static_mount("range");
+        let response = files
+            .respond(&Request::get("/static/app.js").header("range", "bytes=7-11"))
+            .expect("static asset");
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.body(), b"const");
+        assert_eq!(response.get_header("content-range"), Some("bytes 7-11/25"));
+        assert_eq!(response.get_header("content-length"), Some("5"));
+        assert_eq!(response.get_header("accept-ranges"), Some("bytes"));
+        assert_eq!(
+            response.get_header("content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn open_ended_and_suffix_ranges_clamp_to_the_asset() {
+        let (_directory, files) = static_mount("range-forms");
+        let open = files
+            .respond(&Request::get("/static/app.js").header("range", "bytes=20-"))
+            .expect("static asset");
+        assert_eq!(open.status(), 206);
+        assert_eq!(open.body(), b"= 42;");
+        assert_eq!(open.get_header("content-range"), Some("bytes 20-24/25"));
+
+        let suffix = files
+            .respond(&Request::get("/static/app.js").header("range", "bytes=-3"))
+            .expect("static asset");
+        assert_eq!(suffix.status(), 206);
+        assert_eq!(suffix.body(), b"42;");
+        assert_eq!(suffix.get_header("content-range"), Some("bytes 22-24/25"));
+
+        // A suffix longer than the asset, and a last-pos past its end, both
+        // clamp instead of failing.
+        let clamped = files
+            .respond(&Request::get("/static/app.js").header("range", "bytes=-900"))
+            .expect("static asset");
+        assert_eq!(clamped.status(), 206);
+        assert_eq!(clamped.body(), ASSET.as_bytes());
+        assert_eq!(clamped.get_header("content-range"), Some("bytes 0-24/25"));
+
+        let past_end = files
+            .respond(&Request::get("/static/app.js").header("range", "bytes=22-900"))
+            .expect("static asset");
+        assert_eq!(past_end.status(), 206);
+        assert_eq!(past_end.get_header("content-range"), Some("bytes 22-24/25"));
+    }
+
+    #[test]
+    fn an_unsatisfiable_range_returns_416() {
+        let (_directory, files) = static_mount("range-unsatisfiable");
+        for header in ["bytes=25-40", "bytes=100-", "bytes=-0"] {
+            let response = files
+                .respond(&Request::get("/static/app.js").header("range", header))
+                .expect("static asset");
+            assert_eq!(response.status(), 416, "{header}");
+            assert_eq!(response.get_header("content-range"), Some("bytes */25"));
+            assert_eq!(response.get_header("accept-ranges"), Some("bytes"));
+        }
+    }
+
+    #[test]
+    fn a_stale_if_range_validator_returns_the_full_representation() {
+        let (_directory, files) = static_mount("if-range-stale");
+        let response = files
+            .respond(
+                &Request::get("/static/app.js")
+                    .header("range", "bytes=0-4")
+                    .header("if-range", "\"0-deadbeef\""),
+            )
+            .expect("static asset");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), ASSET.as_bytes());
+        assert_eq!(response.get_header("content-length"), Some("25"));
+        assert_eq!(response.get_header("accept-ranges"), Some("bytes"));
+        assert!(response.get_header("content-range").is_none());
+    }
+
+    #[test]
+    fn a_matching_if_range_validator_keeps_the_range() {
+        let (_directory, files) = static_mount("if-range-fresh");
+        let full = files
+            .respond(&Request::get("/static/app.js"))
+            .expect("static asset");
+        let etag = full.get_header("etag").expect("etag").to_owned();
+        let last_modified = full
+            .get_header("last-modified")
+            .expect("last-modified")
+            .to_owned();
+
+        let tagged = files
+            .respond(
+                &Request::get("/static/app.js")
+                    .header("range", "bytes=0-5")
+                    .header("if-range", &etag),
+            )
+            .expect("static asset");
+        assert_eq!(tagged.status(), 206);
+        assert_eq!(tagged.body(), b"export");
+
+        let dated = files
+            .respond(
+                &Request::get("/static/app.js")
+                    .header("range", "bytes=0-5")
+                    .header("if-range", &last_modified),
+            )
+            .expect("static asset");
+        assert_eq!(dated.status(), 206);
+
+        // A weak validator never satisfies If-Range.
+        let weak = files
+            .respond(
+                &Request::get("/static/app.js")
+                    .header("range", "bytes=0-5")
+                    .header("if-range", format!("W/{etag}")),
+            )
+            .expect("static asset");
+        assert_eq!(weak.status(), 200);
+    }
+
+    #[test]
+    fn unusable_range_headers_fall_back_to_the_full_representation() {
+        let (_directory, files) = static_mount("range-fallback");
+        for header in [
+            // Multi-range is answered with the whole representation instead of
+            // a multipart/byteranges payload.
+            "bytes=0-10,20-30",
+            "bytes=abc-def",
+            "bytes=5-2",
+            "items=0-10",
+            "bytes=-",
+        ] {
+            let response = files
+                .respond(&Request::get("/static/app.js").header("range", header))
+                .expect("static asset");
+            assert_eq!(response.status(), 200, "{header}");
+            assert_eq!(response.body(), ASSET.as_bytes(), "{header}");
+        }
+    }
+
+    #[test]
+    fn range_is_ignored_outside_get() {
+        let (_directory, files) = static_mount("range-head");
+        let response = files
+            .respond(&Request::head("/static/app.js").header("range", "bytes=0-4"))
+            .expect("static asset");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.get_header("content-length"), Some("25"));
+        assert!(response.body().is_empty());
+        assert!(response.get_header("content-range").is_none());
+    }
+
+    #[test]
+    fn a_conditional_hit_still_wins_over_a_range() {
+        let (_directory, files) = static_mount("range-conditional");
+        let full = files
+            .respond(&Request::get("/static/app.js"))
+            .expect("static asset");
+        let etag = full.get_header("etag").expect("etag").to_owned();
+        let response = files
+            .respond(
+                &Request::get("/static/app.js")
+                    .header("if-none-match", &etag)
+                    .header("range", "bytes=0-4"),
+            )
+            .expect("static asset");
+        assert_eq!(response.status(), 304);
+    }
+
+    #[test]
+    fn compression_downgrades_a_strong_validator() {
+        let mut response = Response::from_bytes(200, "a".repeat(4096));
+        response.set_header("content-type", "text/plain; charset=utf-8");
+        response.set_header("etag", "\"1000-abc\"");
+        Compression::new().compress_buffered(HttpMethod::Get, Some("gzip"), &mut response);
+        assert_eq!(response.get_header("content-encoding"), Some("gzip"));
+        assert_eq!(response.get_header("etag"), Some("W/\"1000-abc\""));
+    }
+
+    #[test]
+    fn compression_leaves_partial_content_alone() {
+        let mut response = Response::from_bytes(206, "a".repeat(4096));
+        response.set_header("content-type", "text/plain; charset=utf-8");
+        response.set_header("content-range", "bytes 0-4095/10000");
+        Compression::new().compress_buffered(HttpMethod::Get, Some("gzip"), &mut response);
+        assert!(response.get_header("content-encoding").is_none());
+        assert_eq!(response.body().len(), 4096);
+    }
+
+    #[test]
+    fn streaming_compression_emits_a_chunk_before_the_source_ends() {
+        let state = Rc::new(RefCell::new(PacedState::default()));
+        state
+            .borrow_mut()
+            .ready
+            .push_back(Ok(b"event: tick\ndata: 1\n\n".to_vec()));
+        let mut stream =
+            Compression::new().compress_stream(paced_stream(&state), ContentEncoding::Gzip);
+
+        let first = ready_chunk(&mut stream);
+        assert!(!first.is_empty());
+        // The source has not produced another event and has not ended, so the
+        // first event was delivered while the stream is still live.
+        assert!(poll_chunk(&mut stream).is_pending());
+        assert!(!state.borrow().ended);
+
+        state.borrow_mut().ended = true;
+        let trailer = ready_chunk(&mut stream);
+        assert!(matches!(poll_chunk(&mut stream), Poll::Ready(None)));
+
+        let mut encoded = first;
+        encoded.extend_from_slice(&trailer);
+        assert_eq!(
+            gunzip(&encoded).expect("gzip member"),
+            b"event: tick\ndata: 1\n\n"
+        );
+    }
+
+    #[test]
+    fn a_producer_error_terminates_the_compressed_stream() {
+        let state = Rc::new(RefCell::new(PacedState::default()));
+        {
+            let mut state = state.borrow_mut();
+            state.ready.push_back(Ok(b"data: one\n\n".to_vec()));
+            state.ready.push_back(Err(BodyStreamError::new(
+                "upstream_failed",
+                "producer gone",
+            )));
+        }
+        let mut stream =
+            Compression::new().compress_stream(paced_stream(&state), ContentEncoding::Gzip);
+
+        let first = ready_chunk(&mut stream);
+        match poll_chunk(&mut stream) {
+            Poll::Ready(Some(Err(error))) => assert_eq!(error.code, "upstream_failed"),
+            other => panic!("expected the producer error, got {other:?}"),
+        }
+        assert!(matches!(poll_chunk(&mut stream), Poll::Ready(None)));
+        // No trailer was written, so the truncated body is not a complete
+        // member and cannot be mistaken for one.
+        assert!(gunzip(&first).is_err());
+    }
+
+    #[test]
+    fn brotli_streaming_round_trips_every_chunk() {
+        let state = Rc::new(RefCell::new(PacedState::default()));
+        {
+            let mut state = state.borrow_mut();
+            state.ready.push_back(Ok(b"first ".to_vec()));
+            state.ready.push_back(Ok(b"second".to_vec()));
+            state.ended = true;
+        }
+        let mut stream =
+            Compression::new().compress_stream(paced_stream(&state), ContentEncoding::Brotli);
+
+        let mut encoded = Vec::new();
+        let mut chunks = 0;
+        while let Poll::Ready(Some(chunk)) = poll_chunk(&mut stream) {
+            encoded.extend_from_slice(&chunk.expect("chunk"));
+            chunks += 1;
+        }
+        assert!(chunks >= 2, "each source chunk should be flushed out");
+        let mut decoded = Vec::new();
+        brotli::Decompressor::new(encoded.as_slice(), 4096)
+            .read_to_end(&mut decoded)
+            .expect("brotli stream");
+        assert_eq!(decoded, b"first second");
+    }
+
+    #[test]
+    fn encoding_negotiation_is_public() {
+        assert_eq!(
+            negotiate_encoding(Some("gzip, br")),
+            Some(ContentEncoding::Brotli)
+        );
+        assert_eq!(negotiate_encoding(Some("identity")), None);
+        assert_eq!(ContentEncoding::Gzip.as_str(), "gzip");
     }
 }
