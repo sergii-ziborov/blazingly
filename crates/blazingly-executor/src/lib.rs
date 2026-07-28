@@ -13,9 +13,9 @@ use blazingly_di::{
     CompiledProvider, DependencyLifetime, DependencyRequest, DependencySlot, DependencyValue,
     Depends, Provider,
 };
+use blazingly_json::{Value, json};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -886,7 +886,7 @@ where
                 let descriptor = cached_type_descriptor::<T>();
                 let parts = parse_multipart_request(*request)?;
                 let value = multipart_argument_value(&parts, name, required, &descriptor)?;
-                serde_json::from_value(value).map_err(|error| {
+                blazingly_json::from_value(value).map_err(|error| {
                     decode_rejection(name, InputSource::Multipart, &error.to_string())
                 })?
             }
@@ -2796,14 +2796,14 @@ fn internal_dependency_error(
 /// Encodes a success body, reserving what the previous body of this shape
 /// needed.
 ///
-/// `serde_json::to_vec` starts from a 128-byte buffer and doubles, so an 18 KB
+/// `blazingly_json::to_vec` starts from a 128-byte buffer and doubles, so an 18 KB
 /// listing pays about nine reallocations and copies its own body roughly twice
 /// over before it reaches the transport. The shape key is per-monomorphization,
 /// so each response type learns its own size independently; a stale or
 /// colliding hint changes only the initial capacity, never the bytes produced.
 fn serialize_success<T: Serialize>(status: u16, value: T) -> ExecutionOutcome {
     let mut body = Vec::with_capacity(blazingly_core::response_size_hint::<T>());
-    match serde_json::to_writer(&mut body, &value) {
+    match blazingly_json::to_writer(&mut body, &value) {
         Ok(()) => {
             blazingly_core::record_response_size::<T>(body.len());
             ExecutionOutcome::Success {
@@ -3097,7 +3097,7 @@ fn multipart_argument_value(
     descriptor: &TypeDescriptor,
 ) -> Result<Value, InputRejection> {
     if let Some(model) = &descriptor.model {
-        let mut properties = serde_json::Map::new();
+        let mut properties = blazingly_json::Map::new();
         for field in &model.fields {
             let matching = parts
                 .iter()
@@ -3158,7 +3158,7 @@ fn multipart_part_value(
     descriptor: &TypeDescriptor,
 ) -> Result<Value, InputRejection> {
     if descriptor.schema == SchemaKind::Binary {
-        return serde_json::to_value(part.to_upload())
+        return blazingly_json::to_value(part.to_upload())
             .map_err(|_| multipart_rejection("uploaded file metadata could not be decoded"));
     }
     multipart_scalar_value(part, &descriptor.schema)
@@ -3226,7 +3226,7 @@ fn upload_from_value(value: &Value, name: &str) -> Result<UploadFile, InputRejec
             );
         }
     }
-    serde_json::from_value(value.clone())
+    blazingly_json::from_value(value.clone())
         .map_err(|error| decode_rejection(name, InputSource::File, &error.to_string()))
 }
 
@@ -3324,7 +3324,7 @@ where
     if let InvocationInput::Http(request) = input
         && source == InputSource::Json
     {
-        let mut deserializer = serde_json::Deserializer::from_slice(request.body());
+        let mut deserializer = blazingly_json::Deserializer::from_slice(request.body());
         let decoded =
             serde_path_to_error::deserialize::<_, T>(&mut deserializer).map_err(|error| {
                 decode_path_rejection(
@@ -3347,7 +3347,7 @@ where
         }
     };
 
-    let decoded = serde_json::from_value::<T>(value)
+    let decoded = blazingly_json::from_value::<T>(value)
         .map_err(|error| decode_rejection(name, source, &error.to_string()))?;
     validate_decoded(decoded, source)
 }
@@ -3357,7 +3357,7 @@ fn validate_decoded<T: ApiSchema>(decoded: T, source: InputSource) -> Result<T, 
         status: 422,
         code: "validation_error".to_owned(),
         message: format!("{} input failed validation", source_name(source)),
-        details: serde_json::to_value(errors).ok(),
+        details: blazingly_json::to_value(errors).ok(),
     })?;
     Ok(decoded)
 }
@@ -3378,7 +3378,7 @@ fn raw_argument_value(
                     .map(|(name, value)| (name.to_owned(), value))
             })
             .collect();
-        let properties: serde_json::Map<String, Value> = properties;
+        let properties: blazingly_json::Map<String, Value> = properties;
         if properties.is_empty() && !required {
             return Ok(Value::Null);
         }
@@ -3404,7 +3404,7 @@ fn structured_argument_value(
 ) -> Result<Value, InputRejection> {
     if descriptor.model.is_some() {
         let value = select_model_fields(arguments, name, descriptor);
-        if value.as_object().is_some_and(serde_json::Map::is_empty) && !required {
+        if value.as_object().is_some_and(blazingly_json::Map::is_empty) && !required {
             return Ok(Value::Null);
         }
         return Ok(value);
@@ -3497,10 +3497,10 @@ fn raw_scalar_value(value: &str, schema: &SchemaKind) -> Value {
             Value::String(value.to_owned())
         }
         SchemaKind::Integer | SchemaKind::Number | SchemaKind::Boolean => {
-            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
+            blazingly_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
         }
         SchemaKind::Object | SchemaKind::Any => {
-            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
+            blazingly_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
         }
     }
 }
@@ -3553,7 +3553,7 @@ fn decode_path_rejection(
                 "field".to_owned(),
                 Value::String(blazingly_validation::normalize_field_path(path)),
             );
-            if let Ok(rendered) = serde_json::to_value(violations.violations()) {
+            if let Ok(rendered) = blazingly_json::to_value(violations.violations()) {
                 details.insert("violations".to_owned(), rendered);
             }
         }

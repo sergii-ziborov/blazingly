@@ -1,4 +1,4 @@
-﻿#![cfg(feature = "native")]
+#![cfg(feature = "native")]
 
 use blazingly::{
     BodyStream, BodyStreamError, ExecutableApp, Json, StreamingBody, UploadBody, api_model, get,
@@ -259,7 +259,8 @@ fn native_http1_accepts_a_buffered_body_larger_than_the_read_buffer() {
     // Comfortably past one read buffer, and past two, so a single extra
     // reservation would not be enough to make this pass by accident.
     let filler = "x".repeat(40 * 1024);
-    let body = serde_json::to_vec(&serde_json::json!({ "value": filler })).expect("request JSON");
+    let body =
+        blazingly_json::to_vec(&blazingly_json::json!({ "value": filler })).expect("request JSON");
     let head = format!(
         "POST /echo HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()

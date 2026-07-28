@@ -353,7 +353,8 @@ fn cargo_metadata() -> Result<CargoMetadata, CliError> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    serde_json::from_slice(&output.stdout).map_err(|error| CliError::Metadata(error.to_string()))
+    blazingly_json::from_slice(&output.stdout)
+        .map_err(|error| CliError::Metadata(error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -662,7 +663,7 @@ impl Session<'_> {
     fn artifact_path(&self, messages: &str) -> Option<PathBuf> {
         messages
             .lines()
-            .filter_map(|line| serde_json::from_str::<ArtifactMessage>(line).ok())
+            .filter_map(|line| blazingly_json::from_str::<ArtifactMessage>(line).ok())
             .filter(|message| message.reason == "compiler-artifact")
             .filter(|message| message.target.name == self.app.target.name)
             .filter_map(|message| message.executable)

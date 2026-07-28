@@ -19,9 +19,9 @@ use blazingly_core::{
 };
 use blazingly_executor::{ExecutableApp, FromInvocation, InputRejection, InvocationInput};
 use blazingly_http::{HttpMiddleware, HttpRequestContext, HttpRequestView, Response};
+use blazingly_json::{Map, Value, json};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
 use sha2::Sha256;
 use std::any::TypeId;
 use std::cell::RefCell;
@@ -790,7 +790,7 @@ impl JwtHs256 {
     /// be initialized.
     pub fn encode(&self, claims: &JwtClaims) -> Result<String, AuthenticationError> {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-        let payload = serde_json::to_vec(&claims.as_value())
+        let payload = blazingly_json::to_vec(&claims.as_value())
             .map_err(|_| AuthenticationError::Internal("claims serialization failed"))?;
         let payload = URL_SAFE_NO_PAD.encode(payload);
         let signing_input = format!("{header}.{payload}");
@@ -1709,7 +1709,7 @@ fn decode_json_segment(segment: &str) -> Result<Value, AuthenticationError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(segment)
         .map_err(|_| AuthenticationError::Invalid("JWT segment is not base64url"))?;
-    serde_json::from_slice(&bytes)
+    blazingly_json::from_slice(&bytes)
         .map_err(|_| AuthenticationError::Invalid("JWT segment is not valid JSON"))
 }
 
@@ -1801,7 +1801,7 @@ fn claim_scopes(claims: &Value) -> Vec<String> {
 
 fn insert_optional<T: Serialize>(map: &mut Map<String, Value>, name: &str, value: Option<&T>) {
     if let Some(value) = value
-        && let Ok(value) = serde_json::to_value(value)
+        && let Ok(value) = blazingly_json::to_value(value)
     {
         map.insert(name.to_owned(), value);
     }
@@ -1917,7 +1917,7 @@ fn server_security_error(message: &str) -> Response {
 fn json_error(status: u16, code: &str, message: &str) -> Response {
     Response::from_bytes(
         status,
-        serde_json::to_vec(&json!({
+        blazingly_json::to_vec(&json!({
             "error": {
                 "code": code,
                 "message": message,
@@ -1990,7 +1990,7 @@ mod tests {
         .with_security(security);
         ExecutableOperation::typed(descriptor, move |input| {
             let value = handler(&input)?;
-            let body = serde_json::to_vec(&value).expect("test payload serializes");
+            let body = blazingly_json::to_vec(&value).expect("test payload serializes");
             let future: OperationFuture = Box::pin(async move {
                 ExecutionOutcome::Success {
                     status: 200,

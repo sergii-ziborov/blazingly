@@ -2,8 +2,8 @@
 
 use blazingly::prelude::*;
 use blazingly::{ValidationErrors, ValidationRule};
+use blazingly_json::{Value, json};
 use futures_lite::future;
-use serde_json::{Value, json};
 
 #[api_model]
 struct Address {
@@ -154,4 +154,28 @@ fn strong_value_decode_errors_include_the_nested_json_path() {
     let body = response.json::<Value>().expect("decode error JSON");
     assert_eq!(body["error"]["code"], "invalid_json");
     assert_eq!(body["error"]["details"]["field"], "id");
+
+    // A one-segment path is reachable without any real path tracking. This
+    // case forces `serde_path_to_error` to reconstruct a map key, a sequence
+    // index, and a nested struct field from the JSON deserializer, which is
+    // the part of the contract that depends on how the deserializer drives
+    // `MapAccess` and `SeqAccess`.
+    let mut body = valid_body();
+    body["items"][0]["street"] = json!(7);
+
+    let response = future::block_on(
+        TestApp::new(&app()).call(
+            Request::post("/validation")
+                .json(&body)
+                .expect("fixture should serialize"),
+        ),
+    );
+    assert_eq!(response.status(), 422);
+    let body = response.json::<Value>().expect("decode error JSON");
+    assert_eq!(body["error"]["code"], "invalid_json");
+    assert_eq!(body["error"]["details"]["field"], "items[0].street");
+    assert_eq!(
+        body["error"]["details"]["violations"][0]["field"],
+        "items[0].street"
+    );
 }

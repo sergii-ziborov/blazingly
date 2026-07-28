@@ -187,7 +187,7 @@ fn form_cookie_and_every_http_method_share_the_compiled_router() {
     );
 
     assert_eq!(response.status(), 200);
-    let value: serde_json::Value = response.json().unwrap();
+    let value: blazingly_json::Value = response.json().unwrap();
     assert_eq!(value["item_id"], 42);
     assert_eq!(value["session"], "fast");
     assert_eq!(value["name"], "blazingly");
@@ -233,7 +233,7 @@ fn file_upload_has_the_same_typed_http_and_mcp_operation() {
     );
 
     assert_eq!(response.status(), 200);
-    let http_value: serde_json::Value = response.json().unwrap();
+    let http_value: blazingly_json::Value = response.json().unwrap();
     assert_eq!(http_value["file_name"], "speed.txt");
     assert_eq!(http_value["content_type"], "text/plain");
     assert_eq!(http_value["size"], 8);
@@ -241,7 +241,7 @@ fn file_upload_has_the_same_typed_http_and_mcp_operation() {
     let runtime = blazingly::mcp::McpRuntime::new(&executable);
     let mcp = future::block_on(runtime.call_tool(
         "upload_file",
-        serde_json::json!({
+        blazingly_json::json!({
             "file": {
                 "base64": "bWlsbGlvbnM=",
                 "file_name": "speed.txt",
@@ -286,7 +286,7 @@ fn typed_multipart_models_include_text_and_multiple_files() {
     );
 
     assert_eq!(response.status(), 200);
-    let value: serde_json::Value = response.json().unwrap();
+    let value: blazingly_json::Value = response.json().unwrap();
     assert_eq!(value["field_name"], "release");
     assert_eq!(value["file_name"], "a.txt");
     assert_eq!(value["size"], 5);

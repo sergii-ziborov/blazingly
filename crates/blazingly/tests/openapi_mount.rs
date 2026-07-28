@@ -19,7 +19,7 @@ fn openapi_json_and_scalar_ui_are_precompiled_http_assets() {
         Some("application/json")
     );
     let document = document
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("OpenAPI document should be JSON");
     assert_eq!(document["openapi"], "3.1.0");
     assert_eq!(

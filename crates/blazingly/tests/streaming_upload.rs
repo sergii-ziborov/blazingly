@@ -1,6 +1,6 @@
 use blazingly::prelude::*;
+use blazingly_json::{Value, json};
 use futures_lite::future;
-use serde_json::{Value, json};
 
 #[api_model]
 struct UploadResult {

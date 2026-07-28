@@ -1,6 +1,6 @@
 use blazingly::prelude::*;
+use blazingly_json::json;
 use futures_lite::future;
-use serde_json::json;
 
 #[api_model]
 #[derive(Clone, Debug)]
@@ -87,7 +87,7 @@ fn synchronous_operations_use_the_same_typed_http_surface() {
     assert_eq!(response.status(), 200);
     assert_eq!(
         response
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("sync response should be JSON"),
         json!({ "item_id": 11, "message": "sync" })
     );
@@ -134,7 +134,7 @@ fn universal_operation_and_provider_macros_share_http_mcp_and_di() {
     assert_eq!(response.status(), 200);
     assert_eq!(
         response
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("HTTP response should be JSON"),
         json!({ "item_id": 7, "message": "macro-context:ready" })
     );
@@ -167,7 +167,7 @@ fn universal_operation_and_provider_macros_share_http_mcp_and_di() {
     assert_eq!(conflict.status(), 409);
     assert_eq!(
         conflict
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("typed error should be JSON")["error"]["code"],
         "value_already_exists"
     );

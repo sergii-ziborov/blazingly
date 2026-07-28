@@ -18,7 +18,7 @@ validation = ["dep:blazingly-validation"]
 blazingly-validation = { workspace = true, optional = true }
 blazingly-core.workspace = true
 blazingly-deploy.workspace = true
-serde_json.workspace = true
+blazingly-json.workspace = true
 
 [lints]
 workspace = true

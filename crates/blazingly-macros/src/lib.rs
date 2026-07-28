@@ -54,6 +54,8 @@ struct McpArgs {
 struct ModelArgs {
     rename_all: Option<LitStr>,
     validator: Option<SynPath>,
+    /// Present when `#[api_model(borrowed)]` selected the output-only form.
+    borrowed: Option<Ident>,
 }
 
 impl Parse for ModelArgs {
@@ -62,10 +64,21 @@ impl Parse for ModelArgs {
 
         while !input.is_empty() {
             let key = input.parse::<Ident>()?;
-            input.parse::<Token![=]>()?;
 
             match key.to_string().as_str() {
+                // A bare flag, not a `key = value` pair: a view either borrows
+                // or it does not.
+                "borrowed" => {
+                    if arguments.borrowed.is_some() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "`borrowed` was specified twice",
+                        ));
+                    }
+                    arguments.borrowed = Some(key);
+                }
                 "rename_all" => {
+                    input.parse::<Token![=]>()?;
                     if arguments.rename_all.is_some() {
                         return Err(syn::Error::new(
                             key.span(),
@@ -75,6 +88,7 @@ impl Parse for ModelArgs {
                     arguments.rename_all = Some(input.parse::<LitStr>()?);
                 }
                 "validate_with" => {
+                    input.parse::<Token![=]>()?;
                     if arguments.validator.is_some() {
                         return Err(syn::Error::new(
                             key.span(),
@@ -86,7 +100,8 @@ impl Parse for ModelArgs {
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "the supported model options are `rename_all` and `validate_with`",
+                        "the supported model options are `borrowed`, `rename_all`, \
+                         and `validate_with`",
                     ));
                 }
             }
@@ -221,6 +236,12 @@ struct OperationInput {
     argument_type: Type,
     inner: Type,
     required: bool,
+    /// Set when the handler wrote `&Depends<T>` or `&T`.
+    ///
+    /// A dependency taken by reference is what lets a handler return a borrowed
+    /// view over it: the view's lifetime is the argument's, and the response is
+    /// encoded before the argument goes out of scope.
+    by_reference: bool,
 }
 
 struct ErrorVariant {
@@ -505,6 +526,26 @@ pub fn connect(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Connect))
 }
 
+/// Declares an API model.
+///
+/// The default form owns its data: it derives `Serialize` and `Deserialize`,
+/// implements `ApiModel`, and runs every declared field rule before the handler
+/// sees the value.
+///
+/// `#[api_model(borrowed)]` declares the output-only form instead. A borrowed
+/// view derives `Serialize` and implements `ApiSchema` directly; it gains no
+/// `Deserialize` impl and no validation, because a response body is produced by
+/// the operation rather than parsed from a client. Only the borrowed form may
+/// carry lifetime and type parameters, so one `Page<'store, T>` describes every
+/// paginated response instead of one envelope per item type.
+///
+/// ```ignore
+/// #[api_model(borrowed)]
+/// struct SummaryView<'store> {
+///     title: &'store str,
+///     tags: Vec<&'store TagRef>,
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn api_model(arguments: TokenStream, item: TokenStream) -> TokenStream {
     let arguments = parse_macro_input!(arguments as ModelArgs);
@@ -763,6 +804,11 @@ fn operation_tokens(
     let success_descriptor = output.success.as_ref().map_or_else(
         || quote!(::core::option::Option::None),
         |success| {
+            // A borrowed response is written `Json<PageView<'_>>`, and an
+            // elided lifetime has nothing to be inferred from in the
+            // descriptor's body. The schema is the same at every lifetime, so
+            // it is asked for at `'static`.
+            let success = documented_type(success);
             quote!(
                 ::core::option::Option::Some(
                     <#success as ::blazingly::ApiSchema>::type_descriptor()
@@ -822,11 +868,30 @@ fn operation_tokens(
     })
 }
 
+/// Everything both handler shapes need: the argument prologue, the compiled
+/// dependency requests, and the call itself.
+struct ExecutableParts {
+    extracted_arguments: Vec<proc_macro2::TokenStream>,
+    dependency_requests: Vec<proc_macro2::TokenStream>,
+    call: proc_macro2::TokenStream,
+    input_binding: proc_macro2::TokenStream,
+    dependency_binding: proc_macro2::TokenStream,
+}
+
 fn operation_executable(
     inputs: &[OperationInput],
     function_name: &Ident,
     asynchronous: bool,
 ) -> proc_macro2::TokenStream {
+    let parts = executable_parts(inputs, function_name);
+    if asynchronous {
+        asynchronous_executable(&parts)
+    } else {
+        synchronous_executable(&parts)
+    }
+}
+
+fn executable_parts(inputs: &[OperationInput], function_name: &Ident) -> ExecutableParts {
     let mut dependency_index = 0_usize;
     let extracted_arguments = inputs
         .iter()
@@ -837,7 +902,10 @@ fn operation_executable(
                 let inner = &input.inner;
                 let index = dependency_index;
                 dependency_index += 1;
-                if matches!(input.kind, OperationInputKind::Dependency) {
+                // A dependency taken by reference is read through the handle
+                // rather than out of it, so `&Depends<T>` and `&T` share one
+                // extraction and neither clones `T`.
+                if input.by_reference || matches!(input.kind, OperationInputKind::Dependency) {
                     quote! {
                         let #binding = dependencies
                             .get::<#inner>(#index)
@@ -873,54 +941,102 @@ fn operation_executable(
             quote!(::blazingly::DependencyRequest::of::<#inner>())
         })
         .collect::<Vec<_>>();
-    let handler_arguments = (0..inputs.len())
-        .map(|index| {
+    let handler_arguments = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
             let binding = format_ident!("__blazingly_argument_{index}");
-            quote!(#binding)
+            if input.by_reference {
+                // `&Depends<T>` is passed straight through; `&T` reaches the
+                // same place through the handle's `Deref`.
+                quote!(&#binding)
+            } else {
+                quote!(#binding)
+            }
         })
         .collect::<Vec<_>>();
-
-    if asynchronous {
-        quote! {
-            ::blazingly::ExecutableOperation::typed_with_dependencies(
-                descriptor(),
-                ::std::vec![#(#dependency_requests),*],
-                |input, dependencies| {
-                    #(#extracted_arguments)*
-                    let output = super::#function_name(#(#handler_arguments),*);
-                    ::core::result::Result::Ok(
-                        ::std::boxed::Box::pin(async move {
-                            let output = output.await;
-                            ::blazingly::OperationOutput::into_execution_outcome(output)
-                        }) as ::blazingly::OperationFuture
-                    )
-                },
-            )
-        }
+    let call = quote!(super::#function_name(#(#handler_arguments),*));
+    // Naming a closure parameter that nothing reads is a warning, and CI
+    // rejects warnings.
+    let input_binding = if inputs.iter().any(|input| !input.kind.is_dependency()) {
+        quote!(input)
     } else {
-        quote! {
-            ::blazingly::ExecutableOperation::typed_with_dependencies(
-                descriptor(),
-                ::std::vec![#(#dependency_requests),*],
-                |input, dependencies| {
-                    #(#extracted_arguments)*
-                    ::core::result::Result::Ok(
-                        ::std::boxed::Box::pin(async move {
-                            match ::blazingly::run_blocking(move || {
-                                super::#function_name(#(#handler_arguments),*)
-                            }).await {
-                                ::core::result::Result::Ok(output) => {
-                                    ::blazingly::OperationOutput::into_execution_outcome(output)
-                                }
-                                ::core::result::Result::Err(error) => {
-                                    ::blazingly::blocking_error_outcome(error)
-                                }
-                            }
-                        }) as ::blazingly::OperationFuture
-                    )
-                },
-            )
-        }
+        quote!(_)
+    };
+    let dependency_binding = if dependency_requests.is_empty() {
+        quote!(_)
+    } else {
+        quote!(dependencies)
+    };
+
+    ExecutableParts {
+        extracted_arguments,
+        dependency_requests,
+        call,
+        input_binding,
+        dependency_binding,
+    }
+}
+
+fn asynchronous_executable(parts: &ExecutableParts) -> proc_macro2::TokenStream {
+    let ExecutableParts {
+        extracted_arguments,
+        dependency_requests,
+        call,
+        input_binding,
+        dependency_binding,
+    } = parts;
+    quote! {
+        ::blazingly::ExecutableOperation::typed_with_dependencies(
+            descriptor(),
+            ::std::vec![#(#dependency_requests),*],
+            |#input_binding, #dependency_binding| {
+                #(#extracted_arguments)*
+                ::core::result::Result::Ok(
+                    ::std::boxed::Box::pin(async move {
+                        let output = #call.await;
+                        ::blazingly::OperationOutput::into_execution_outcome(output)
+                    }) as ::blazingly::OperationFuture
+                )
+            },
+        )
+    }
+}
+
+/// A handler that is not `async` completes when it is called, so its outcome is
+/// produced without a future.
+///
+/// The fallback exists because `ExecutableOperation` still needs one when
+/// plugin hooks, cancellation, or request-scoped finalizers wrap the operation.
+/// It runs the same body at the same point in the pipeline an async handler
+/// would, so the two paths cannot observe different hook ordering.
+fn synchronous_executable(parts: &ExecutableParts) -> proc_macro2::TokenStream {
+    let ExecutableParts {
+        extracted_arguments,
+        dependency_requests,
+        call,
+        input_binding,
+        dependency_binding,
+    } = parts;
+    quote! {
+        ::blazingly::ExecutableOperation::typed_sync_with_dependencies(
+            descriptor(),
+            ::std::vec![#(#dependency_requests),*],
+            |#input_binding, #dependency_binding| {
+                #(#extracted_arguments)*
+                ::core::result::Result::Ok(
+                    ::blazingly::OperationOutput::into_execution_outcome(#call)
+                )
+            },
+            |#input_binding, #dependency_binding| {
+                #(#extracted_arguments)*
+                ::core::result::Result::Ok(
+                    ::std::boxed::Box::pin(async move {
+                        ::blazingly::OperationOutput::into_execution_outcome(#call)
+                    }) as ::blazingly::OperationFuture
+                )
+            },
+        )
     }
 }
 
@@ -1071,7 +1187,7 @@ fn error_failure_tokens(variant: &ErrorVariant) -> proc_macro2::TokenStream {
         || quote!(),
         |_| {
             quote! {
-                let details = ::blazingly::__private::serde_json::to_vec(&payload)
+                let details = ::blazingly::__private::blazingly_json::to_vec(&payload)
                     .map_err(|_| ::blazingly::ResponseBuildError::serialization_failed())?;
                 failure = failure.with_details(details);
             }
@@ -1138,83 +1254,32 @@ fn model_tokens(
     arguments: &ModelArgs,
     model: &mut ItemStruct,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    if arguments.borrowed.is_some() {
+        return borrowed_model_tokens(arguments, model);
+    }
+    owned_model_tokens(arguments, model)
+}
+
+/// Expands the owning form: `Serialize`, `Deserialize`, and a validating
+/// [`ApiModel`] implementation.
+fn owned_model_tokens(
+    arguments: &ModelArgs,
+    model: &mut ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
     let Fields::Named(fields) = &mut model.fields else {
         return Err(syn::Error::new_spanned(
             &model.fields,
             "`#[api_model]` requires a struct with named fields",
         ));
     };
+    reject_owned_generics(&model.generics)?;
 
     let rename_rule = model_rename_rule(arguments)?;
-
-    let mut descriptors = Vec::new();
-    let mut validations = Vec::new();
-    let mut needs_probes = false;
-
-    for field in &mut fields.named {
-        let identifier = field
-            .ident
-            .clone()
-            .expect("named fields always have identifiers");
-        let mut rules = take_field_rules(&mut field.attrs)?;
-        for alias in &rules.aliases {
-            field
-                .attrs
-                .push(syn::parse_quote!(#[serde(alias = #alias)]));
-        }
-        let field_type = &field.ty;
-        let optional = wrapper_inner(field_type, "Option");
-        let validation_type = optional.as_ref().unwrap_or(field_type);
-        let shape = field_shape(validation_type);
-        reject_incompatible_rules(&rules, validation_type, shape)?;
-        normalize_collection_rules(&mut rules, shape);
-        needs_probes |= shape.may_be_model();
-
-        let public_name = if rename_rule == "camelCase" {
-            snake_to_camel(&identifier.to_string())
-        } else {
-            identifier.to_string()
-        };
-        let public_name = LitStr::new(&public_name, identifier.span());
-
-        let required = optional.is_none();
-        let declared_rules = rule_descriptors(&rules);
-        let nested_descriptor = nested_rule_descriptor(validation_type, shape, rules.nested);
-        descriptors.push(quote! {
-            ::blazingly::FieldDescriptor::new(
-                #public_name,
-                #required,
-                <#field_type as ::blazingly::ApiSchema>::type_descriptor(),
-                {
-                    let mut rules = ::std::vec![#(#declared_rules),*];
-                    #nested_descriptor
-                    rules
-                },
-            )
-        });
-
-        let checks = field_checks(&rules, shape, &public_name);
-        let nested_checks = nested_validation_checks(shape, &public_name, &rules);
-        if checks.is_empty() && nested_checks.is_empty() {
-            continue;
-        }
-        if optional.is_some() {
-            validations.push(quote! {
-                if let ::core::option::Option::Some(value) = &self.#identifier {
-                    #checks
-                    #nested_checks
-                }
-            });
-        } else {
-            validations.push(quote! {
-                {
-                    let value = &self.#identifier;
-                    #checks
-                    #nested_checks
-                }
-            });
-        }
-    }
+    let OwnedFields {
+        descriptors,
+        validations,
+        needs_probes,
+    } = owned_field_tokens(fields, &rename_rule)?;
 
     let model_name = &model.ident;
     let serde_rename = arguments
@@ -1270,6 +1335,442 @@ fn model_tokens(
             }
         };
     })
+}
+
+#[derive(Default)]
+struct OwnedFields {
+    descriptors: Vec<proc_macro2::TokenStream>,
+    validations: Vec<proc_macro2::TokenStream>,
+    needs_probes: bool,
+}
+
+fn owned_field_tokens(
+    fields: &mut syn::FieldsNamed,
+    rename_rule: &str,
+) -> syn::Result<OwnedFields> {
+    let mut owned = OwnedFields::default();
+
+    for field in &mut fields.named {
+        let identifier = field
+            .ident
+            .clone()
+            .expect("named fields always have identifiers");
+        let mut rules = take_field_rules(&mut field.attrs)?;
+        for alias in &rules.aliases {
+            field
+                .attrs
+                .push(syn::parse_quote!(#[serde(alias = #alias)]));
+        }
+        let field_type = &field.ty;
+        let optional = wrapper_inner(field_type, "Option");
+        let validation_type = optional.as_ref().unwrap_or(field_type);
+        let shape = field_shape(validation_type);
+        reject_incompatible_rules(&rules, validation_type, shape)?;
+        normalize_collection_rules(&mut rules, shape);
+        owned.needs_probes |= shape.may_be_model();
+
+        let public_name = public_field_name(&identifier, rename_rule);
+        let required = optional.is_none();
+        let declared_rules = rule_descriptors(&rules);
+        let nested_descriptor = nested_rule_descriptor(validation_type, shape, rules.nested);
+        owned.descriptors.push(quote! {
+            ::blazingly::FieldDescriptor::new(
+                #public_name,
+                #required,
+                <#field_type as ::blazingly::ApiSchema>::type_descriptor(),
+                {
+                    let mut rules = ::std::vec![#(#declared_rules),*];
+                    #nested_descriptor
+                    rules
+                },
+            )
+        });
+
+        let checks = field_checks(&rules, shape, &public_name);
+        let nested_checks = nested_validation_checks(shape, &public_name, &rules);
+        if checks.is_empty() && nested_checks.is_empty() {
+            continue;
+        }
+        if optional.is_some() {
+            owned.validations.push(quote! {
+                if let ::core::option::Option::Some(value) = &self.#identifier {
+                    #checks
+                    #nested_checks
+                }
+            });
+        } else {
+            owned.validations.push(quote! {
+                {
+                    let value = &self.#identifier;
+                    #checks
+                    #nested_checks
+                }
+            });
+        }
+    }
+
+    Ok(owned)
+}
+
+fn public_field_name(identifier: &Ident, rename_rule: &str) -> LitStr {
+    let name = if rename_rule == "camelCase" {
+        snake_to_camel(&identifier.to_string())
+    } else {
+        identifier.to_string()
+    };
+    LitStr::new(&name, identifier.span())
+}
+
+/// Expands the borrowed form: `Serialize` plus a direct [`ApiSchema`] impl.
+///
+/// A borrowed view is an output type. It is produced by the operation rather
+/// than parsed from a client, so it gets neither `Deserialize` nor validation,
+/// and it may carry lifetime and type parameters that an owning model cannot.
+fn borrowed_model_tokens(
+    arguments: &ModelArgs,
+    model: &mut ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Fields::Named(fields) = &mut model.fields else {
+        return Err(syn::Error::new_spanned(
+            &model.fields,
+            "`#[api_model]` requires a struct with named fields",
+        ));
+    };
+    if let Some(validator) = &arguments.validator {
+        return Err(syn::Error::new_spanned(
+            validator,
+            "a borrowed view is an output type and is never validated; declare \
+             `validate_with` on the owning model the client sends",
+        ));
+    }
+
+    let rename_rule = model_rename_rule(arguments)?;
+    let mut descriptors = Vec::new();
+
+    for field in &mut fields.named {
+        let identifier = field
+            .ident
+            .clone()
+            .expect("named fields always have identifiers");
+        reject_borrowed_field_rules(&mut field.attrs)?;
+
+        let public_name = public_field_name(&identifier, &rename_rule);
+        let required = wrapper_inner(&field.ty, "Option").is_none();
+        // The wire shape a borrowed view prints is the shape its owning
+        // counterpart prints, so the documented schema is the field type with
+        // its borrows resolved: `&'store str` is a string, `Vec<&'store Tag>`
+        // is an array of `Tag`.
+        let schema_type = schema_type(&field.ty);
+        descriptors.push(quote! {
+            ::blazingly::FieldDescriptor::new(
+                #public_name,
+                #required,
+                <#schema_type as ::blazingly::ApiSchema>::type_descriptor(),
+                ::std::vec::Vec::new(),
+            )
+        });
+    }
+
+    let model_name = &model.ident;
+    let serde_rename = arguments
+        .rename_all
+        .as_ref()
+        .map_or_else(|| quote!(), |rename| quote!(#[serde(rename_all = #rename)]));
+    let (impl_generics, type_generics, where_clause) = model.generics.split_for_impl();
+    let schema_bounds = schema_parameter_bounds(&model.generics);
+    let where_clause = merge_where_predicates(where_clause, &schema_bounds);
+    let descriptor_name = borrowed_descriptor_name(&model.generics, model_name);
+
+    Ok(quote! {
+        #[derive(::blazingly::__private::serde::Serialize)]
+        #[serde(crate = "::blazingly::__private::serde")]
+        #serde_rename
+        #model
+
+        const _: () = {
+            #[allow(dead_code)]
+            fn __blazingly_schema_name(
+                base: &str,
+                parameters: &[::blazingly::TypeDescriptor],
+            ) -> ::std::string::String {
+                let mut name = ::std::string::String::from(base);
+                for parameter in parameters {
+                    name.push('_');
+                    // `OpenAPI` component keys accept only `[A-Za-z0-9._-]`,
+                    // and `Vec<Tag>` is a perfectly ordinary Rust name.
+                    for character in parameter.rust_name.chars() {
+                        if character.is_ascii_alphanumeric()
+                            || character == '_'
+                            || character == '.'
+                            || character == '-'
+                        {
+                            name.push(character);
+                        } else {
+                            name.push('_');
+                        }
+                    }
+                }
+                name
+            }
+
+            impl #impl_generics ::blazingly::ApiSchema for #model_name #type_generics
+            #where_clause
+            {
+                fn type_descriptor() -> ::blazingly::TypeDescriptor {
+                    ::blazingly::TypeDescriptor::model(
+                        ::blazingly::ModelDescriptor::new(
+                            #descriptor_name,
+                            ::std::vec![#(#descriptors),*],
+                        )
+                    )
+                }
+            }
+        };
+    })
+}
+
+/// An owning model is deserialized and validated, and neither survives an
+/// unbounded parameter, so generics are the borrowed form's alone.
+fn reject_owned_generics(generics: &syn::Generics) -> syn::Result<()> {
+    let Some(parameter) = generics.params.first() else {
+        return Ok(());
+    };
+    let reason = match parameter {
+        syn::GenericParam::Lifetime(_) => {
+            "an owning model deserializes into itself and cannot borrow from the \
+             request buffer"
+        }
+        syn::GenericParam::Type(_) | syn::GenericParam::Const(_) => {
+            "field rules cannot recurse into an unbounded parameter, so an owning \
+             model would silently skip validating it"
+        }
+    };
+    Err(syn::Error::new_spanned(
+        parameter,
+        format!("{reason}; declare `#[api_model(borrowed)]` for a generic output view"),
+    ))
+}
+
+/// Every declarative rule is a request-side check, so none of them mean
+/// anything on a view the framework only ever writes.
+fn reject_borrowed_field_rules(attributes: &mut Vec<Attribute>) -> syn::Result<()> {
+    let mut retained = Vec::new();
+    for attribute in attributes.drain(..) {
+        if BORROWED_REJECTED_ATTRIBUTES
+            .iter()
+            .any(|name| attribute.path().is_ident(name))
+        {
+            let name = attribute
+                .path()
+                .get_ident()
+                .map_or_else(String::new, ToString::to_string);
+            return Err(syn::Error::new(
+                attribute_span(&attribute),
+                format!(
+                    "`#[{name}]` validates a request; a borrowed view is an output \
+                     type and is never validated. Declare the rule on the owning \
+                     model the client sends"
+                ),
+            ));
+        }
+        retained.push(attribute);
+    }
+    *attributes = retained;
+    Ok(())
+}
+
+const BORROWED_REJECTED_ATTRIBUTES: &[&str] = &[
+    "min_length",
+    "max_length",
+    "email",
+    "alias",
+    "validate_with",
+    "nested",
+    "minimum",
+    "maximum",
+    "exclusive_minimum",
+    "exclusive_maximum",
+    "multiple_of",
+    "pattern",
+    "min_items",
+    "max_items",
+    "unique_items",
+];
+
+/// Adds `T: ApiSchema` for every type parameter so the field descriptors can
+/// ask each one for its own schema.
+fn schema_parameter_bounds(generics: &syn::Generics) -> Vec<syn::WherePredicate> {
+    generics
+        .params
+        .iter()
+        .filter_map(|parameter| match parameter {
+            syn::GenericParam::Type(parameter) => {
+                let identifier = &parameter.ident;
+                Some(syn::parse_quote!(#identifier: ::blazingly::ApiSchema))
+            }
+            syn::GenericParam::Lifetime(_) | syn::GenericParam::Const(_) => None,
+        })
+        .collect()
+}
+
+fn merge_where_predicates(
+    existing: Option<&syn::WhereClause>,
+    added: &[syn::WherePredicate],
+) -> Option<syn::WhereClause> {
+    if added.is_empty() {
+        return existing.cloned();
+    }
+    let mut clause = existing.cloned().unwrap_or_else(|| syn::WhereClause {
+        where_token: <Token![where]>::default(),
+        predicates: syn::punctuated::Punctuated::new(),
+    });
+    clause.predicates.extend(added.iter().cloned());
+    Some(clause)
+}
+
+/// One `Page<'store, T>` describes every paginated response, so the documented
+/// name has to distinguish `Page<Article>` from `Page<Company>`; an `OpenAPI`
+/// projection keys its component schemas by this name.
+fn borrowed_descriptor_name(
+    generics: &syn::Generics,
+    model_name: &Ident,
+) -> proc_macro2::TokenStream {
+    let parameters = generics
+        .params
+        .iter()
+        .filter_map(|parameter| match parameter {
+            syn::GenericParam::Type(parameter) => {
+                let identifier = &parameter.ident;
+                Some(quote!(<#identifier as ::blazingly::ApiSchema>::type_descriptor()))
+            }
+            syn::GenericParam::Lifetime(_) | syn::GenericParam::Const(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if parameters.is_empty() {
+        return quote!(stringify!(#model_name));
+    }
+    quote! {
+        __blazingly_schema_name(
+            stringify!(#model_name),
+            &[#(#parameters),*],
+        )
+    }
+}
+
+/// Resolves a written field type to the type whose schema it prints.
+///
+/// A borrowed view exists to avoid owning its data, so its fields are written
+/// as `&'store str`, `Vec<&'store Tag>`, or `Cow<'store, str>`. All three print
+/// exactly what their owning counterparts print, and this is where that is
+/// stated once instead of by every application that writes a view.
+fn schema_type(ty: &Type) -> Type {
+    match ty {
+        Type::Reference(reference) => borrowed_schema_type(&reference.elem),
+        Type::Slice(slice) => vector_of(&schema_type(&slice.elem)),
+        Type::Array(array) => vector_of(&schema_type(&array.elem)),
+        Type::Paren(inner) => schema_type(&inner.elem),
+        Type::Group(inner) => schema_type(&inner.elem),
+        Type::Path(path) => path_schema_type(path),
+        other => other.clone(),
+    }
+}
+
+fn borrowed_schema_type(referent: &Type) -> Type {
+    // `&str` is the schema the contract implements; `str` alone is not.
+    if bare_type_matches(referent, &["str"]) {
+        return syn::parse_quote!(&str);
+    }
+    match referent {
+        Type::Slice(slice) => vector_of(&schema_type(&slice.elem)),
+        Type::Array(array) => vector_of(&schema_type(&array.elem)),
+        other => schema_type(other),
+    }
+}
+
+fn path_schema_type(path: &TypePath) -> Type {
+    let mut path = path.clone();
+    if let Some(segment) = path.path.segments.last()
+        && segment.ident == "Cow"
+        && let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments
+    {
+        let owned = arguments.args.iter().find_map(|argument| match argument {
+            syn::GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        });
+        if let Some(owned) = owned {
+            return borrowed_schema_type(owned);
+        }
+    }
+    for segment in &mut path.path.segments {
+        let syn::PathArguments::AngleBracketed(arguments) = &mut segment.arguments else {
+            continue;
+        };
+        let resolved = arguments
+            .args
+            .iter()
+            .filter_map(|argument| match argument {
+                syn::GenericArgument::Lifetime(_) => None,
+                syn::GenericArgument::Type(ty) => Some(syn::GenericArgument::Type(schema_type(ty))),
+                other => Some(other.clone()),
+            })
+            .collect::<syn::punctuated::Punctuated<_, Token![,]>>();
+        if resolved.is_empty() {
+            segment.arguments = syn::PathArguments::None;
+        } else {
+            arguments.args = resolved;
+        }
+    }
+    Type::Path(path)
+}
+
+fn vector_of(item: &Type) -> Type {
+    syn::parse_quote!(::std::vec::Vec<#item>)
+}
+
+/// Names a type in a descriptor body, where no lifetime can be inferred.
+///
+/// `Json<PageView<'_>>` and `Json<PageView<'store>>` document one schema, so
+/// every lifetime is written `'static` and the impl that answers is the same
+/// one either way.
+fn documented_type(ty: &Type) -> Type {
+    match ty {
+        Type::Reference(reference) => {
+            let mut reference = reference.clone();
+            reference.lifetime = Some(syn::Lifetime::new(
+                "'static",
+                proc_macro2::Span::call_site(),
+            ));
+            reference.elem = Box::new(documented_type(&reference.elem));
+            Type::Reference(reference)
+        }
+        Type::Path(path) => {
+            let mut path = path.clone();
+            for segment in &mut path.path.segments {
+                let syn::PathArguments::AngleBracketed(arguments) = &mut segment.arguments else {
+                    continue;
+                };
+                for argument in &mut arguments.args {
+                    match argument {
+                        syn::GenericArgument::Lifetime(lifetime) => {
+                            *lifetime =
+                                syn::Lifetime::new("'static", proc_macro2::Span::call_site());
+                        }
+                        syn::GenericArgument::Type(inner) => *inner = documented_type(inner),
+                        _ => {}
+                    }
+                }
+            }
+            Type::Path(path)
+        }
+        Type::Paren(inner) => documented_type(&inner.elem),
+        Type::Group(inner) => documented_type(&inner.elem),
+        Type::Slice(slice) => {
+            let mut slice = slice.clone();
+            slice.elem = Box::new(documented_type(&slice.elem));
+            Type::Slice(slice)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Emits the autoref-specialization probes that drive recursion into models.
@@ -2270,8 +2771,26 @@ fn operation_inputs(
             ));
         };
         let name = operation_argument_name(pat)?;
-        let (kind, inner) = OperationInputKind::from_type(ty)
-            .unwrap_or_else(|| (OperationInputKind::DirectDependency, (**ty).clone()));
+        let (declared, by_reference) = match &**ty {
+            Type::Reference(reference) if reference.mutability.is_some() => {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "operation arguments cannot be taken by unique reference; a \
+                     dependency is shared across the request",
+                ));
+            }
+            Type::Reference(reference) => (&*reference.elem, true),
+            other => (other, false),
+        };
+        let (kind, inner) = OperationInputKind::from_type(declared)
+            .unwrap_or_else(|| (OperationInputKind::DirectDependency, declared.clone()));
+        if by_reference && !kind.is_dependency() {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "only dependencies may be taken by reference; an extracted \
+                 argument is decoded from the request and owns its data",
+            ));
+        }
         if matches!(
             kind,
             OperationInputKind::Json
@@ -2298,9 +2817,10 @@ fn operation_inputs(
         operation_inputs.push(OperationInput {
             name: LitStr::new(&name.to_string(), name.span()),
             kind,
-            argument_type: (**ty).clone(),
+            argument_type: declared.clone(),
             inner,
             required,
+            by_reference,
         });
     }
 
@@ -2523,7 +3043,8 @@ mod tests {
     use super::{
         Attribute, FieldRules, FieldShape, Fields, ItemStruct, ModelArgs, NumericLiteral, Type,
         constraint_encodings, field_shape, lint_pattern_syntax, model_tokens,
-        normalize_collection_rules, reject_incompatible_rules, snake_to_camel, take_field_rules,
+        normalize_collection_rules, quote, reject_incompatible_rules, schema_type, snake_to_camel,
+        take_field_rules,
     };
 
     fn field_attributes(declaration: &str) -> Vec<Attribute> {
@@ -2784,8 +3305,8 @@ mod tests {
     #[test]
     fn model_level_validate_with_runs_after_the_field_rules() {
         let arguments = ModelArgs {
-            rename_all: None,
             validator: Some(syn::parse_str("checks::validate_window").expect("path parses")),
+            ..ModelArgs::default()
         };
         let expansion = expand(
             "struct Window { #[minimum(0)] start: i64, #[minimum(0)] end: i64 }",
@@ -2808,7 +3329,7 @@ mod tests {
             "rename_all = \"camelCase\", frobnicate = \"x\"",
         ));
         assert!(
-            error.contains("`rename_all` and `validate_with`"),
+            error.contains("`borrowed`, `rename_all`, and `validate_with`"),
             "{error}"
         );
     }
@@ -2818,5 +3339,79 @@ mod tests {
         assert_eq!(snake_to_camel("public_name"), "publicName");
         assert_eq!(snake_to_camel("id"), "id");
         assert_eq!(snake_to_camel("a_b_c"), "aBC");
+    }
+
+    fn borrowed_arguments() -> ModelArgs {
+        syn::parse_str::<ModelArgs>("borrowed").expect("`borrowed` is a bare flag")
+    }
+
+    fn expand_borrowed(source: &str) -> syn::Result<String> {
+        expand(source, &borrowed_arguments())
+    }
+
+    #[test]
+    fn a_borrowed_view_serializes_and_describes_itself_but_never_parses() {
+        let expansion = expand_borrowed("struct View<'store> { title: &'store str }")
+            .expect("a borrowed view expands");
+        assert!(expansion.contains("Serialize"));
+        assert!(
+            !expansion.contains("Deserialize"),
+            "a borrowed view is an output type"
+        );
+        assert!(expansion.contains("ApiSchema for View"));
+        assert!(
+            !expansion.contains("ApiModel for"),
+            "a borrowed view is never validated"
+        );
+        assert!(!expansion.contains("ValidationErrors"));
+    }
+
+    #[test]
+    fn borrowed_field_types_document_the_schema_their_owned_form_documents() {
+        let resolved = |source: &str| {
+            let ty = schema_type(&parse_type(source));
+            quote!(#ty).to_string().replace(' ', "")
+        };
+        assert_eq!(resolved("&'store str"), "&str");
+        assert_eq!(resolved("Vec<&'store Tag>"), "Vec<Tag>");
+        assert_eq!(resolved("Option<&'store str>"), "Option<&str>");
+        assert_eq!(resolved("&'store [Tag]"), "::std::vec::Vec<Tag>");
+        assert_eq!(resolved("Cow<'store, str>"), "&str");
+        assert_eq!(resolved("Page<'store, Tag>"), "Page<Tag>");
+        // A type that borrows nothing is left exactly as written.
+        assert_eq!(resolved("Vec<Tag>"), "Vec<Tag>");
+    }
+
+    #[test]
+    fn a_generic_borrowed_envelope_names_one_schema_per_item_type() {
+        let expansion = expand_borrowed("struct Page<'store, T> { items: Vec<&'store T> }")
+            .expect("a generic borrowed view expands");
+        assert!(expansion.contains("__blazingly_schema_name"));
+        assert!(expansion.contains("T : :: blazingly :: ApiSchema"));
+    }
+
+    #[test]
+    fn validation_rules_are_rejected_on_a_borrowed_view() {
+        let error = rejection_message(expand_borrowed(
+            "struct View<'store> { #[min_length(2)] title: &'store str }",
+        ));
+        assert!(error.contains("`#[min_length]`"), "{error}");
+        assert!(error.contains("never validated"), "{error}");
+
+        let arguments = syn::parse_str::<ModelArgs>("borrowed, validate_with = checks::window")
+            .expect("parses");
+        let error = rejection_message(expand("struct View<'a> { title: &'a str }", &arguments));
+        assert!(error.contains("never validated"), "{error}");
+    }
+
+    #[test]
+    fn an_owning_model_rejects_generics_and_points_at_the_borrowed_form() {
+        let error = rejection_message(expand_default("struct Page<T> { items: Vec<T> }"));
+        assert!(error.contains("silently skip validating it"), "{error}");
+        assert!(error.contains("#[api_model(borrowed)]"), "{error}");
+
+        let error = rejection_message(expand_default("struct View<'a> { title: &'a str }"));
+        assert!(error.contains("cannot borrow from the request"), "{error}");
+        assert!(error.contains("#[api_model(borrowed)]"), "{error}");
     }
 }

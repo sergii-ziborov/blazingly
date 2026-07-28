@@ -8,10 +8,10 @@ use blazingly_executor::{
     DependencyError, ExecutableApp, ExecutionOutcome, HttpRequestParts as InvocationRequestParts,
     InvocationControl,
 };
+use blazingly_json::{Value, json};
 use blazingly_openapi::{OpenApiAssetResponse, OpenApiConfig, OpenApiService};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -346,8 +346,8 @@ impl Request {
     /// # Errors
     ///
     /// Returns the serialization error if `value` cannot be encoded as JSON.
-    pub fn json(mut self, value: &impl Serialize) -> Result<Self, serde_json::Error> {
-        self.body = serde_json::to_vec(value)?;
+    pub fn json(mut self, value: &impl Serialize) -> Result<Self, blazingly_json::Error> {
+        self.body = blazingly_json::to_vec(value)?;
         self.headers
             .insert("content-type".to_owned(), "application/json".to_owned());
         Ok(self)
@@ -614,8 +614,8 @@ impl Response {
     /// # Errors
     ///
     /// Returns an error when the response is not valid JSON for `T`.
-    pub fn json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_slice(&self.body)
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T, blazingly_json::Error> {
+        blazingly_json::from_slice(&self.body)
     }
 }
 
@@ -1714,7 +1714,7 @@ fn outcome_response(outcome: ExecutionOutcome) -> Response {
         } => error_response(status, &code, &message, details),
         ExecutionOutcome::DomainError(error) => {
             let details = match error.details {
-                Some(details) => match serde_json::from_slice(&details) {
+                Some(details) => match blazingly_json::from_slice(&details) {
                     Ok(details) => Some(details),
                     Err(_) => return internal_error_response(),
                 },
@@ -1760,7 +1760,7 @@ fn internal_error_response() -> Response {
 }
 
 fn json_response(status: u16, value: &Value) -> Response {
-    let Ok(body) = serde_json::to_vec(value) else {
+    let Ok(body) = blazingly_json::to_vec(value) else {
         return Response {
             status: 500,
             headers: json_headers(),
@@ -1894,8 +1894,8 @@ mod tests {
         ExecutableApp, ExecutableOperation, ExecutionOutcome, Extension, FromInvocation,
         OperationFuture, OperationOutput,
     };
+    use blazingly_json::{Value, json};
     use futures_lite::future;
-    use serde_json::{Value, json};
     use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
     struct PassthroughLayer;
@@ -1951,7 +1951,7 @@ mod tests {
                 ExecutionOutcome::Success {
                     status: 200,
                     headers: Vec::new(),
-                    body: Some(serde_json::to_vec(&body).expect("connection body")),
+                    body: Some(blazingly_json::to_vec(&body).expect("connection body")),
                     background: Vec::new(),
                 }
             }) as OperationFuture)

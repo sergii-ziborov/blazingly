@@ -21,9 +21,9 @@ use blazingly_core::{
     OperationDescriptor, OperationRisk, OutputExposure, SchemaKind, TypeDescriptor, ValidationRule,
 };
 use blazingly_executor::{ExecutableApp, ExecutionOutcome};
+use blazingly_json::Map;
+use blazingly_json::{Value, json};
 use serde::Serialize;
-use serde_json::Map;
-use serde_json::{Value, json};
 use std::fmt;
 
 /// Context supplied by an MCP host when it invokes a tool.
@@ -134,7 +134,7 @@ impl<'app> McpRuntime<'app> {
             } => {
                 let body = body
                     .map(|body| {
-                        serde_json::from_slice(&body).map_err(|error| McpProtocolError {
+                        blazingly_json::from_slice(&body).map_err(|error| McpProtocolError {
                             code: -32_603,
                             message: format!("operation response is not valid JSON: {error}"),
                         })
@@ -169,7 +169,7 @@ impl<'app> McpRuntime<'app> {
                 let details = error
                     .details
                     .map(|details| {
-                        serde_json::from_slice::<Value>(&details).map_err(|decode| {
+                        blazingly_json::from_slice::<Value>(&details).map_err(|decode| {
                             McpProtocolError {
                                 code: -32_603,
                                 message: format!(

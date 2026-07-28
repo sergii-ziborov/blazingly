@@ -295,6 +295,9 @@ are recorded in [benchmark status](docs/benchmark-status.md).
 - `blazingly-contract`: independent portable operation contracts, pinned here
   to the local `v0.3.0` release commit while its registry publication is
   pending;
+- `blazingly-json`: the JSON engine every crate here encodes and decodes with,
+  developed in its own repository and consumed as a path dependency while its
+  registry publication is pending;
 - `blazingly-benchmarks`: external conformance and performance comparisons.
 
 The framework workspace contains:

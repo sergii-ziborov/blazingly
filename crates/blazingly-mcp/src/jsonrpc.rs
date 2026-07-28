@@ -2,7 +2,7 @@ use crate::{
     AuditEvent, AuditOutcome, AuditSink, McpCallContext, McpRegistry, McpRuntime, to_value,
 };
 use blazingly_executor::ExecutableApp;
-use serde_json::{Map, Number, Value, json};
+use blazingly_json::{Map, Number, Value, json};
 use std::sync::Arc;
 
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -92,7 +92,7 @@ impl<'app> JsonRpcServer<'app> {
     /// Handles one newline-free JSON-RPC message.
     #[must_use]
     pub async fn handle_line(&mut self, line: &str) -> Option<String> {
-        let message = match serde_json::from_str(line) {
+        let message = match blazingly_json::from_str(line) {
             Ok(message) => message,
             Err(error) => {
                 return Some(
@@ -252,7 +252,7 @@ impl<'app> JsonRpcServer<'app> {
             .call_tool(name, arguments, McpCallContext { confirmed })
             .await
         {
-            Ok(result) => match serde_json::to_value(result) {
+            Ok(result) => match blazingly_json::to_value(result) {
                 Ok(result) => success_response(id, result),
                 Err(_) => error_response(id, -32_603, "Internal error", None),
             },
@@ -272,7 +272,7 @@ impl<'app> JsonRpcServer<'app> {
             .resources()
             .map(crate::McpResource::descriptor)
             .collect::<Vec<_>>();
-        match serde_json::to_value(resources) {
+        match blazingly_json::to_value(resources) {
             Ok(resources) => success_response(id, json!({ "resources": resources })),
             Err(_) => error_response(id, -32_603, "Internal error", None),
         }
@@ -292,7 +292,7 @@ impl<'app> JsonRpcServer<'app> {
             return error_response(id, -32_002, "Resource not found", None);
         };
         match resource.read().await {
-            Ok(content) => match serde_json::to_value(content) {
+            Ok(content) => match blazingly_json::to_value(content) {
                 Ok(content) => success_response(id, json!({ "contents": [content] })),
                 Err(_) => error_response(id, -32_603, "Internal error", None),
             },
@@ -312,7 +312,7 @@ impl<'app> JsonRpcServer<'app> {
             .prompts()
             .map(crate::McpPrompt::descriptor)
             .collect::<Vec<_>>();
-        match serde_json::to_value(prompts) {
+        match blazingly_json::to_value(prompts) {
             Ok(prompts) => success_response(id, json!({ "prompts": prompts })),
             Err(_) => error_response(id, -32_603, "Internal error", None),
         }
@@ -341,7 +341,7 @@ impl<'app> JsonRpcServer<'app> {
             return invalid_params(id, "unknown prompt");
         };
         match prompt.render(arguments).await {
-            Ok(messages) => match serde_json::to_value(messages) {
+            Ok(messages) => match blazingly_json::to_value(messages) {
                 Ok(messages) => {
                     let mut result = json!({ "messages": messages });
                     if let Some(description) = &prompt.descriptor().description {

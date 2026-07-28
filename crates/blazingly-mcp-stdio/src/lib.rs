@@ -261,8 +261,8 @@ impl Wake for ThreadWaker {
 mod tests {
     use super::{StdioConfig, StdioSupervisor, StdioTermination, serve, serve_supervised};
     use blazingly_executor::{ExecutableApp, ExecutableOperation};
+    use blazingly_json::Value;
     use blazingly_mcp::JsonRpcServer;
-    use serde_json::Value;
     use std::io::Cursor;
     use std::num::NonZeroU64;
 
@@ -292,12 +292,12 @@ mod tests {
         let output = String::from_utf8(output).expect("responses are UTF-8");
         let responses = output
             .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("stdout contains JSON only"))
+            .map(|line| blazingly_json::from_str::<Value>(line).expect("stdout contains JSON only"))
             .collect::<Vec<_>>();
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
         assert_eq!(responses[1]["id"], "ping-1");
-        assert_eq!(responses[1]["result"], serde_json::json!({}));
+        assert_eq!(responses[1]["result"], blazingly_json::json!({}));
     }
 
     #[test]

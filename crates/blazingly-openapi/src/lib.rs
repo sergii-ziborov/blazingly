@@ -4,7 +4,7 @@ use blazingly_core::{
     AppDefinition, InputDescriptor, InputSource, ModelDescriptor, OperationDescriptor, SchemaKind,
     SecurityLocation, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationRule,
 };
-use serde_json::{Map, Value, json};
+use blazingly_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 /// Browser UI rendered by [`OpenApiService`].
@@ -345,8 +345,8 @@ fn response_media_type(descriptor: &TypeDescriptor) -> &'static str {
 
 fn scalar_html(config: &OpenApiConfig) -> String {
     let title = escape_html(&config.title);
-    let document_path =
-        serde_json::to_string(&config.document_path).unwrap_or_else(|_| "\"/openapi.json\"".into());
+    let document_path = blazingly_json::to_string(&config.document_path)
+        .unwrap_or_else(|_| "\"/openapi.json\"".into());
     format!(
         concat!(
             "<!doctype html><html><head><meta charset=\"utf-8\">",
@@ -363,8 +363,8 @@ fn scalar_html(config: &OpenApiConfig) -> String {
 
 fn swagger_html(config: &OpenApiConfig) -> String {
     let title = escape_html(&config.title);
-    let document_path =
-        serde_json::to_string(&config.document_path).unwrap_or_else(|_| "\"/openapi.json\"".into());
+    let document_path = blazingly_json::to_string(&config.document_path)
+        .unwrap_or_else(|_| "\"/openapi.json\"".into());
     format!(
         concat!(
             "<!doctype html><html><head><meta charset=\"utf-8\">",

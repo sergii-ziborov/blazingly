@@ -16,7 +16,7 @@ blazingly-mcp.workspace = true
 
 [dev-dependencies]
 blazingly-executor.workspace = true
-serde_json.workspace = true
+blazingly-json.workspace = true
 
 [lints]
 workspace = true

@@ -2,18 +2,14 @@ use blazingly::prelude::*;
 use futures_lite::future;
 use std::num::NonZeroUsize;
 
-#[get("/blocking", id = "blocking.run")]
-fn blocking_handler() -> Json<String> {
-    Json(
-        std::thread::current()
-            .name()
-            .unwrap_or("unnamed")
-            .to_owned(),
-    )
-}
-
+/// The pool is bounded, and saturation is rejected rather than queued forever.
+///
+/// This test owns the whole binary because it installs a one-worker,
+/// one-slot pool process-wide. Anything else scheduled here would be rejected
+/// by that configuration rather than by its own behaviour, so the companion
+/// contract lives in `sync_handler_path.rs`.
 #[test]
-fn sync_handlers_use_a_bounded_named_worker_pool() {
+fn the_blocking_pool_is_bounded_and_rejects_saturation() {
     install_global_blocking_pool(BlockingPoolConfig::new(
         NonZeroUsize::MIN,
         NonZeroUsize::MIN,
@@ -37,10 +33,4 @@ fn sync_handlers_use_a_bounded_named_worker_pool() {
     release_sender.send(()).expect("release worker");
     future::block_on(first).expect("first task");
     assert_eq!(future::block_on(second), Ok(2));
-
-    let executable = ExecutableApp::new(routes![blocking_handler]).expect("blocking route");
-    let response = future::block_on(TestApp::new(&executable).call(Request::get("/blocking")));
-    assert_eq!(response.status(), 200);
-    let worker_name: String = response.json().expect("worker name");
-    assert!(worker_name.starts_with("blazingly-blocking-"));
 }

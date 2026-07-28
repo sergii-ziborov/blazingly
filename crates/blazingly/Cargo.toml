@@ -49,6 +49,7 @@ blazingly-docs = { workspace = true, optional = true }
 blazingly-di.workspace = true
 blazingly-executor.workspace = true
 blazingly-http.workspace = true
+blazingly-json.workspace = true
 blazingly-macros.workspace = true
 blazingly-middleware = { workspace = true, optional = true }
 blazingly-mcp = { workspace = true, optional = true }
@@ -62,11 +63,15 @@ blazingly-security = { workspace = true, optional = true }
 blazingly-templates = { workspace = true, optional = true }
 blazingly-validation = { workspace = true, optional = true }
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
 futures-lite.workspace = true
+# Independent oracle: the integration tests re-parse the bytes this framework
+# puts on the wire with a second, unrelated JSON implementation, so an encoder
+# bug cannot hide behind a matching decoder. Test-only; not in the dependency
+# tree of any shipped crate.
+serde_json.workspace = true
 shiguredo_http2.workspace = true
 
 [[example]]

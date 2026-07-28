@@ -44,8 +44,8 @@ impl SseEvent {
     /// # Errors
     ///
     /// Returns the serializer error when the value cannot be encoded.
-    pub fn json(value: &impl Serialize) -> Result<Self, serde_json::Error> {
-        serde_json::to_string(value).map(Self::data)
+    pub fn json(value: &impl Serialize) -> Result<Self, blazingly_json::Error> {
+        blazingly_json::to_string(value).map(Self::data)
     }
 
     /// Sets the event type.

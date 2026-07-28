@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = [
     "crates/cargo-blazingly",
     "crates/blazingly",
@@ -58,6 +58,7 @@ blazingly-docs = { path = "crates/blazingly-docs" }
 blazingly-di = { path = "crates/blazingly-di" }
 blazingly-executor = { path = "crates/blazingly-executor" }
 blazingly-http = { path = "crates/blazingly-http" }
+blazingly-json = { version = "0.1.0", path = "crates/blazingly-json" }
 blazingly-macros = { path = "crates/blazingly-macros" }
 blazingly-middleware = { path = "crates/blazingly-middleware" }
 blazingly-mcp = { path = "crates/blazingly-mcp" }
@@ -95,6 +96,10 @@ rust_decimal = "1"
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
+# Dev-only. The framework encodes and decodes with `blazingly-json`; this is the
+# independent oracle `crates/blazingly/tests/json_oracle.rs` checks the wire
+# bytes against, so a shared bug in one engine cannot pass unnoticed. It must
+# never appear in a `[dependencies]` table.
 serde_json = "1.0.151"
 serde_path_to_error = "0.1"
 sha2 = "0.10"

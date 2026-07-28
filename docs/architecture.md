@@ -101,7 +101,7 @@ must preserve these invariants:
 - middleware storage is empty by default and only allocates typed request
   extensions when a layer installs state such as an authenticated identity;
 - HTTP JSON is decoded directly from request bytes without an intermediate
-  `serde_json::Value`;
+  `blazingly_json::Value`;
 - a successful typed response is serialized once into final JSON bytes;
 - dependency injection uses a compiled slot plan, never per-request type-name
   or hash-map lookup;

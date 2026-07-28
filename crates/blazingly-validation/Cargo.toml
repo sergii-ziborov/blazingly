@@ -13,9 +13,9 @@ publish.workspace = true
 
 [dependencies]
 blazingly-core.workspace = true
+blazingly-json.workspace = true
 rust_decimal.workspace = true
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
 time.workspace = true
 url.workspace = true
 uuid.workspace = true

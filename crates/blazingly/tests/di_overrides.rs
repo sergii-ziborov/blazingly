@@ -89,7 +89,7 @@ fn read(app: &ExecutableApp, path: &str) -> String {
     let response = future::block_on(TestApp::new(app).call(Request::get(path)));
     assert_eq!(response.status(), 200);
     response
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("override response should be JSON")["value"]
         .as_str()
         .expect("override response should contain a string")

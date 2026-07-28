@@ -8,10 +8,10 @@
 
 use blazingly_core::{BodyStream, BodyStreamError, HttpMethod, StreamingBody};
 use blazingly_http::{HttpMiddleware, HttpRequestContext, HttpRequestView, Response};
+use blazingly_json::json;
 use brotli::CompressorWriter;
 use flate2::Compression as GzipLevel;
 use flate2::write::GzEncoder;
-use serde_json::json;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1493,7 +1493,7 @@ const MIME_TYPES: &[(&str, &str)] = &[
 fn json_error(status: u16, code: &str, message: &str) -> Response {
     Response::from_bytes(
         status,
-        serde_json::to_vec(&json!({
+        blazingly_json::to_vec(&json!({
             "error": {
                 "code": code,
                 "message": message,

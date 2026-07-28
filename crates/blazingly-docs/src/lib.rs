@@ -4,7 +4,7 @@ use blazingly_core::{
     AppDefinition, InputDescriptor, InputSource, ModelDescriptor, OperationDescriptor, SchemaKind,
     TypeDescriptor, ValidationRule,
 };
-use serde_json::{Map, Value, json};
+use blazingly_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -127,7 +127,7 @@ impl ScaffoldConfig {
 pub fn bundle(
     app: &AppDefinition,
     config: &DocsBundleConfig,
-) -> Result<DocsBundle, serde_json::Error> {
+) -> Result<DocsBundle, blazingly_json::Error> {
     let contracts = app
         .operations()
         .iter()
@@ -138,7 +138,7 @@ pub fn bundle(
     files.insert("ai.md".to_owned(), ai_markdown(app, config));
     files.insert(
         "contracts.json".to_owned(),
-        serde_json::to_string_pretty(&contracts)?,
+        blazingly_json::to_string_pretty(&contracts)?,
     );
     files.insert("examples/http.md".to_owned(), http_examples(app, config));
     files.insert("examples/mcp.md".to_owned(), mcp_examples(app, config));
@@ -442,7 +442,7 @@ fn mcp_examples(app: &AppDefinition, config: &DocsBundleConfig) -> String {
             output,
             "## `{}`\n\n```json\n{}\n```\n",
             tool.name,
-            serde_json::to_string_pretty(&request)
+            blazingly_json::to_string_pretty(&request)
                 .unwrap_or_else(|_| "{\"error\":\"example generation failed\"}".to_owned())
         );
     }
@@ -452,6 +452,9 @@ fn mcp_examples(app: &AppDefinition, config: &DocsBundleConfig) -> String {
 fn rust_client_source(app: &AppDefinition, config: &DocsBundleConfig) -> String {
     let mut output = format!(
         concat!(
+            // The starter is a standalone reqwest project, not a Blazingly
+            // crate. `reqwest::Response::json` deserializes through
+            // `serde_json`, so the generated signatures name that crate.
             "// Generated starter for {}. Dependencies: reqwest, serde_json.\n",
             "pub struct Client {{\n",
             "    base_url: String,\n",

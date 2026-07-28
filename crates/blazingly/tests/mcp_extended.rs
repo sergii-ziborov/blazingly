@@ -4,8 +4,8 @@ use blazingly::mcp::{
     StreamableHttpRequest, StreamableHttpServer,
 };
 use blazingly::prelude::*;
+use blazingly_json::{Value, json};
 use futures_lite::future;
-use serde_json::{Value, json};
 
 #[test]
 fn resources_prompts_and_redacted_audit_share_one_json_rpc_lifecycle() {
@@ -199,7 +199,7 @@ fn request(server: &mut JsonRpcServer<'_>, message: Value) -> Value {
 }
 
 fn initialization() -> Vec<u8> {
-    serde_json::to_vec(&initialization_value()).expect("fixture should serialize")
+    blazingly_json::to_vec(&initialization_value()).expect("fixture should serialize")
 }
 
 fn initialization_value() -> Value {

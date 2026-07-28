@@ -19,8 +19,8 @@ blazingly-validation = { workspace = true, optional = true }
 base64.workspace = true
 blazingly-core.workspace = true
 blazingly-di.workspace = true
+blazingly-json.workspace = true
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
 serde_path_to_error.workspace = true
 
 [lints]

@@ -572,9 +572,12 @@ fn ends_with_anchor(body: &[char]) -> bool {
 }
 
 /// Compiles and applies a pattern, reporting `false` for unsupported patterns.
+///
+/// Compilation is memoized per thread, so repeatedly applying one pattern pays
+/// the parse cost once.
 #[must_use]
 pub fn matches_pattern(value: &str, pattern: &str) -> bool {
-    Pattern::compile(pattern).is_ok_and(|pattern| pattern.matches(value))
+    crate::cache::compiled_pattern(pattern).is_ok_and(|compiled| compiled.matches(value))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use blazingly::prelude::*;
-use serde_json::json;
+use blazingly_json::json;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -563,7 +563,7 @@ fn native_mcp_uses_the_shared_validation_handler_and_error_pipeline() {
     assert_eq!(structured["id"], 1);
     assert_eq!(structured["name"], "Ada");
 
-    let wire = serde_json::to_value(&success).expect("MCP result should serialize");
+    let wire = blazingly_json::to_value(&success).expect("MCP result should serialize");
     assert_eq!(wire["content"][0]["type"], "text");
     assert_eq!(wire["structuredContent"]["email"], "ada@example.com");
     assert!(wire.get("isError").is_none());
@@ -597,7 +597,7 @@ fn http_test_app_and_mcp_execute_the_same_operation() {
         Some("application/json")
     );
     let http_body = http_success
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("HTTP success should be JSON");
 
     let mcp_success = poll_ready(runtime_call_create_user(
@@ -625,7 +625,7 @@ fn http_test_app_and_mcp_execute_the_same_operation() {
     assert_eq!(http_domain_error.status(), 409);
     assert_eq!(
         http_domain_error
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("HTTP error should be JSON")["error"]["code"],
         "email_already_exists"
     );
@@ -647,7 +647,7 @@ fn http_test_app_enforces_routing_body_and_error_contracts() {
     assert_eq!(health_response.status(), 200);
     assert_eq!(
         health_response
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("health response should be JSON"),
         "ok"
     );
@@ -708,7 +708,7 @@ fn multiple_typed_arguments_share_http_mcp_and_documentation_contracts() {
     );
     assert_eq!(response.status(), 200);
     let http_body = response
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("HTTP response should be JSON");
     assert_eq!(http_body["tenantId"], 41);
     assert_eq!(http_body["userId"], 7);
@@ -798,7 +798,7 @@ fn complete_response_and_error_pipeline_is_transport_consistent() {
     assert_eq!(accepted.get_header("x-request-id"), Some("req-7"));
     assert_eq!(
         accepted
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("accepted response should be JSON")["id"],
         7
     );
@@ -815,7 +815,7 @@ fn complete_response_and_error_pipeline_is_transport_consistent() {
     assert_http_error(&typed_error, 429, "rate_limited");
     assert_eq!(typed_error.get_header("retry-after"), Some("30"));
     let error_body = typed_error
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("typed error should be JSON");
     assert_eq!(error_body["error"]["details"]["retryAfterSeconds"], 30);
     assert_eq!(error_body["error"]["details"]["limit"], 100);
@@ -920,7 +920,7 @@ fn plugin_scopes_compile_di_once_and_share_it_across_http_and_mcp() {
     let response = poll_ready(http.call(Request::get("/di/users/42")));
     assert_eq!(response.status(), 200);
     let body = response
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("dependency response should be JSON");
     assert_eq!(body["userId"], 42);
     assert_eq!(body["message"], "users-hello");
@@ -1020,7 +1020,7 @@ fn compiled_di_honors_transient_lifetime_and_reverse_finalizer_order() {
     let response = poll_ready(TestApp::new(&executable).call(Request::get("/di/lifecycle")));
     assert_eq!(response.status(), 200);
     let body = response
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("lifecycle response should be JSON");
     assert_eq!(body["firstTransient"], 1);
     assert_eq!(body["secondTransient"], 2);
@@ -1089,7 +1089,7 @@ fn async_providers_and_finalizers_are_runtime_neutral_across_http_and_mcp() {
     assert_eq!(response.status(), 200);
     assert_eq!(
         response
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("async dependency response should be JSON")["value"],
         1
     );
@@ -1423,7 +1423,7 @@ fn text_content(result: &blazingly::mcp::CallToolResult) -> &str {
 
 async fn runtime_call_create_user(
     runtime: &blazingly::mcp::McpRuntime<'_>,
-    input: serde_json::Value,
+    input: blazingly_json::Value,
 ) -> blazingly::mcp::CallToolResult {
     runtime
         .call_tool(
@@ -1438,7 +1438,7 @@ async fn runtime_call_create_user(
 fn assert_http_error(response: &Response, status: u16, code: &str) {
     assert_eq!(response.status(), status);
     let body = response
-        .json::<serde_json::Value>()
+        .json::<blazingly_json::Value>()
         .expect("HTTP error should be JSON");
     assert_eq!(body["error"]["code"], code);
 }

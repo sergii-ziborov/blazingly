@@ -83,7 +83,7 @@ fn assert_error(response: &Response, status: u16, code: &str) {
     assert_eq!(response.status(), status);
     assert_eq!(
         response
-            .json::<serde_json::Value>()
+            .json::<blazingly_json::Value>()
             .expect("controlled error should be JSON")["error"]["code"],
         code
     );

@@ -5,3 +5,7 @@
 	path = crates/blazingly-wire
 	url = ../blazingly-wire
 	branch = main
+[submodule "crates/blazingly-json"]
+	path = crates/blazingly-json
+	url = ../blazingly-json
+	branch = main

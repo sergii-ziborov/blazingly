@@ -16,9 +16,9 @@ base64.workspace = true
 blazingly-core.workspace = true
 blazingly-executor.workspace = true
 blazingly-http.workspace = true
+blazingly-json.workspace = true
 hmac.workspace = true
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 

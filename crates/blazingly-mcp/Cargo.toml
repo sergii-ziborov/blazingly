@@ -18,8 +18,8 @@ validation = ["dep:blazingly-validation"]
 blazingly-validation = { workspace = true, optional = true }
 blazingly-core.workspace = true
 blazingly-executor.workspace = true
+blazingly-json.workspace = true
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
 
 [lints]
 workspace = true

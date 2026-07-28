@@ -3,10 +3,12 @@
 //! Strong string-like API values comparable to common Pydantic field types,
 //! plus the runtime checks `#[api_model]` emits for declarative field rules.
 
+mod cache;
 mod checks;
 mod matcher;
 mod paths;
 
+pub use cache::PATTERN_CACHE_CAPACITY;
 pub use checks::{
     Constraint, IntoModelViolations, ModelViolation, NumericField, NumericValue,
     UNIQUE_ITEMS_SCAN_LIMIT, check_exclusive_maximum, check_exclusive_minimum, check_max_items,

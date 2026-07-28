@@ -1,6 +1,6 @@
 use crate::{ContentBlock, McpProtocolError};
+use blazingly_json::{Map, Value};
 use serde::Serialize;
-use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;

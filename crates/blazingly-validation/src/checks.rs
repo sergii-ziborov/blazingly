@@ -1,10 +1,10 @@
 //! Runtime helpers emitted by `#[api_model]` for declarative field constraints.
 
-use crate::matcher::Pattern;
+use crate::cache::compiled_pattern;
 use blazingly_core::{FieldViolation, ValidationErrors};
+use blazingly_json::{Value, json};
 use core::cmp::Ordering;
 use core::fmt;
-use serde_json::{Value, json};
 
 /// Largest collection length for which uniqueness is verified in place.
 ///
@@ -281,8 +281,13 @@ pub fn check_unique_items<T: PartialEq>(errors: &mut ValidationErrors, field: &s
 }
 
 /// Records a `pattern` violation when the value does not satisfy the pattern.
+///
+/// The pattern is compiled at most once per thread and reused afterwards, so a
+/// field rule costs one match rather than one compile plus one match per call.
+/// See [`PATTERN_CACHE_CAPACITY`](crate::PATTERN_CACHE_CAPACITY) for the bound
+/// on what that reuse retains.
 pub fn check_pattern(errors: &mut ValidationErrors, field: &str, value: &str, pattern: &str) {
-    match Pattern::compile(pattern) {
+    match compiled_pattern(pattern) {
         Ok(compiled) => {
             if !compiled.matches(value) {
                 errors.push(
@@ -490,7 +495,7 @@ mod tests {
         check_pattern, check_unique_items, merge_model_violations, parse_numeric_value,
     };
     use blazingly_core::ValidationErrors;
-    use serde_json::json;
+    use blazingly_json::json;
 
     fn codes(errors: &ValidationErrors) -> Vec<&str> {
         errors

@@ -22,6 +22,12 @@ pub use blazingly_http::{
     CollectBodyError, ConnectionInfo, HttpApp, HttpMiddleware, HttpRequestContext, HttpRequestView,
     Request, Response, RouteError, RouteMatch, Router, TestApp,
 };
+// Public, not `__private`: `AuthenticatedIdentity::claims`, `VerifiedToken::claims`
+// and `PreparedJson::encode` name this crate's `Value` and `Error` in their
+// signatures, so an application has to be able to name them too. While
+// `serde_json` was the engine an application could reach it from crates.io on
+// its own; `blazingly-json` is not published yet, so the facade re-exports it.
+pub use blazingly_json as json;
 pub use blazingly_macros::{
     api_error, api_model, connect, delete, get, head, operation, options, patch, post, provider,
     put, security, trace,
@@ -58,8 +64,8 @@ pub mod native {
 
 #[doc(hidden)]
 pub mod __private {
+    pub use blazingly_json;
     pub use serde;
-    pub use serde_json;
 }
 
 pub mod prelude {

@@ -25,7 +25,7 @@ pub use blazingly_contract::{
 
 /// Distinct response shapes tracked per thread before slots start colliding.
 const RESPONSE_HINT_SLOTS: usize = 32;
-/// Floor for a learned hint, matching what `serde_json::to_vec` starts with.
+/// Floor for a learned hint, matching what `blazingly_json::to_vec` starts with.
 const MIN_RESPONSE_HINT: usize = 128;
 /// Ceiling for a learned hint, so one outsized response cannot make every
 /// later response of that shape reserve megabytes.
@@ -253,14 +253,14 @@ impl<T> PreparedJson<T> {
     ///
     /// # Errors
     ///
-    /// Returns the `serde_json` failure when `value` cannot be encoded, for
+    /// Returns the `blazingly_json` failure when `value` cannot be encoded, for
     /// instance because a map key is not a string.
-    pub fn encode<V>(value: &V) -> Result<Self, serde_json::Error>
+    pub fn encode<V>(value: &V) -> Result<Self, blazingly_json::Error>
     where
         V: Serialize + ?Sized,
     {
         let mut body = Vec::with_capacity(response_size_hint::<V>());
-        serde_json::to_writer(&mut body, value)?;
+        blazingly_json::to_writer(&mut body, value)?;
         record_response_size::<V>(body.len());
         Ok(Self::from_bytes(body))
     }

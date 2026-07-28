@@ -1,6 +1,6 @@
 use crate::{AuditSink, JsonRpcServer, McpRegistry, PROTOCOL_VERSION, ServerInfo};
 use blazingly_executor::ExecutableApp;
-use serde_json::{Value, json};
+use blazingly_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -98,8 +98,8 @@ impl StreamableHttpResponse {
     /// # Errors
     ///
     /// Returns a serde error for non-JSON responses.
-    pub fn json(&self) -> Result<Value, serde_json::Error> {
-        serde_json::from_slice(&self.body)
+    pub fn json(&self) -> Result<Value, blazingly_json::Error> {
+        blazingly_json::from_slice(&self.body)
     }
 }
 
@@ -258,7 +258,7 @@ impl<'app> StreamableHttpServer<'app> {
                 "Accept must include application/json and text/event-stream",
             );
         }
-        let message = match serde_json::from_slice::<Value>(&request.body) {
+        let message = match blazingly_json::from_slice::<Value>(&request.body) {
             Ok(message) => message,
             Err(error) => {
                 return json_response(
@@ -378,7 +378,7 @@ fn media_type(value: &str, expected: &str) -> bool {
 }
 
 fn json_response(status: u16, value: &Value) -> StreamableHttpResponse {
-    match serde_json::to_vec(value) {
+    match blazingly_json::to_vec(value) {
         Ok(body) => StreamableHttpResponse {
             status,
             headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
