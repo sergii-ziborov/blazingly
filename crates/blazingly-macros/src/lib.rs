@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use core::fmt::Write as _;
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
@@ -136,6 +137,20 @@ impl NumericLiteral {
         }
     }
 
+    /// The bare literal, so the field type it is written for infers itself.
+    fn literal_tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Integer(value) => {
+                let literal = proc_macro2::Literal::i128_unsuffixed(value);
+                quote!(#literal)
+            }
+            Self::Float(value) => {
+                let literal = proc_macro2::Literal::f64_unsuffixed(value);
+                quote!(#literal)
+            }
+        }
+    }
+
     fn encoded(self) -> String {
         match self {
             Self::Integer(value) => value.to_string(),
@@ -166,6 +181,72 @@ impl NumericLiteral {
             Self::Float(value) => value == 0.0,
         }
     }
+}
+
+/// A field default written as an attribute literal.
+///
+/// The literal is emitted twice: once as the body of the serde default so the
+/// handler never sees an absent field, and once as JSON in the descriptor so a
+/// schema projection can state the value a client may omit.
+#[derive(Clone)]
+enum DefaultLiteral {
+    Text(LitStr),
+    Number(NumericLiteral),
+    Boolean(LitBool),
+}
+
+impl DefaultLiteral {
+    fn expression(&self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Text(value) => quote!(::std::string::String::from(#value)),
+            Self::Number(value) => value.literal_tokens(),
+            Self::Boolean(value) => quote!(#value),
+        }
+    }
+
+    /// The JSON form recorded in the descriptor.
+    fn encoded(&self) -> String {
+        match self {
+            Self::Text(value) => json_string(&value.value()),
+            Self::Number(value) => value.encoded(),
+            Self::Boolean(value) => value.value().to_string(),
+        }
+    }
+
+    /// What the literal is, and the field it can be written on.
+    const fn expectation(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Text(_) => ("a string literal", "a `String` field"),
+            Self::Number(NumericLiteral::Integer(_)) => {
+                ("an integer literal", "an integer or floating-point field")
+            }
+            Self::Number(NumericLiteral::Float(_)) => {
+                ("a floating-point literal", "a floating-point field")
+            }
+            Self::Boolean(_) => ("a boolean literal", "a `bool` field"),
+        }
+    }
+}
+
+/// Encodes a Rust string as a JSON string literal.
+fn json_string(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() + 2);
+    encoded.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => encoded.push_str("\\\""),
+            '\\' => encoded.push_str("\\\\"),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            control if control < ' ' => {
+                let _ = write!(encoded, "\\u{:04x}", control as u32);
+            }
+            other => encoded.push(other),
+        }
+    }
+    encoded.push('"');
+    encoded
 }
 
 /// The syntactic value shape a field's declarative rules are checked against.
@@ -205,6 +286,7 @@ struct FieldRules {
     min_items: Option<(usize, proc_macro2::Span)>,
     max_items: Option<(usize, proc_macro2::Span)>,
     unique_items: Option<proc_macro2::Span>,
+    default: Option<(DefaultLiteral, proc_macro2::Span)>,
 }
 
 struct OperationOutput {
@@ -546,12 +628,33 @@ pub fn connect(arguments: TokenStream, item: TokenStream) -> TokenStream {
 ///     tags: Vec<&'store TagRef>,
 /// }
 /// ```
+///
+/// A one-field tuple struct declares a *value type*: a bundle of field rules
+/// named once and applied by every field declared with it.
+///
+/// ```ignore
+/// #[api_model]
+/// #[min_length(8)]
+/// #[max_length(200)]
+/// struct Title(String);
+/// ```
+///
+/// A unit-variant enum declares a closed set of strings, schema included.
+///
+/// ```ignore
+/// #[api_model(rename_all = "lowercase")]
+/// enum Language {
+///     Uk,
+///     Ru,
+///     En,
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn api_model(arguments: TokenStream, item: TokenStream) -> TokenStream {
     let arguments = parse_macro_input!(arguments as ModelArgs);
-    let mut model = parse_macro_input!(item as ItemStruct);
+    let mut model = parse_macro_input!(item as syn::Item);
 
-    match model_tokens(&arguments, &mut model) {
+    match api_model_tokens(&arguments, &mut model) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.into_compile_error().into(),
     }
@@ -1250,14 +1353,453 @@ fn validate_response_header(name: &LitStr, value: &LitStr) -> syn::Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
+fn api_model_tokens(
+    arguments: &ModelArgs,
+    item: &mut syn::Item,
+) -> syn::Result<proc_macro2::TokenStream> {
+    match item {
+        syn::Item::Struct(model) => model_tokens(arguments, model),
+        syn::Item::Enum(model) => enum_model_tokens(arguments, model),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "`#[api_model]` describes a struct, a one-field value type, or a \
+             unit-variant enum",
+        )),
+    }
+}
+
 fn model_tokens(
     arguments: &ModelArgs,
     model: &mut ItemStruct,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    if matches!(model.fields, Fields::Unnamed(_)) {
+        return value_model_tokens(arguments, model);
+    }
     if arguments.borrowed.is_some() {
         return borrowed_model_tokens(arguments, model);
     }
     owned_model_tokens(arguments, model)
+}
+
+/// Expands the value form: one named bundle of field rules, applied by type.
+///
+/// `Title` is declared once with the rules written exactly as they are on a
+/// field, and every model that declares a `Title` field inherits them — into the
+/// descriptor through [`ApiConstrained::constraint_rules`], and into validation
+/// through [`ApiConstrained::validate_constraints`]. A newtype was chosen over a
+/// rule alias because a proc macro cannot see a declaration from another
+/// expansion: only the type system carries a name across item boundaries.
+fn value_model_tokens(
+    arguments: &ModelArgs,
+    model: &mut ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let inner = value_type_inner(arguments, model)?;
+    let mut rules = take_field_rules(&mut model.attrs)?;
+    reject_field_only_rules(&rules, &model.ident)?;
+
+    let shape = field_shape(&inner);
+    reject_incompatible_rules(&rules, &inner, shape)?;
+    normalize_collection_rules(&mut rules, shape);
+
+    let model_name = &model.ident;
+    // A value type has no field name of its own: the model that declares the
+    // field supplies one when it merges these violations.
+    let anonymous = LitStr::new("", model_name.span());
+    let declared_rules = rule_descriptors(&rules, false);
+    let checks = field_checks(&rules, shape, &anonymous);
+    let custom = rules.validator.as_ref().map(|validator| {
+        quote! {
+            if let ::core::result::Result::Err(custom_errors) = #validator(value) {
+                ::blazingly::merge_field_validation_errors(
+                    &mut errors,
+                    #anonymous,
+                    &custom_errors,
+                );
+            }
+        }
+    });
+
+    Ok(quote! {
+        #[derive(
+            ::blazingly::__private::serde::Serialize,
+            ::blazingly::__private::serde::Deserialize
+        )]
+        #[serde(crate = "::blazingly::__private::serde")]
+        #[serde(transparent)]
+        #model
+
+        impl #model_name {
+            /// Wraps a value without checking it; the declared rules run when a
+            /// request is validated.
+            #[must_use]
+            pub fn new(value: #inner) -> Self {
+                Self(value)
+            }
+
+            /// The wrapped value.
+            #[must_use]
+            pub const fn as_inner(&self) -> &#inner {
+                &self.0
+            }
+
+            /// Unwraps the value.
+            #[must_use]
+            pub fn into_inner(self) -> #inner {
+                self.0
+            }
+        }
+
+        const _: () = {
+            impl ::blazingly::ApiSchema for #model_name {
+                fn type_descriptor() -> ::blazingly::TypeDescriptor {
+                    let mut descriptor =
+                        <#inner as ::blazingly::ApiSchema>::type_descriptor();
+                    descriptor.rust_name = ::std::string::String::from(
+                        stringify!(#model_name)
+                    );
+                    descriptor
+                }
+
+                fn validate_input(
+                    &self,
+                ) -> ::core::result::Result<(), ::blazingly::ValidationErrors> {
+                    <Self as ::blazingly::ApiConstrained>::validate_constraints(self)
+                }
+            }
+
+            impl ::blazingly::ApiConstrained for #model_name {
+                fn constraint_rules() -> ::std::vec::Vec<::blazingly::ValidationRule> {
+                    ::std::vec![#(#declared_rules),*]
+                }
+
+                fn validate_constraints(
+                    &self,
+                ) -> ::core::result::Result<(), ::blazingly::ValidationErrors> {
+                    let mut errors = ::blazingly::ValidationErrors::new();
+                    {
+                        let value = &self.0;
+                        #checks
+                        #custom
+                    }
+
+                    if errors.is_empty() {
+                        ::core::result::Result::Ok(())
+                    } else {
+                        ::core::result::Result::Err(errors)
+                    }
+                }
+            }
+        };
+    })
+}
+
+/// Resolves the one type a value type wraps, rejecting every other shape.
+fn value_type_inner(arguments: &ModelArgs, model: &ItemStruct) -> syn::Result<Type> {
+    let Fields::Unnamed(fields) = &model.fields else {
+        unreachable!("the value form is selected by an unnamed field list");
+    };
+    if fields.unnamed.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &model.fields,
+            "a value type wraps exactly one field; declare a struct with named \
+             fields for anything else",
+        ));
+    }
+    if let Some(borrowed) = &arguments.borrowed {
+        return Err(syn::Error::new_spanned(
+            borrowed,
+            "a value type is validated wherever it appears, which a borrowed \
+             output view never is",
+        ));
+    }
+    if let Some(rename) = &arguments.rename_all {
+        return Err(syn::Error::new_spanned(
+            rename,
+            "`rename_all` renames fields, and a value type has none",
+        ));
+    }
+    if let Some(validator) = &arguments.validator {
+        return Err(syn::Error::new_spanned(
+            validator,
+            "declare `#[validate_with(...)]` beside the other rules; a value type \
+             has no cross-field check to run",
+        ));
+    }
+    reject_owned_generics(&model.generics)?;
+
+    let inner = fields.unnamed[0].ty.clone();
+    if wrapper_inner(&inner, "Option").is_some() {
+        return Err(syn::Error::new_spanned(
+            &inner,
+            "a value type wraps the value its rules describe; declare the field \
+             that uses it as `Option<_>` instead",
+        ));
+    }
+    Ok(inner)
+}
+
+/// Rejects the rules that only mean something on a field of a model.
+fn reject_field_only_rules(rules: &FieldRules, model_name: &Ident) -> syn::Result<()> {
+    if let Some(alias) = rules.aliases.first() {
+        return Err(syn::Error::new_spanned(
+            alias,
+            "`alias` names an extra wire key for one field, which a value type \
+             does not have",
+        ));
+    }
+    if let Some((_, span)) = &rules.default {
+        return Err(syn::Error::new(
+            *span,
+            "a `default` belongs to the field that may be absent, not to the type \
+             the field is declared with",
+        ));
+    }
+    if rules.nested {
+        return Err(syn::Error::new_spanned(
+            model_name,
+            "`nested` recurses into a model; a value type validates itself",
+        ));
+    }
+    Ok(())
+}
+
+/// Expands the enumeration form: a string schema with a closed variant set.
+fn enum_model_tokens(
+    arguments: &ModelArgs,
+    model: &mut ItemEnum,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(borrowed) = &arguments.borrowed {
+        return Err(syn::Error::new_spanned(
+            borrowed,
+            "an enumeration owns its variants and never borrows",
+        ));
+    }
+    if let Some(validator) = &arguments.validator {
+        return Err(syn::Error::new_spanned(
+            validator,
+            "an enumeration accepts its declared variants and nothing else, so \
+             there is nothing left to validate",
+        ));
+    }
+    if let Some(parameter) = model.generics.params.first() {
+        return Err(syn::Error::new_spanned(
+            parameter,
+            "an API enumeration is a closed set of strings and cannot be generic",
+        ));
+    }
+    if model.variants.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &model.ident,
+            "an API enumeration needs at least one variant",
+        ));
+    }
+
+    let wire_names = enum_wire_names(arguments, model)?;
+    let identifiers = model
+        .variants
+        .iter()
+        .map(|variant| variant.ident.clone())
+        .collect::<Vec<_>>();
+    let model_name = &model.ident;
+    let encoded = format!(
+        "enum={}",
+        wire_names
+            .iter()
+            .map(LitStr::value)
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+
+    Ok(quote! {
+        #[derive(
+            ::blazingly::__private::serde::Serialize,
+            ::blazingly::__private::serde::Deserialize
+        )]
+        #[serde(crate = "::blazingly::__private::serde")]
+        #model
+
+        impl #model_name {
+            /// Every accepted wire value, in declaration order.
+            pub const VARIANTS: &'static [&'static str] = &[#(#wire_names),*];
+
+            /// The wire value this variant serializes to.
+            #[must_use]
+            pub const fn as_str(&self) -> &'static str {
+                match self {
+                    #(Self::#identifiers => #wire_names,)*
+                }
+            }
+        }
+
+        const _: () = {
+            impl ::blazingly::ApiSchema for #model_name {
+                fn type_descriptor() -> ::blazingly::TypeDescriptor {
+                    ::blazingly::TypeDescriptor::scalar(
+                        stringify!(#model_name),
+                        ::blazingly::SchemaKind::String,
+                    )
+                }
+            }
+
+            impl ::blazingly::ApiConstrained for #model_name {
+                fn constraint_rules() -> ::std::vec::Vec<::blazingly::ValidationRule> {
+                    ::std::vec![::blazingly::ValidationRule::Custom(#encoded.to_owned())]
+                }
+
+                fn validate_constraints(
+                    &self,
+                ) -> ::core::result::Result<(), ::blazingly::ValidationErrors> {
+                    ::core::result::Result::Ok(())
+                }
+            }
+        };
+    })
+}
+
+/// Resolves every variant's wire value and pins it with `#[serde(rename)]`.
+fn enum_wire_names(arguments: &ModelArgs, model: &mut ItemEnum) -> syn::Result<Vec<LitStr>> {
+    let rename_rule = enum_rename_rule(arguments)?;
+    let mut wire_names: Vec<LitStr> = Vec::new();
+
+    for variant in &mut model.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                &variant.fields,
+                "an API enumeration projects to a string, so a variant cannot \
+                 carry data",
+            ));
+        }
+        let wire = variant_wire_name(variant, rename_rule)?;
+        if wire.value().contains('|') {
+            return Err(syn::Error::new(
+                wire.span(),
+                "`|` separates the variants in the recorded schema and cannot \
+                 appear in one",
+            ));
+        }
+        if wire_names
+            .iter()
+            .any(|declared| declared.value() == wire.value())
+        {
+            return Err(syn::Error::new(
+                wire.span(),
+                format!("the wire value {:?} is declared twice", wire.value()),
+            ));
+        }
+        variant
+            .attrs
+            .push(syn::parse_quote!(#[serde(rename = #wire)]));
+        wire_names.push(wire);
+    }
+
+    Ok(wire_names)
+}
+
+/// Resolves one variant's wire value, consuming an explicit `#[rename("...")]`.
+fn variant_wire_name(variant: &mut syn::Variant, rule: RenameRule) -> syn::Result<LitStr> {
+    let mut explicit = None;
+    let mut retained = Vec::new();
+    for attribute in variant.attrs.drain(..) {
+        if attribute.path().is_ident("rename") {
+            if explicit.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attribute,
+                    "only one `rename` may be declared per variant",
+                ));
+            }
+            explicit = Some(attribute.parse_args::<LitStr>()?);
+        } else {
+            retained.push(attribute);
+        }
+    }
+    variant.attrs = retained;
+
+    Ok(explicit.unwrap_or_else(|| {
+        LitStr::new(
+            &rule.apply(&variant.ident.to_string()),
+            variant.ident.span(),
+        )
+    }))
+}
+
+/// The variant renaming rules an API enumeration understands.
+///
+/// Every variant is emitted with an explicit `#[serde(rename = "...")]`, so the
+/// recorded schema and the wire form cannot drift apart.
+#[derive(Clone, Copy)]
+enum RenameRule {
+    Pascal,
+    Lower,
+    Upper,
+    Camel,
+    Snake,
+    ScreamingSnake,
+    Kebab,
+    ScreamingKebab,
+}
+
+impl RenameRule {
+    const SUPPORTED: &'static str = "`PascalCase`, `lowercase`, `UPPERCASE`, `camelCase`, \
+                                     `snake_case`, `SCREAMING_SNAKE_CASE`, `kebab-case`, \
+                                     or `SCREAMING-KEBAB-CASE`";
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "PascalCase" => Self::Pascal,
+            "lowercase" => Self::Lower,
+            "UPPERCASE" => Self::Upper,
+            "camelCase" => Self::Camel,
+            "snake_case" => Self::Snake,
+            "SCREAMING_SNAKE_CASE" => Self::ScreamingSnake,
+            "kebab-case" => Self::Kebab,
+            "SCREAMING-KEBAB-CASE" => Self::ScreamingKebab,
+            _ => return None,
+        })
+    }
+
+    fn apply(self, variant: &str) -> String {
+        match self {
+            Self::Pascal => variant.to_owned(),
+            Self::Lower => variant.to_ascii_lowercase(),
+            Self::Upper => variant.to_ascii_uppercase(),
+            Self::Camel => {
+                let mut characters = variant.chars();
+                characters.next().map_or_else(String::new, |first| {
+                    first.to_ascii_lowercase().to_string() + characters.as_str()
+                })
+            }
+            Self::Snake => snake_case(variant),
+            Self::ScreamingSnake => snake_case(variant).to_ascii_uppercase(),
+            Self::Kebab => snake_case(variant).replace('_', "-"),
+            Self::ScreamingKebab => snake_case(variant).to_ascii_uppercase().replace('_', "-"),
+        }
+    }
+}
+
+fn snake_case(variant: &str) -> String {
+    let mut output = String::with_capacity(variant.len());
+    for (index, character) in variant.char_indices() {
+        if index > 0 && character.is_uppercase() {
+            output.push('_');
+        }
+        output.push(character.to_ascii_lowercase());
+    }
+    output
+}
+
+fn enum_rename_rule(arguments: &ModelArgs) -> syn::Result<RenameRule> {
+    let Some(rename) = &arguments.rename_all else {
+        return Ok(RenameRule::Pascal);
+    };
+    RenameRule::parse(&rename.value()).ok_or_else(|| {
+        syn::Error::new(
+            rename.span(),
+            format!(
+                "an enumeration renames its variants with {}",
+                RenameRule::SUPPORTED
+            ),
+        )
+    })
 }
 
 /// Expands the owning form: `Serialize`, `Deserialize`, and a validating
@@ -1275,13 +1817,14 @@ fn owned_model_tokens(
     reject_owned_generics(&model.generics)?;
 
     let rename_rule = model_rename_rule(arguments)?;
+    let model_name = model.ident.clone();
     let OwnedFields {
         descriptors,
         validations,
+        defaults,
         needs_probes,
-    } = owned_field_tokens(fields, &rename_rule)?;
+    } = owned_field_tokens(fields, &rename_rule, &model_name)?;
 
-    let model_name = &model.ident;
     let serde_rename = arguments
         .rename_all
         .as_ref()
@@ -1307,6 +1850,8 @@ fn owned_model_tokens(
         #[serde(crate = "::blazingly::__private::serde")]
         #serde_rename
         #model
+
+        #(#defaults)*
 
         const _: () = {
             #probes
@@ -1341,12 +1886,16 @@ fn owned_model_tokens(
 struct OwnedFields {
     descriptors: Vec<proc_macro2::TokenStream>,
     validations: Vec<proc_macro2::TokenStream>,
+    /// Serde default functions, emitted beside the model rather than inside it
+    /// because `#[serde(default = "...")]` names a path in the enclosing scope.
+    defaults: Vec<proc_macro2::TokenStream>,
     needs_probes: bool,
 }
 
 fn owned_field_tokens(
     fields: &mut syn::FieldsNamed,
     rename_rule: &str,
+    model_name: &Ident,
 ) -> syn::Result<OwnedFields> {
     let mut owned = OwnedFields::default();
 
@@ -1361,17 +1910,40 @@ fn owned_field_tokens(
                 .attrs
                 .push(syn::parse_quote!(#[serde(alias = #alias)]));
         }
-        let field_type = &field.ty;
-        let optional = wrapper_inner(field_type, "Option");
-        let validation_type = optional.as_ref().unwrap_or(field_type);
+        let field_type = field.ty.clone();
+        let optional = wrapper_inner(&field_type, "Option");
+        let validation_type = optional.as_ref().unwrap_or(&field_type);
         let shape = field_shape(validation_type);
         reject_incompatible_rules(&rules, validation_type, shape)?;
         normalize_collection_rules(&mut rules, shape);
         owned.needs_probes |= shape.may_be_model();
 
+        if let Some((literal, span)) = &rules.default {
+            if optional.is_some() {
+                return Err(syn::Error::new(
+                    *span,
+                    "a field with a `default` is never absent from the handler; \
+                     declare it without `Option`",
+                ));
+            }
+            let function = default_function_name(model_name, &identifier);
+            let expression = literal.expression();
+            let path = LitStr::new(&function.to_string(), *span);
+            field
+                .attrs
+                .push(syn::parse_quote!(#[serde(default = #path)]));
+            owned.defaults.push(quote! {
+                #[doc(hidden)]
+                fn #function() -> #field_type {
+                    #expression
+                }
+            });
+        }
+
         let public_name = public_field_name(&identifier, rename_rule);
-        let required = optional.is_none();
-        let declared_rules = rule_descriptors(&rules);
+        let required = optional.is_none() && rules.default.is_none();
+        let declared_rules = rule_descriptors(&rules, optional.is_some());
+        let inherited_rules = inherited_rule_descriptor(validation_type, shape);
         let nested_descriptor = nested_rule_descriptor(validation_type, shape, rules.nested);
         owned.descriptors.push(quote! {
             ::blazingly::FieldDescriptor::new(
@@ -1379,7 +1951,9 @@ fn owned_field_tokens(
                 #required,
                 <#field_type as ::blazingly::ApiSchema>::type_descriptor(),
                 {
-                    let mut rules = ::std::vec![#(#declared_rules),*];
+                    let mut rules = ::std::vec::Vec::new();
+                    #inherited_rules
+                    #(rules.push(#declared_rules);)*
                     #nested_descriptor
                     rules
                 },
@@ -1410,6 +1984,17 @@ fn owned_field_tokens(
     }
 
     Ok(owned)
+}
+
+/// Names the serde default function for one field.
+///
+/// The model name is folded in because two models in one module may both
+/// declare a defaulted field of the same name.
+fn default_function_name(model_name: &Ident, field: &Ident) -> Ident {
+    let model = model_name.to_string().to_lowercase();
+    let field = field.to_string();
+    let field = field.trim_start_matches("r#");
+    format_ident!("__blazingly_default_{model}_{field}")
 }
 
 fn public_field_name(identifier: &Ident, rename_rule: &str) -> LitStr {
@@ -1461,12 +2046,21 @@ fn borrowed_model_tokens(
         // its borrows resolved: `&'store str` is a string, `Vec<&'store Tag>`
         // is an array of `Tag`.
         let schema_type = schema_type(&field.ty);
+        // A view is never validated, but an optional field still prints `null`,
+        // and a reader of the document has no other way to learn that.
+        let metadata = if required {
+            quote!(::std::vec::Vec::new())
+        } else {
+            quote!(::std::vec![::blazingly::ValidationRule::Custom(
+                "nullable=true".to_owned()
+            )])
+        };
         descriptors.push(quote! {
             ::blazingly::FieldDescriptor::new(
                 #public_name,
                 #required,
                 <#schema_type as ::blazingly::ApiSchema>::type_descriptor(),
-                ::std::vec::Vec::new(),
+                #metadata,
             )
         });
     }
@@ -1564,12 +2158,17 @@ fn reject_borrowed_field_rules(attributes: &mut Vec<Attribute>) -> syn::Result<(
                 .path()
                 .get_ident()
                 .map_or_else(String::new, ToString::to_string);
+            let purpose = if name == "default" {
+                "fills in an absent request field"
+            } else {
+                "validates a request"
+            };
             return Err(syn::Error::new(
                 attribute_span(&attribute),
                 format!(
-                    "`#[{name}]` validates a request; a borrowed view is an output \
-                     type and is never validated. Declare the rule on the owning \
-                     model the client sends"
+                    "`#[{name}]` {purpose}; a borrowed view is an output type and is \
+                     never validated. Declare the rule on the owning model the client \
+                     sends"
                 ),
             ));
         }
@@ -1586,6 +2185,7 @@ const BORROWED_REJECTED_ATTRIBUTES: &[&str] = &[
     "alias",
     "validate_with",
     "nested",
+    "default",
     "minimum",
     "maximum",
     "exclusive_minimum",
@@ -1782,6 +2382,7 @@ fn nested_probe_definitions() -> proc_macro2::TokenStream {
     let value = value_probe_definitions();
     let items = items_probe_definitions();
     let kind = kind_probe_definitions();
+    let constrained = constrained_probe_definitions();
     quote! {
         #[allow(dead_code)]
         struct __BlazinglyValue<'probe, T>(&'probe T);
@@ -1793,6 +2394,148 @@ fn nested_probe_definitions() -> proc_macro2::TokenStream {
         #value
         #items
         #kind
+        #constrained
+    }
+}
+
+/// Emits the probes that carry a declared value type's rules into the model.
+///
+/// A field written `title: Title` has to pick up the rules `Title` declared,
+/// both in the descriptor and in the validation pass, without the model
+/// knowing at expansion time whether `Title` declares any.
+fn constrained_probe_definitions() -> proc_macro2::TokenStream {
+    let rules = declared_rules_probe_definitions();
+    let checks = constrained_check_probe_definitions();
+    quote! {
+        #rules
+        #checks
+    }
+}
+
+fn declared_rules_probe_definitions() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(dead_code)]
+        trait __BlazinglyDeclaredRules {
+            fn __blazingly_declared_rules(
+                &self,
+            ) -> ::std::vec::Vec<::blazingly::ValidationRule>;
+        }
+
+        impl<T: ::blazingly::ApiConstrained> __BlazinglyDeclaredRules for __BlazinglyKind<T> {
+            fn __blazingly_declared_rules(
+                &self,
+            ) -> ::std::vec::Vec<::blazingly::ValidationRule> {
+                <T as ::blazingly::ApiConstrained>::constraint_rules()
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BlazinglyPlainRules {
+            fn __blazingly_declared_rules(
+                &self,
+            ) -> ::std::vec::Vec<::blazingly::ValidationRule>;
+        }
+
+        impl<T> __BlazinglyPlainRules for &__BlazinglyKind<T> {
+            fn __blazingly_declared_rules(
+                &self,
+            ) -> ::std::vec::Vec<::blazingly::ValidationRule> {
+                ::std::vec::Vec::new()
+            }
+        }
+    }
+}
+
+fn constrained_check_probe_definitions() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(dead_code)]
+        trait __BlazinglyConstrainedValue {
+            fn __blazingly_constrained(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T: ::blazingly::ApiConstrained> __BlazinglyConstrainedValue
+            for __BlazinglyValue<'_, T>
+        {
+            fn __blazingly_constrained(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            ) {
+                if let ::core::result::Result::Err(declared) =
+                    ::blazingly::ApiConstrained::validate_constraints(self.0)
+                {
+                    ::blazingly::merge_field_validation_errors(errors, field, &declared);
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BlazinglyPlainConstrained {
+            fn __blazingly_constrained(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T> __BlazinglyPlainConstrained for &__BlazinglyValue<'_, T> {
+            fn __blazingly_constrained(
+                &self,
+                _errors: &mut ::blazingly::ValidationErrors,
+                _field: &str,
+            ) {
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BlazinglyConstrainedItems {
+            fn __blazingly_constrained_items(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T: ::blazingly::ApiConstrained> __BlazinglyConstrainedItems
+            for __BlazinglyItems<'_, T>
+        {
+            fn __blazingly_constrained_items(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            ) {
+                for (index, item) in self.0.iter().enumerate() {
+                    if let ::core::result::Result::Err(declared) =
+                        ::blazingly::ApiConstrained::validate_constraints(item)
+                    {
+                        let prefix = ::std::format!("{}[{}]", field, index);
+                        ::blazingly::merge_field_validation_errors(errors, &prefix, &declared);
+                    }
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        trait __BlazinglyPlainConstrainedItems {
+            fn __blazingly_constrained_items(
+                &self,
+                errors: &mut ::blazingly::ValidationErrors,
+                field: &str,
+            );
+        }
+
+        impl<T> __BlazinglyPlainConstrainedItems for &__BlazinglyItems<'_, T> {
+            fn __blazingly_constrained_items(
+                &self,
+                _errors: &mut ::blazingly::ValidationErrors,
+                _field: &str,
+            ) {
+            }
+        }
     }
 }
 
@@ -1936,6 +2679,25 @@ fn nested_rule_descriptor(
     }
 }
 
+/// Copies a declared value type's rules into the field that uses it.
+///
+/// Only a scalar-shaped field inherits: a `Vec<Title>` field would otherwise
+/// claim the item's bounds as its own.
+fn inherited_rule_descriptor(
+    validation_type: &Type,
+    shape: FieldShape,
+) -> proc_macro2::TokenStream {
+    if shape != FieldShape::Other {
+        return quote!();
+    }
+    quote! {
+        rules.extend(
+            (&__BlazinglyKind::<#validation_type>(::core::marker::PhantomData))
+                .__blazingly_declared_rules(),
+        );
+    }
+}
+
 fn model_probe_type(validation_type: &Type, shape: FieldShape) -> Type {
     if shape == FieldShape::Collection {
         wrapper_inner(validation_type, "Vec").unwrap_or_else(|| validation_type.clone())
@@ -2003,6 +2765,14 @@ fn take_field_rules(attributes: &mut Vec<Attribute>) -> syn::Result<FieldRules> 
                 return Err(syn::Error::new(pattern.span(), reason));
             }
             rules.pattern = Some(pattern);
+        } else if path.is_ident("default") {
+            if rules.default.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attribute,
+                    "only one `default` may be declared per field",
+                ));
+            }
+            rules.default = Some(default_attribute(&attribute)?);
         } else if path.is_ident("email") {
             rules.email = Some(attribute_span(&attribute));
         } else if path.is_ident("alias") {
@@ -2034,6 +2804,49 @@ fn attribute_span(attribute: &Attribute) -> proc_macro2::Span {
         .segments
         .last()
         .map_or_else(proc_macro2::Span::call_site, |segment| segment.ident.span())
+}
+
+fn default_attribute(attribute: &Attribute) -> syn::Result<(DefaultLiteral, proc_macro2::Span)> {
+    let expression = attribute.parse_args::<syn::Expr>()?;
+    let unsupported = || {
+        syn::Error::new_spanned(
+            &expression,
+            "`default` requires a string, integer, floating-point, or boolean literal",
+        )
+    };
+    let (negative, literal) = match &expression {
+        syn::Expr::Lit(literal) => (false, &literal.lit),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            let syn::Expr::Lit(literal) = unary.expr.as_ref() else {
+                return Err(unsupported());
+            };
+            (true, &literal.lit)
+        }
+        _ => return Err(unsupported()),
+    };
+    let span = literal.span();
+    let value = match literal {
+        syn::Lit::Str(value) if !negative => DefaultLiteral::Text(value.clone()),
+        syn::Lit::Bool(value) if !negative => DefaultLiteral::Boolean(value.clone()),
+        syn::Lit::Int(value) => {
+            let magnitude = value.base10_parse::<i128>()?;
+            DefaultLiteral::Number(NumericLiteral::Integer(if negative {
+                -magnitude
+            } else {
+                magnitude
+            }))
+        }
+        syn::Lit::Float(value) => {
+            let magnitude = value.base10_parse::<f64>()?;
+            let magnitude = if negative { -magnitude } else { magnitude };
+            if !magnitude.is_finite() {
+                return Err(syn::Error::new(span, "a `default` must be finite"));
+            }
+            DefaultLiteral::Number(NumericLiteral::Float(magnitude))
+        }
+        _ => return Err(unsupported()),
+    };
+    Ok((value, span))
 }
 
 fn numeric_attribute(attribute: &Attribute) -> syn::Result<(NumericLiteral, proc_macro2::Span)> {
@@ -2196,6 +3009,8 @@ fn reject_incompatible_rules(
         ));
     }
 
+    reject_incompatible_default(rules, validation_type, shape)?;
+
     let lengths = [
         (rules.min_length.map(|(_, span)| span), "min_length"),
         (rules.max_length.map(|(_, span)| span), "max_length"),
@@ -2218,6 +3033,35 @@ fn reject_incompatible_rules(
     Ok(())
 }
 
+/// A default is substituted for the field itself, so it has to be the field's
+/// own type; nothing here converts.
+fn reject_incompatible_default(
+    rules: &FieldRules,
+    validation_type: &Type,
+    shape: FieldShape,
+) -> syn::Result<()> {
+    let Some((literal, span)) = &rules.default else {
+        return Ok(());
+    };
+    let accepted = match literal {
+        DefaultLiteral::Text(_) => shape == FieldShape::Text,
+        DefaultLiteral::Number(NumericLiteral::Integer(_)) => shape.is_numeric(),
+        DefaultLiteral::Number(NumericLiteral::Float(_)) => shape == FieldShape::Float,
+        DefaultLiteral::Boolean(_) => bare_type_matches(validation_type, &["bool"]),
+    };
+    if accepted {
+        return Ok(());
+    }
+    let (written, expected) = literal.expectation();
+    Err(syn::Error::new(
+        *span,
+        format!(
+            "`default` with {written} requires {expected}, but `{}` is not one",
+            type_label(validation_type)
+        ),
+    ))
+}
+
 /// Folds `min_length`/`max_length` into the item bounds for collection fields.
 fn normalize_collection_rules(rules: &mut FieldRules, shape: FieldShape) {
     if shape != FieldShape::Collection {
@@ -2233,7 +3077,7 @@ fn normalize_collection_rules(rules: &mut FieldRules, shape: FieldShape) {
     rules.max_length = None;
 }
 
-fn rule_descriptors(rules: &FieldRules) -> Vec<proc_macro2::TokenStream> {
+fn rule_descriptors(rules: &FieldRules, nullable: bool) -> Vec<proc_macro2::TokenStream> {
     let mut descriptors = Vec::new();
 
     if let Some((minimum, _)) = rules.min_length {
@@ -2246,6 +3090,9 @@ fn rule_descriptors(rules: &FieldRules) -> Vec<proc_macro2::TokenStream> {
         descriptors.push(quote!(::blazingly::ValidationRule::Email));
     }
     for encoded in constraint_encodings(rules) {
+        descriptors.push(quote!(::blazingly::ValidationRule::Custom(#encoded.to_owned())));
+    }
+    for encoded in metadata_encodings(rules, nullable) {
         descriptors.push(quote!(::blazingly::ValidationRule::Custom(#encoded.to_owned())));
     }
     for alias in &rules.aliases {
@@ -2286,6 +3133,21 @@ fn constraint_encodings(rules: &FieldRules) -> Vec<String> {
     }
     if rules.unique_items.is_some() {
         encodings.push("unique_items=true".to_owned());
+    }
+    encodings
+}
+
+/// Encodes field metadata the frozen contract format cannot name.
+///
+/// `blazingly::FieldMetadata` is the reader; the `keyword=value` channel is the
+/// one already used for the constraints above.
+fn metadata_encodings(rules: &FieldRules, nullable: bool) -> Vec<String> {
+    let mut encodings = Vec::new();
+    if let Some((literal, _)) = &rules.default {
+        encodings.push(format!("default={}", literal.encoded()));
+    }
+    if nullable {
+        encodings.push("nullable=true".to_owned());
     }
     encodings
 }
@@ -2424,17 +3286,20 @@ fn nested_validation_checks(
             quote! {
                 (&__BlazinglyItems(value.as_slice()))
                     .__blazingly_nested_items(&mut errors, #public_name);
+                (&__BlazinglyItems(value.as_slice()))
+                    .__blazingly_constrained_items(&mut errors, #public_name);
             }
         } else {
             quote! {
                 (&__BlazinglyValue(value)).__blazingly_nested(&mut errors, #public_name);
+                (&__BlazinglyValue(value)).__blazingly_constrained(&mut errors, #public_name);
             }
         }
     });
     let custom = rules.validator.as_ref().map(|validator| {
         quote! {
             if let ::core::result::Result::Err(custom_errors) = #validator(value) {
-                ::blazingly::merge_validation_errors(
+                ::blazingly::merge_field_validation_errors(
                     &mut errors,
                     #public_name,
                     &custom_errors,
@@ -3041,10 +3906,10 @@ fn wrapper_inner(ty: &Type, wrapper: &str) -> Option<Type> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attribute, FieldRules, FieldShape, Fields, ItemStruct, ModelArgs, NumericLiteral, Type,
-        constraint_encodings, field_shape, lint_pattern_syntax, model_tokens,
-        normalize_collection_rules, quote, reject_incompatible_rules, schema_type, snake_to_camel,
-        take_field_rules,
+        Attribute, FieldRules, FieldShape, Fields, ItemEnum, ItemStruct, ModelArgs, NumericLiteral,
+        RenameRule, Type, constraint_encodings, enum_model_tokens, field_shape,
+        lint_pattern_syntax, metadata_encodings, model_tokens, normalize_collection_rules, quote,
+        reject_incompatible_rules, schema_type, snake_to_camel, take_field_rules,
     };
 
     fn field_attributes(declaration: &str) -> Vec<Attribute> {
@@ -3402,6 +4267,210 @@ mod tests {
             .expect("parses");
         let error = rejection_message(expand("struct View<'a> { title: &'a str }", &arguments));
         assert!(error.contains("never validated"), "{error}");
+    }
+
+    fn expand_enum(source: &str, arguments: &ModelArgs) -> syn::Result<String> {
+        let mut model = syn::parse_str::<ItemEnum>(source).expect("fixture enum parses");
+        enum_model_tokens(arguments, &mut model).map(|tokens| tokens.to_string())
+    }
+
+    fn model_arguments(source: &str) -> ModelArgs {
+        syn::parse_str::<ModelArgs>(source).expect("fixture arguments parse")
+    }
+
+    #[test]
+    fn a_default_is_recorded_as_json_beside_the_field_rules() {
+        let rules = rules_of("#[default(20)] limit: u32").expect("the default parses");
+        assert_eq!(metadata_encodings(&rules, false), ["default=20"]);
+
+        let rules = rules_of("#[default(-2.5)] ratio: f64").expect("the default parses");
+        assert_eq!(metadata_encodings(&rules, false), ["default=-2.5"]);
+
+        let rules = rules_of("#[default(\"dr\\\"aft\")] status: String").expect("parses");
+        assert_eq!(metadata_encodings(&rules, false), [r#"default="dr\"aft""#]);
+
+        let rules = rules_of("#[default(false)] verbose: bool").expect("the default parses");
+        assert_eq!(
+            metadata_encodings(&rules, true),
+            ["default=false", "nullable=true"]
+        );
+    }
+
+    #[test]
+    fn a_default_must_match_the_field_it_fills_in() {
+        let message = reject("#[default(\"draft\")] limit: u32", "u32");
+        assert!(
+            message.contains("a string literal requires a `String` field"),
+            "{message}"
+        );
+
+        let message = reject("#[default(20)] status: String", "String");
+        assert!(
+            message.contains("an integer literal requires an integer or floating-point field"),
+            "{message}"
+        );
+
+        let message = reject("#[default(true)] limit: u32", "u32");
+        assert!(
+            message.contains("a boolean literal requires a `bool` field"),
+            "{message}"
+        );
+
+        let message = rejection_message(rules_of("#[default(limit())] limit: u32"));
+        assert!(
+            message.contains("string, integer, floating-point, or boolean literal"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_defaulted_field_is_not_optional_and_is_no_longer_required() {
+        let message = rejection_message(expand_default(
+            "struct List { #[default(20)] limit: Option<u32> }",
+        ));
+        assert!(message.contains("declare it without `Option`"), "{message}");
+
+        let expansion =
+            expand_default("struct List { #[default(20)] limit: u32 }").expect("model expands");
+        assert!(expansion.contains("__blazingly_default_list_limit"));
+        assert!(expansion.contains("serde (default = \"__blazingly_default_list_limit\")"));
+        assert!(
+            expansion.contains("FieldDescriptor :: new (\"limit\" , false ,"),
+            "a field with a default is not required of the client: {expansion}"
+        );
+    }
+
+    #[test]
+    fn an_optional_field_records_its_nullability() {
+        let expansion =
+            expand_default("struct Article { summary: Option<String> }").expect("model expands");
+        assert!(expansion.contains("\"nullable=true\""));
+
+        let expansion = expand_default("struct Article { summary: String }").expect("expands");
+        assert!(!expansion.contains("nullable"));
+    }
+
+    #[test]
+    fn a_value_type_declares_one_reusable_bundle_of_rules() {
+        let expansion = expand_default("struct Title (String) ;").expect("a value type expands");
+        assert!(expansion.contains("serde (transparent)"));
+        assert!(expansion.contains("impl :: blazingly :: ApiConstrained for Title"));
+        assert!(expansion.contains("fn into_inner"));
+
+        let mut model = syn::parse_str::<ItemStruct>("#[min_length(8)] struct Title (String) ;")
+            .expect("parses");
+        let expansion = model_tokens(&ModelArgs::default(), &mut model)
+            .expect("a value type with rules expands")
+            .to_string();
+        assert!(expansion.contains("ValidationRule :: MinLength (8usize)"));
+        assert!(expansion.contains("min_length"));
+    }
+
+    #[test]
+    fn a_value_type_rejects_what_only_a_field_can_carry() {
+        let message = rejection_message(expand_default("struct Pair (String , u32) ;"));
+        assert!(message.contains("wraps exactly one field"), "{message}");
+
+        let message = rejection_message(expand_default("#[alias(\"t\")] struct Title (String) ;"));
+        assert!(
+            message.contains("`alias` names an extra wire key"),
+            "{message}"
+        );
+
+        let message =
+            rejection_message(expand_default("#[default(\"x\")] struct Title (String) ;"));
+        assert!(message.contains("belongs to the field"), "{message}");
+
+        let message = rejection_message(expand_default("struct Title (Option<String>) ;"));
+        assert!(
+            message.contains("declare the field that uses it"),
+            "{message}"
+        );
+
+        let message = rejection_message(expand(
+            "struct Title (String) ;",
+            &model_arguments("rename_all = \"camelCase\""),
+        ));
+        assert!(message.contains("`rename_all` renames fields"), "{message}");
+    }
+
+    #[test]
+    fn an_enumeration_pins_every_variant_to_an_explicit_wire_value() {
+        let expansion = expand_enum(
+            "enum Language { Uk, Ru, En }",
+            &model_arguments("rename_all = \"lowercase\""),
+        )
+        .expect("an enumeration expands");
+        assert!(expansion.contains("serde (rename = \"uk\")"));
+        assert!(expansion.contains("\"enum=uk|ru|en\""));
+        assert!(expansion.contains("SchemaKind :: String"));
+        assert!(expansion.contains("const VARIANTS"));
+
+        let expansion = expand_enum(
+            "enum Status { NotFound, #[rename(\"ok\")] Fine }",
+            &ModelArgs::default(),
+        )
+        .expect("an enumeration expands");
+        assert!(expansion.contains("serde (rename = \"NotFound\")"));
+        assert!(expansion.contains("serde (rename = \"ok\")"));
+        assert!(expansion.contains("\"enum=NotFound|ok\""));
+    }
+
+    #[test]
+    fn enum_rename_rules_match_the_serde_spelling() {
+        let cases = [
+            ("PascalCase", "NotFound"),
+            ("lowercase", "notfound"),
+            ("UPPERCASE", "NOTFOUND"),
+            ("camelCase", "notFound"),
+            ("snake_case", "not_found"),
+            ("SCREAMING_SNAKE_CASE", "NOT_FOUND"),
+            ("kebab-case", "not-found"),
+            ("SCREAMING-KEBAB-CASE", "NOT-FOUND"),
+        ];
+        for (rule, expected) in cases {
+            let rule = RenameRule::parse(rule).expect("the rule is supported");
+            assert_eq!(rule.apply("NotFound"), expected);
+        }
+        assert!(RenameRule::parse("Train-Case").is_none());
+    }
+
+    #[test]
+    fn an_enumeration_rejects_data_carrying_and_ambiguous_variants() {
+        let message = rejection_message(expand_enum(
+            "enum Payload { Text(String) }",
+            &ModelArgs::default(),
+        ));
+        assert!(message.contains("a variant cannot carry data"), "{message}");
+
+        let message = rejection_message(expand_enum(
+            "enum Language { Uk, #[rename(\"Uk\")] Ukrainian }",
+            &ModelArgs::default(),
+        ));
+        assert!(message.contains("declared twice"), "{message}");
+
+        let message = rejection_message(expand_enum(
+            "enum Language { #[rename(\"a|b\")] Both }",
+            &ModelArgs::default(),
+        ));
+        assert!(message.contains("`|` separates the variants"), "{message}");
+
+        let message = rejection_message(expand_enum("enum Empty { }", &ModelArgs::default()));
+        assert!(message.contains("at least one variant"), "{message}");
+
+        let message = rejection_message(expand_enum(
+            "enum Language { Uk }",
+            &model_arguments("rename_all = \"Train-Case\""),
+        ));
+        assert!(message.contains("SCREAMING-KEBAB-CASE"), "{message}");
+    }
+
+    #[test]
+    fn a_field_validator_reports_through_the_undoubled_merge() {
+        let expansion = expand_default("struct Window { #[validate_with(checks::at)] at: u32 }")
+            .expect("model expands");
+        assert!(expansion.contains("merge_field_validation_errors"));
+        assert!(!expansion.contains("merge_validation_errors (& mut errors"));
     }
 
     #[test]

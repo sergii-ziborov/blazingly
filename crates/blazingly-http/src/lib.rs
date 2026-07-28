@@ -2,11 +2,11 @@
 
 use blazingly_core::{
     BackgroundTask, BackgroundTaskError, BodyStreamError, HttpMethod, HttpUpgrade, InputSource,
-    OperationDescriptor, SecuritySchemeDescriptor, StreamingBody,
+    OperationDescriptor, ResponseHeader, SecuritySchemeDescriptor, StreamingBody,
 };
 use blazingly_executor::{
-    DependencyError, ExecutableApp, ExecutionOutcome, HttpRequestParts as InvocationRequestParts,
-    InvocationControl,
+    DependencyError, ExecutableApp, ExecutionOutcome, FromInvocation,
+    HttpRequestParts as InvocationRequestParts, InputRejection, InvocationControl, InvocationInput,
 };
 use blazingly_json::{Value, json};
 use blazingly_openapi::{OpenApiAssetResponse, OpenApiConfig, OpenApiService};
@@ -14,9 +14,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::str::Utf8Error;
@@ -239,6 +240,363 @@ pub trait HttpMiddleware {
     }
 }
 
+type OperationFilter = Rc<dyn Fn(&str) -> bool>;
+
+#[derive(Clone)]
+enum OperationPredicate {
+    Exact(Box<str>),
+    Prefix(Box<str>),
+    Filter(OperationFilter),
+}
+
+impl OperationPredicate {
+    fn matches(&self, operation_id: &str) -> bool {
+        match self {
+            Self::Exact(expected) => operation_id == expected.as_ref(),
+            Self::Prefix(prefix) => operation_id.starts_with(prefix.as_ref()),
+            Self::Filter(filter) => filter(operation_id),
+        }
+    }
+}
+
+/// Selects the requests one registered middleware layer observes.
+///
+/// An empty scope matches every request, which is what
+/// [`HttpApp::with_middleware`] registers. Path prefixes and operation
+/// predicates combine as `AND` between the two categories and `OR` inside one
+/// category.
+///
+/// The selected operation is unknown before routing, so a scope that declares
+/// an operation predicate never matches [`HttpMiddleware::on_request`]; that
+/// layer sees [`HttpMiddleware::on_operation`] and
+/// [`HttpMiddleware::on_response`] instead. A layer whose scope does not match
+/// is also not counted by the security guard, so a scoped verifier cannot
+/// silently authorize an operation outside its subtree.
+#[derive(Clone, Default)]
+pub struct MiddlewareScope {
+    prefixes: Vec<Box<str>>,
+    operations: Vec<OperationPredicate>,
+}
+
+impl MiddlewareScope {
+    /// A scope that constrains nothing.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            prefixes: Vec::new(),
+            operations: Vec::new(),
+        }
+    }
+
+    /// A scope limited to one path prefix.
+    #[must_use]
+    pub fn prefix(prefix: &str) -> Self {
+        Self::all().with_prefix(prefix)
+    }
+
+    /// A scope limited to one operation id.
+    #[must_use]
+    pub fn operation(operation_id: &str) -> Self {
+        Self::all().with_operation(operation_id)
+    }
+
+    /// Adds an accepted path prefix, matched on segment boundaries.
+    ///
+    /// `/ingest` matches `/ingest` and `/ingest/events`, never `/ingested`.
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefixes.push(normalize_prefix(prefix));
+        self
+    }
+
+    /// Adds one accepted operation id.
+    #[must_use]
+    pub fn with_operation(mut self, operation_id: &str) -> Self {
+        self.operations
+            .push(OperationPredicate::Exact(Box::from(operation_id)));
+        self
+    }
+
+    /// Adds an accepted operation id prefix, for id namespaces such as
+    /// `ingest.`.
+    #[must_use]
+    pub fn with_operation_prefix(mut self, prefix: &str) -> Self {
+        self.operations
+            .push(OperationPredicate::Prefix(Box::from(prefix)));
+        self
+    }
+
+    /// Adds an operation id predicate for a selection the other constraints
+    /// cannot express.
+    #[must_use]
+    pub fn with_operation_filter<Filter>(mut self, filter: Filter) -> Self
+    where
+        Filter: Fn(&str) -> bool + 'static,
+    {
+        self.operations
+            .push(OperationPredicate::Filter(Rc::new(filter)));
+        self
+    }
+
+    /// Returns whether this scope constrains nothing.
+    #[must_use]
+    pub fn is_global(&self) -> bool {
+        self.prefixes.is_empty() && self.operations.is_empty()
+    }
+
+    /// Matches before routing, when only the request path is known.
+    #[must_use]
+    pub fn matches_request(&self, path: &str) -> bool {
+        self.operations.is_empty() && self.matches_path(path)
+    }
+
+    /// Matches after routing, when the selected operation is known.
+    #[must_use]
+    pub fn matches_operation(&self, path: &str, operation_id: &str) -> bool {
+        self.matches_path(path)
+            && (self.operations.is_empty()
+                || self
+                    .operations
+                    .iter()
+                    .any(|predicate| predicate.matches(operation_id)))
+    }
+
+    fn matches_path(&self, path: &str) -> bool {
+        self.prefixes.is_empty()
+            || self
+                .prefixes
+                .iter()
+                .any(|prefix| path_has_prefix(path, prefix))
+    }
+}
+
+impl fmt::Debug for MiddlewareScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MiddlewareScope")
+            .field("prefixes", &self.prefixes)
+            .field("operations", &self.operations.len())
+            .finish()
+    }
+}
+
+fn normalize_prefix(prefix: &str) -> Box<str> {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        Box::from("")
+    } else if trimmed.starts_with('/') {
+        Box::from(trimmed)
+    } else {
+        Box::from(format!("/{trimmed}"))
+    }
+}
+
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/')
+}
+
+struct ScopedMiddleware {
+    scope: MiddlewareScope,
+    layer: Rc<dyn HttpMiddleware>,
+}
+
+impl ScopedMiddleware {
+    fn matches(&self, path: &str, operation: Option<&OperationDescriptor>) -> bool {
+        operation.map_or_else(
+            || self.scope.matches_request(path),
+            |operation| {
+                self.scope
+                    .matches_operation(path, operation.contract.id.as_str())
+            },
+        )
+    }
+}
+
+/// Where a failure response produced by dispatch came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpErrorSource {
+    /// No route matched the request method and path.
+    Routing,
+    /// Dispatch rejected the request before the operation ran.
+    Request,
+    /// Argument extraction or model validation rejected the request.
+    Rejection,
+    /// A typed `#[api_error]` variant declared by the operation contract.
+    Domain,
+    /// A server-side failure, including a security scheme no registered layer
+    /// can verify.
+    Internal,
+}
+
+/// The failure an application error handler is asked to rewrite.
+pub struct HttpError<'dispatch> {
+    source: HttpErrorSource,
+    status: u16,
+    code: &'dispatch str,
+    message: &'dispatch str,
+    method: HttpMethod,
+    path: &'dispatch str,
+    operation: Option<&'dispatch OperationDescriptor>,
+}
+
+impl HttpError<'_> {
+    /// Origin of this failure.
+    #[must_use]
+    pub const fn source(&self) -> HttpErrorSource {
+        self.source
+    }
+
+    /// Status of the response dispatch built before any handler ran.
+    #[must_use]
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Stable error code of the response dispatch built.
+    #[must_use]
+    pub const fn code(&self) -> &str {
+        self.code
+    }
+
+    /// Message of the response dispatch built.
+    #[must_use]
+    pub const fn message(&self) -> &str {
+        self.message
+    }
+
+    /// Request method.
+    #[must_use]
+    pub const fn method(&self) -> HttpMethod {
+        self.method
+    }
+
+    /// Request path without its query string.
+    #[must_use]
+    pub const fn path(&self) -> &str {
+        self.path
+    }
+
+    /// Operation the router selected, when the failure happened after routing.
+    #[must_use]
+    pub const fn operation(&self) -> Option<&OperationDescriptor> {
+        self.operation
+    }
+}
+
+/// Application-level rewriting of failure responses.
+///
+/// Handlers run in registration order after dispatch has produced a failure
+/// response and before middleware `on_response`, so an application can give
+/// every failure one house style without touching the typed errors each
+/// operation declares.
+///
+/// The status of a [`HttpErrorSource::Domain`] failure is restored after the
+/// handlers run: a `#[api_error]` variant publishes its status in the contract,
+/// and this seam must not make that published status a lie. Body, headers, and
+/// the status of every other source are the handler's to change.
+///
+/// A response a middleware layer returns to short-circuit dispatch is that
+/// layer's own and does not reach these handlers; the layer shapes it in
+/// [`HttpMiddleware::on_response`].
+pub trait HttpErrorHandler {
+    /// Rewrites one failure response.
+    fn on_error(&self, error: &HttpError<'_>, response: &mut Response);
+}
+
+/// A request-scoped handle for scheduling work that runs after the response.
+///
+/// A handler injects it with `Extension<BackgroundTasks>` and schedules work
+/// anywhere in its body, instead of restructuring its return type around
+/// [`Background<T>`](blazingly_core::Background).
+///
+/// A scheduled task is attached to the response dispatch produces whatever the
+/// outcome is, including a rejection, a typed domain error, and an aborted
+/// invocation, so an adapter runs it once the body has been written. This is
+/// the one behavioral difference from `Background<T>`, whose tasks ride on a
+/// success value and are therefore discarded when the operation fails.
+#[derive(Clone, Debug, Default)]
+pub struct BackgroundTasks {
+    tasks: Rc<RefCell<Vec<BackgroundTask>>>,
+}
+
+impl BackgroundTasks {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Schedules a prepared task.
+    pub fn add_task(&self, task: BackgroundTask) {
+        self.tasks.borrow_mut().push(task);
+    }
+
+    /// Schedules a fallible after-response task.
+    pub fn add<Task, TaskFuture>(&self, task: Task)
+    where
+        Task: FnOnce() -> TaskFuture + 'static,
+        TaskFuture: Future<Output = Result<(), BackgroundTaskError>> + 'static,
+    {
+        self.add_task(BackgroundTask::new(task));
+    }
+
+    /// Schedules an after-response task that cannot fail.
+    pub fn add_infallible<Task, TaskFuture>(&self, task: Task)
+    where
+        Task: FnOnce() -> TaskFuture + 'static,
+        TaskFuture: Future<Output = ()> + 'static,
+    {
+        self.add_task(BackgroundTask::infallible(task));
+    }
+
+    /// Number of tasks scheduled so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tasks.borrow().len()
+    }
+
+    /// Returns whether nothing has been scheduled yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tasks.borrow().is_empty()
+    }
+
+    /// Takes the scheduled tasks, leaving the handle empty.
+    #[must_use]
+    pub fn take(&self) -> Vec<BackgroundTask> {
+        std::mem::take(&mut self.tasks.borrow_mut())
+    }
+}
+
+impl FromInvocation for BackgroundTasks {
+    fn from_invocation(
+        input: &InvocationInput<'_>,
+        name: &str,
+        _required: bool,
+    ) -> Result<Self, InputRejection> {
+        let InvocationInput::Http(request) = input else {
+            return Err(InputRejection::new(
+                500,
+                "background_tasks_transport_mismatch",
+                "after-response tasks are available only through HTTP",
+            ));
+        };
+        request
+            .extension(TypeId::of::<Self>())
+            .and_then(<dyn Any>::downcast_ref::<Self>)
+            .cloned()
+            .ok_or_else(|| {
+                InputRejection::new(
+                    500,
+                    "background_tasks_unavailable",
+                    format!("this transport installed no after-response tasks for `{name}`"),
+                )
+            })
+    }
+}
+
 impl Request {
     #[must_use]
     pub fn new(method: HttpMethod, target: impl Into<String>) -> Self {
@@ -450,6 +808,11 @@ impl Response {
         self.status
     }
 
+    /// Replaces the response status.
+    pub const fn set_status(&mut self, status: u16) {
+        self.status = status;
+    }
+
     #[must_use]
     pub fn get_header(&self, name: &str) -> Option<&str> {
         self.headers.get(name)
@@ -651,7 +1014,8 @@ pub struct HttpApp {
     router: Router,
     max_body_bytes: usize,
     openapi: Option<OpenApiService>,
-    middleware: Vec<Rc<dyn HttpMiddleware>>,
+    middleware: Vec<ScopedMiddleware>,
+    error_handlers: Vec<Rc<dyn HttpErrorHandler>>,
     allow_unverified_security_schemes: bool,
 }
 
@@ -665,6 +1029,7 @@ impl HttpApp {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             openapi: None,
             middleware: Vec::new(),
+            error_handlers: Vec::new(),
             allow_unverified_security_schemes: false,
         }
     }
@@ -713,17 +1078,67 @@ impl HttpApp {
         self
     }
 
-    /// Registers runtime-neutral HTTP middleware.
+    /// Registers runtime-neutral HTTP middleware for every request.
     #[must_use]
     pub fn with_middleware(mut self, middleware: impl HttpMiddleware + 'static) -> Self {
-        self.middleware.push(Rc::new(middleware));
+        self.middleware.push(ScopedMiddleware {
+            scope: MiddlewareScope::all(),
+            layer: Rc::new(middleware),
+        });
         self
     }
 
-    /// Registers shared middleware state.
+    /// Registers shared middleware state for every request.
     #[must_use]
     pub fn with_shared_middleware(mut self, middleware: Rc<dyn HttpMiddleware>) -> Self {
-        self.middleware.push(middleware);
+        self.middleware.push(ScopedMiddleware {
+            scope: MiddlewareScope::all(),
+            layer: middleware,
+        });
+        self
+    }
+
+    /// Registers runtime-neutral HTTP middleware for one path prefix or
+    /// operation selection.
+    #[must_use]
+    pub fn with_scoped_middleware(
+        mut self,
+        scope: MiddlewareScope,
+        middleware: impl HttpMiddleware + 'static,
+    ) -> Self {
+        self.middleware.push(ScopedMiddleware {
+            scope,
+            layer: Rc::new(middleware),
+        });
+        self
+    }
+
+    /// Registers shared middleware state for one path prefix or operation
+    /// selection.
+    #[must_use]
+    pub fn with_shared_scoped_middleware(
+        mut self,
+        scope: MiddlewareScope,
+        middleware: Rc<dyn HttpMiddleware>,
+    ) -> Self {
+        self.middleware.push(ScopedMiddleware {
+            scope,
+            layer: middleware,
+        });
+        self
+    }
+
+    /// Registers an application-level handler for failure responses.
+    #[must_use]
+    pub fn with_error_handler(mut self, handler: impl HttpErrorHandler + 'static) -> Self {
+        self.error_handlers.push(Rc::new(handler));
+        self
+    }
+
+    /// Registers shared application-level error handler state.
+    #[must_use]
+    pub fn with_shared_error_handler(mut self, handler: Rc<dyn HttpErrorHandler>) -> Self {
+        self.error_handlers.push(handler);
         self
     }
 
@@ -752,6 +1167,7 @@ impl HttpApp {
             max_body_bytes: self.max_body_bytes,
             openapi: self.openapi.as_ref(),
             middleware: &self.middleware,
+            error_handlers: &self.error_handlers,
             allow_unverified_security_schemes: self.allow_unverified_security_schemes,
         }
     }
@@ -776,7 +1192,8 @@ pub struct TestApp<'app> {
     router: Router,
     max_body_bytes: usize,
     openapi: Option<OpenApiService>,
-    middleware: Vec<Rc<dyn HttpMiddleware>>,
+    middleware: Vec<ScopedMiddleware>,
+    error_handlers: Vec<Rc<dyn HttpErrorHandler>>,
     allow_unverified_security_schemes: bool,
 }
 
@@ -789,6 +1206,7 @@ impl<'app> TestApp<'app> {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             openapi: None,
             middleware: Vec::new(),
+            error_handlers: Vec::new(),
             allow_unverified_security_schemes: false,
         }
     }
@@ -835,17 +1253,67 @@ impl<'app> TestApp<'app> {
         self
     }
 
-    /// Registers runtime-neutral HTTP middleware.
+    /// Registers runtime-neutral HTTP middleware for every request.
     #[must_use]
     pub fn with_middleware(mut self, middleware: impl HttpMiddleware + 'static) -> Self {
-        self.middleware.push(Rc::new(middleware));
+        self.middleware.push(ScopedMiddleware {
+            scope: MiddlewareScope::all(),
+            layer: Rc::new(middleware),
+        });
         self
     }
 
-    /// Registers shared middleware state.
+    /// Registers shared middleware state for every request.
     #[must_use]
     pub fn with_shared_middleware(mut self, middleware: Rc<dyn HttpMiddleware>) -> Self {
-        self.middleware.push(middleware);
+        self.middleware.push(ScopedMiddleware {
+            scope: MiddlewareScope::all(),
+            layer: middleware,
+        });
+        self
+    }
+
+    /// Registers runtime-neutral HTTP middleware for one path prefix or
+    /// operation selection.
+    #[must_use]
+    pub fn with_scoped_middleware(
+        mut self,
+        scope: MiddlewareScope,
+        middleware: impl HttpMiddleware + 'static,
+    ) -> Self {
+        self.middleware.push(ScopedMiddleware {
+            scope,
+            layer: Rc::new(middleware),
+        });
+        self
+    }
+
+    /// Registers shared middleware state for one path prefix or operation
+    /// selection.
+    #[must_use]
+    pub fn with_shared_scoped_middleware(
+        mut self,
+        scope: MiddlewareScope,
+        middleware: Rc<dyn HttpMiddleware>,
+    ) -> Self {
+        self.middleware.push(ScopedMiddleware {
+            scope,
+            layer: middleware,
+        });
+        self
+    }
+
+    /// Registers an application-level handler for failure responses.
+    #[must_use]
+    pub fn with_error_handler(mut self, handler: impl HttpErrorHandler + 'static) -> Self {
+        self.error_handlers.push(Rc::new(handler));
+        self
+    }
+
+    /// Registers shared application-level error handler state.
+    #[must_use]
+    pub fn with_shared_error_handler(mut self, handler: Rc<dyn HttpErrorHandler>) -> Self {
+        self.error_handlers.push(handler);
         self
     }
 
@@ -866,6 +1334,7 @@ impl<'app> TestApp<'app> {
             max_body_bytes: self.max_body_bytes,
             openapi: self.openapi.as_ref(),
             middleware: &self.middleware,
+            error_handlers: &self.error_handlers,
             allow_unverified_security_schemes: self.allow_unverified_security_schemes,
         }
     }
@@ -877,8 +1346,16 @@ struct Dispatcher<'app> {
     router: &'app Router,
     max_body_bytes: usize,
     openapi: Option<&'app OpenApiService>,
-    middleware: &'app [Rc<dyn HttpMiddleware>],
+    middleware: &'app [ScopedMiddleware],
+    error_handlers: &'app [Rc<dyn HttpErrorHandler>],
     allow_unverified_security_schemes: bool,
+}
+
+/// The request coordinates every scoped layer and error handler is selected by.
+struct DispatchSite<'dispatch> {
+    method: HttpMethod,
+    path: &'dispatch str,
+    operation: Option<&'dispatch OperationDescriptor>,
 }
 
 impl Dispatcher<'_> {
@@ -894,66 +1371,65 @@ impl Dispatcher<'_> {
             return self.dispatch_unlayered(request, control).await;
         }
         let middleware = self.middleware;
+        let target = request.target();
+        let mut site = DispatchSite {
+            method: request.method(),
+            path: target.split_once('?').map_or(target, |(path, _)| path),
+            operation: None,
+        };
         let mut context = HttpRequestContext::new(request);
         for layer in middleware {
-            if let Some(response) = layer.on_request(&mut context) {
-                return complete_response(middleware, &context, None, response);
+            if layer.scope.matches_request(site.path)
+                && let Some(response) = layer.layer.on_request(&mut context)
+            {
+                return complete_response(middleware, &context, &site, response);
             }
         }
 
-        let target = request.target();
         if validate_url_encoding(target).is_err() {
-            return complete_response(
-                middleware,
-                &context,
-                None,
-                error_response(
-                    400,
-                    "invalid_url_encoding",
-                    "request target contains invalid percent encoding",
-                    None,
-                ),
-            );
+            let response = self.fail(&site, invalid_url_encoding_failure());
+            return complete_response(middleware, &context, &site, response);
         }
-        let path = target.split_once('?').map_or(target, |(path, _)| path);
         if let Some(response) = self
             .openapi
-            .and_then(|service| service.handle(request.method(), path))
+            .and_then(|service| service.handle(site.method, site.path))
         {
-            return complete_response(middleware, &context, None, openapi_response(response));
+            return complete_response(middleware, &context, &site, openapi_response(response));
         }
-        let recognized = match self.router.recognize(request.method(), path) {
+        let recognized = match self.router.recognize(site.method, site.path) {
             Ok(recognized) => recognized,
             Err(error) => {
-                return complete_response(middleware, &context, None, route_miss_response(error));
+                let response = self.fail(&site, route_miss_failure(&error));
+                return complete_response(middleware, &context, &site, response);
             }
         };
         let Some(operation) = self.app.operation_at(recognized.operation_index()) else {
-            return complete_response(middleware, &context, None, internal_error_response());
+            let response = self.fail(&site, internal_failure());
+            return complete_response(middleware, &context, &site, response);
         };
         let descriptor = operation.descriptor();
+        site.operation = Some(descriptor);
         for layer in middleware {
-            if let Some(response) = layer.on_operation(
-                &mut context,
-                descriptor,
-                self.app.definition().security_schemes(),
-            ) {
-                return complete_response(middleware, &context, Some(descriptor), response);
+            if layer.matches(site.path, site.operation)
+                && let Some(response) = layer.layer.on_operation(
+                    &mut context,
+                    descriptor,
+                    self.app.definition().security_schemes(),
+                )
+            {
+                return complete_response(middleware, &context, &site, response);
             }
         }
-        if let Some(response) = self.security_guard(descriptor) {
-            return complete_response(middleware, &context, Some(descriptor), response);
+        if let Some(failure) = self.security_guard(site.path, descriptor) {
+            let response = self.fail(&site, failure);
+            return complete_response(middleware, &context, &site, response);
         }
         if let Some(body_source) = recognized.body_source() {
             match validate_body(request, self.max_body_bytes, body_source) {
                 Ok(()) => {}
                 Err(rejection) => {
-                    return complete_response(
-                        middleware,
-                        &context,
-                        Some(descriptor),
-                        rejection.into_response(),
-                    );
+                    let response = self.fail(&site, rejection.into_failure());
+                    return complete_response(middleware, &context, &site, response);
                 }
             }
         }
@@ -962,6 +1438,7 @@ impl Dispatcher<'_> {
             route: &recognized,
             context: Some(&context),
             connection: OnceCell::new(),
+            background: OnceCell::new(),
         };
         let outcome = if let Some(control) = control {
             operation
@@ -970,12 +1447,12 @@ impl Dispatcher<'_> {
         } else {
             operation.invoke_http(&request_parts).await
         };
-        complete_response(
-            middleware,
-            &context,
-            Some(descriptor),
-            outcome_response(outcome),
-        )
+        let mut response = match outcome_result(outcome) {
+            Ok(response) => response,
+            Err(failure) => self.fail(&site, failure),
+        };
+        response.background.extend(request_parts.scheduled_tasks());
+        complete_response(middleware, &context, &site, response)
     }
 
     async fn dispatch_unlayered<RequestView>(
@@ -987,35 +1464,35 @@ impl Dispatcher<'_> {
         RequestView: HttpRequestView + ?Sized,
     {
         let target = request.target();
+        let mut site = DispatchSite {
+            method: request.method(),
+            path: target.split_once('?').map_or(target, |(path, _)| path),
+            operation: None,
+        };
         if validate_url_encoding(target).is_err() {
-            return error_response(
-                400,
-                "invalid_url_encoding",
-                "request target contains invalid percent encoding",
-                None,
-            );
+            return self.fail(&site, invalid_url_encoding_failure());
         }
-        let path = target.split_once('?').map_or(target, |(path, _)| path);
         if let Some(response) = self
             .openapi
-            .and_then(|service| service.handle(request.method(), path))
+            .and_then(|service| service.handle(site.method, site.path))
         {
             return openapi_response(response);
         }
-        let recognized = match self.router.recognize(request.method(), path) {
+        let recognized = match self.router.recognize(site.method, site.path) {
             Ok(recognized) => recognized,
-            Err(error) => return route_miss_response(error),
+            Err(error) => return self.fail(&site, route_miss_failure(&error)),
         };
         let Some(operation) = self.app.operation_at(recognized.operation_index()) else {
-            return internal_error_response();
+            return self.fail(&site, internal_failure());
         };
-        if let Some(response) = self.security_guard(operation.descriptor()) {
-            return response;
+        site.operation = Some(operation.descriptor());
+        if let Some(failure) = self.security_guard(site.path, operation.descriptor()) {
+            return self.fail(&site, failure);
         }
         if let Some(body_source) = recognized.body_source() {
             match validate_body(request, self.max_body_bytes, body_source) {
                 Ok(()) => {}
-                Err(rejection) => return rejection.into_response(),
+                Err(rejection) => return self.fail(&site, rejection.into_failure()),
             }
         }
         let request_parts = RoutedRequestParts {
@@ -1023,6 +1500,7 @@ impl Dispatcher<'_> {
             route: &recognized,
             context: None,
             connection: OnceCell::new(),
+            background: OnceCell::new(),
         };
         let outcome = if let Some(control) = control {
             operation
@@ -1031,35 +1509,123 @@ impl Dispatcher<'_> {
         } else {
             operation.invoke_http(&request_parts).await
         };
-        outcome_response(outcome)
+        let mut response = match outcome_result(outcome) {
+            Ok(response) => response,
+            Err(failure) => self.fail(&site, failure),
+        };
+        response.background.extend(request_parts.scheduled_tasks());
+        response
+    }
+
+    /// Builds a failure response and offers it to the application error
+    /// handlers.
+    fn fail(&self, site: &DispatchSite<'_>, mut failure: Failure) -> Response {
+        let mut response = failure.response();
+        if self.error_handlers.is_empty() {
+            return response;
+        }
+        let error = HttpError {
+            source: failure.source,
+            status: failure.status,
+            code: &failure.code,
+            message: &failure.message,
+            method: site.method,
+            path: site.path,
+            operation: site.operation,
+        };
+        for handler in self.error_handlers {
+            handler.on_error(&error, &mut response);
+        }
+        // A typed `#[api_error]` variant publishes its status in the contract.
+        if failure.source == HttpErrorSource::Domain {
+            response.status = failure.status;
+        }
+        response
     }
 
     /// Fails closed when the matched operation declares a security scheme that
     /// no layer on this dispatch path can verify.
     ///
     /// Both dispatch paths run this before invoking an operation, so an
-    /// unlayered path never serves a declared scheme unauthenticated.
-    fn security_guard(&self, descriptor: &OperationDescriptor) -> Option<Response> {
+    /// unlayered path never serves a declared scheme unauthenticated. A scoped
+    /// layer counts only where its scope reaches.
+    fn security_guard(&self, path: &str, descriptor: &OperationDescriptor) -> Option<Failure> {
         if self.allow_unverified_security_schemes || descriptor.contract.security.is_empty() {
             return None;
         }
         if self
             .middleware
             .iter()
-            .any(|layer| layer.verifies_security())
+            .any(|layer| layer.layer.verifies_security() && layer.matches(path, Some(descriptor)))
         {
             return None;
         }
-        Some(error_response(
+        Some(Failure::new(
+            HttpErrorSource::Internal,
             500,
             "security_verifier_missing",
             "the operation declares a security scheme with no registered verifier",
-            None,
         ))
     }
 }
 
-fn route_miss_response(error: RouteError) -> Response {
+/// A failure response before it reaches the application error handlers.
+struct Failure {
+    source: HttpErrorSource,
+    status: u16,
+    code: Cow<'static, str>,
+    message: Cow<'static, str>,
+    details: Option<Value>,
+    headers: Vec<ResponseHeader>,
+}
+
+impl Failure {
+    fn new(
+        source: HttpErrorSource,
+        status: u16,
+        code: impl Into<Cow<'static, str>>,
+        message: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            source,
+            status,
+            code: code.into(),
+            message: message.into(),
+            details: None,
+            headers: Vec::new(),
+        }
+    }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    fn with_headers(mut self, headers: Vec<ResponseHeader>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    fn response(&mut self) -> Response {
+        let response = error_response(self.status, &self.code, &self.message, self.details.take());
+        with_outcome_headers(response, std::mem::take(&mut self.headers))
+    }
+
+    fn into_response(mut self) -> Response {
+        self.response()
+    }
+}
+
+fn invalid_url_encoding_failure() -> Failure {
+    Failure::new(
+        HttpErrorSource::Request,
+        400,
+        "invalid_url_encoding",
+        "request target contains invalid percent encoding",
+    )
+}
+
+fn route_miss_failure(error: &RouteError) -> Failure {
     match error {
         RouteError::MethodNotAllowed { allowed } => {
             let allow = allowed
@@ -1067,21 +1633,35 @@ fn route_miss_response(error: RouteError) -> Response {
                 .map(|method| method.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            error_response(405, "method_not_allowed", "HTTP method not allowed", None)
-                .with_header("allow", allow)
+            Failure::new(
+                HttpErrorSource::Routing,
+                405,
+                "method_not_allowed",
+                "HTTP method not allowed",
+            )
+            .with_headers(vec![ResponseHeader::new("allow", allow)])
         }
-        RouteError::NotFound => error_response(404, "not_found", "HTTP route not found", None),
+        RouteError::NotFound => Failure::new(
+            HttpErrorSource::Routing,
+            404,
+            "not_found",
+            "HTTP route not found",
+        ),
     }
 }
 
 fn complete_response(
-    middleware: &[Rc<dyn HttpMiddleware>],
+    middleware: &[ScopedMiddleware],
     context: &HttpRequestContext<'_>,
-    operation: Option<&OperationDescriptor>,
+    site: &DispatchSite<'_>,
     mut response: Response,
 ) -> Response {
     for layer in middleware.iter().rev() {
-        layer.on_response(context, operation, &mut response);
+        if layer.matches(site.path, site.operation) {
+            layer
+                .layer
+                .on_response(context, site.operation, &mut response);
+        }
     }
     response
 }
@@ -1371,6 +1951,7 @@ struct RoutedRequestParts<'request, 'router, 'path, 'context, RequestView: ?Size
     route: &'request RouteMatch<'router, 'path>,
     context: Option<&'context HttpRequestContext<'request>>,
     connection: OnceCell<ConnectionInfo>,
+    background: OnceCell<BackgroundTasks>,
 }
 
 impl<RequestView> RoutedRequestParts<'_, '_, '_, '_, RequestView>
@@ -1385,6 +1966,19 @@ where
                 HttpRequestContext::connection_info,
             )
         })
+    }
+
+    /// Materializes the after-response task handle on first extractor use, so
+    /// an operation that never injects one allocates nothing.
+    fn background_tasks(&self) -> &BackgroundTasks {
+        self.background.get_or_init(BackgroundTasks::new)
+    }
+
+    /// Takes what the handler scheduled through the injected handle.
+    fn scheduled_tasks(&self) -> Vec<BackgroundTask> {
+        self.background
+            .get()
+            .map_or_else(Vec::new, BackgroundTasks::take)
     }
 }
 
@@ -1424,6 +2018,9 @@ where
         }
         if type_id == TypeId::of::<ConnectionInfo>() {
             return Some(self.connection_info());
+        }
+        if type_id == TypeId::of::<BackgroundTasks>() {
+            return Some(self.background_tasks());
         }
         None
     }
@@ -1586,21 +2183,26 @@ enum BodyRejection {
 }
 
 impl BodyRejection {
-    fn into_response(self) -> Response {
+    fn into_failure(self) -> Failure {
         match self {
-            Self::PayloadTooLarge { max_body_bytes } => error_response(
+            Self::PayloadTooLarge { max_body_bytes } => Failure::new(
+                HttpErrorSource::Request,
                 413,
                 "payload_too_large",
                 "request body exceeds the configured limit",
-                Some(json!({ "maxBytes": max_body_bytes })),
-            ),
-            Self::UnsupportedMediaType => error_response(
+            )
+            .with_details(json!({ "maxBytes": max_body_bytes })),
+            Self::UnsupportedMediaType => Failure::new(
+                HttpErrorSource::Request,
                 415,
                 "unsupported_media_type",
                 "request body media type does not match the operation input",
-                None,
             ),
         }
+    }
+
+    fn into_response(self) -> Response {
+        self.into_failure().into_response()
     }
 }
 
@@ -1643,7 +2245,7 @@ fn media_type_is(value: &str, expected: &str) -> bool {
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(expected))
 }
 
-fn outcome_response(outcome: ExecutionOutcome) -> Response {
+fn outcome_result(outcome: ExecutionOutcome) -> Result<Response, Failure> {
     match outcome {
         ExecutionOutcome::Success {
             status,
@@ -1671,14 +2273,14 @@ fn outcome_response(outcome: ExecutionOutcome) -> Response {
             };
             let mut response = with_outcome_headers(response, headers);
             response.background = background;
-            response
+            Ok(response)
         }
         ExecutionOutcome::StreamingSuccess {
             status,
             headers,
             body,
             background,
-        } => with_outcome_headers(
+        } => Ok(with_outcome_headers(
             Response {
                 status,
                 headers: ResponseHeaders::empty(),
@@ -1688,13 +2290,13 @@ fn outcome_response(outcome: ExecutionOutcome) -> Response {
                 background,
             },
             headers,
-        ),
+        )),
         ExecutionOutcome::Upgrade {
             upgrade,
             background,
         } => {
             let headers = upgrade.headers().to_vec();
-            with_outcome_headers(
+            Ok(with_outcome_headers(
                 Response {
                     status: 101,
                     headers: ResponseHeaders::empty(),
@@ -1704,33 +2306,43 @@ fn outcome_response(outcome: ExecutionOutcome) -> Response {
                     background,
                 },
                 headers,
-            )
+            ))
         }
         ExecutionOutcome::Rejected {
             status,
             code,
             message,
             details,
-        } => error_response(status, &code, &message, details),
+        } => Err(Failure {
+            source: HttpErrorSource::Rejection,
+            status,
+            code: Cow::Owned(code),
+            message: Cow::Owned(message),
+            details,
+            headers: Vec::new(),
+        }),
         ExecutionOutcome::DomainError(error) => {
             let details = match error.details {
                 Some(details) => match blazingly_json::from_slice(&details) {
                     Ok(details) => Some(details),
-                    Err(_) => return internal_error_response(),
+                    Err(_) => return Err(internal_failure()),
                 },
                 None => None,
             };
-            let response = error_response(error.status, &error.code, &error.message, details);
-            with_outcome_headers(response, error.headers)
+            Err(Failure {
+                source: HttpErrorSource::Domain,
+                status: error.status,
+                code: Cow::Owned(error.code),
+                message: Cow::Owned(error.message),
+                details,
+                headers: error.headers,
+            })
         }
-        ExecutionOutcome::InternalError { .. } => internal_error_response(),
+        ExecutionOutcome::InternalError { .. } => Err(internal_failure()),
     }
 }
 
-fn with_outcome_headers(
-    mut response: Response,
-    headers: Vec<blazingly_core::ResponseHeader>,
-) -> Response {
+fn with_outcome_headers(mut response: Response, headers: Vec<ResponseHeader>) -> Response {
     for header in headers {
         response = response.with_header(header.name, header.value);
     }
@@ -1750,12 +2362,12 @@ fn error_response(status: u16, code: &str, message: &str, details: Option<Value>
     json_response(status, &error)
 }
 
-fn internal_error_response() -> Response {
-    error_response(
+fn internal_failure() -> Failure {
+    Failure::new(
+        HttpErrorSource::Internal,
         500,
         "internal_error",
         "the operation could not be completed",
-        None,
     )
 }
 
@@ -1884,19 +2496,26 @@ impl ResponseHeaders {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionInfo, HttpApp, HttpMiddleware, HttpRequestContext, Request, Response, TestApp,
+        BackgroundTasks, ConnectionInfo, HttpApp, HttpError, HttpErrorHandler, HttpErrorSource,
+        HttpMiddleware, HttpRequestContext, MiddlewareScope, Request, Response, TestApp,
     };
     use blazingly_core::{
-        HttpMethod, OperationDescriptor, PreparedJson, ResponseDescriptor, SecurityLocation,
-        SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
+        HttpMethod, OperationDescriptor, OperationFailure, PreparedJson, ResponseDescriptor,
+        SecurityLocation, SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind,
+        TypeDescriptor,
     };
     use blazingly_executor::{
         ExecutableApp, ExecutableOperation, ExecutionOutcome, Extension, FromInvocation,
-        OperationFuture, OperationOutput,
+        InputRejection, InvocationControl, InvocationInput, OperationFuture, OperationOutput,
     };
     use blazingly_json::{Value, json};
     use futures_lite::future;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
 
     struct PassthroughLayer;
 
@@ -2094,6 +2713,432 @@ mod tests {
                 .call(Request::get("/secure")),
         );
         assert_eq!(verified.status(), 200);
+    }
+
+    type EventLog = Rc<RefCell<Vec<String>>>;
+    type HandleExtractor = fn(&InvocationInput<'_>) -> Result<BackgroundTasks, InputRejection>;
+
+    struct RecordingLayer {
+        name: &'static str,
+        events: EventLog,
+    }
+
+    impl HttpMiddleware for RecordingLayer {
+        fn on_request(&self, _context: &mut HttpRequestContext<'_>) -> Option<Response> {
+            self.events
+                .borrow_mut()
+                .push(format!("{}:request", self.name));
+            None
+        }
+
+        fn on_operation(
+            &self,
+            _context: &mut HttpRequestContext<'_>,
+            operation: &OperationDescriptor,
+            _security_schemes: &[SecuritySchemeDescriptor],
+        ) -> Option<Response> {
+            self.events.borrow_mut().push(format!(
+                "{}:operation:{}",
+                self.name,
+                operation.contract.id.as_str()
+            ));
+            None
+        }
+
+        fn on_response(
+            &self,
+            _context: &HttpRequestContext<'_>,
+            _operation: Option<&OperationDescriptor>,
+            _response: &mut Response,
+        ) {
+            self.events
+                .borrow_mut()
+                .push(format!("{}:response", self.name));
+        }
+    }
+
+    struct StatusStamp;
+
+    impl HttpMiddleware for StatusStamp {
+        fn on_response(
+            &self,
+            _context: &HttpRequestContext<'_>,
+            _operation: Option<&OperationDescriptor>,
+            response: &mut Response,
+        ) {
+            let status = response.status().to_string();
+            response.set_header("x-final-status", status);
+        }
+
+        fn verifies_security(&self) -> bool {
+            false
+        }
+    }
+
+    struct HouseStyle;
+
+    impl HttpErrorHandler for HouseStyle {
+        fn on_error(&self, error: &HttpError<'_>, response: &mut Response) {
+            response.set_header("x-error-source", format!("{:?}", error.source()));
+            match error.source() {
+                HttpErrorSource::Internal => {
+                    response.set_status(503);
+                    response.replace_body(br#"{"error":{"code":"unavailable"}}"#.to_vec());
+                }
+                // Deliberately illegal: a typed status is contract, not style.
+                HttpErrorSource::Domain => response.set_status(500),
+                HttpErrorSource::Routing
+                | HttpErrorSource::Request
+                | HttpErrorSource::Rejection => {}
+            }
+        }
+    }
+
+    fn scoped_executable() -> ExecutableApp {
+        ExecutableApp::new([
+            connection_operation("/ingest/events", "ingest.events", Vec::new()),
+            connection_operation("/status", "status.read", Vec::new()),
+        ])
+        .expect("scoped operation graph should compile")
+    }
+
+    fn ack_descriptor(path: &str, id: &str) -> OperationDescriptor {
+        OperationDescriptor::new(
+            HttpMethod::Get,
+            path,
+            id,
+            "Reports an acknowledgement",
+            None,
+            vec![ResponseDescriptor::success(
+                200,
+                Some(TypeDescriptor::new("Ack")),
+            )],
+        )
+        .expect("test operation id should be valid")
+    }
+
+    fn outcome_operation(
+        path: &str,
+        id: &str,
+        outcome: fn() -> ExecutionOutcome,
+    ) -> ExecutableOperation {
+        ExecutableOperation::typed(ack_descriptor(path, id), move |_| {
+            Ok(Box::pin(async move { outcome() }) as OperationFuture)
+        })
+    }
+
+    fn extension_handle(input: &InvocationInput<'_>) -> Result<BackgroundTasks, InputRejection> {
+        Extension::<BackgroundTasks>::from_invocation(input, "background", true)
+            .map(|Extension(tasks)| tasks)
+    }
+
+    fn bare_handle(input: &InvocationInput<'_>) -> Result<BackgroundTasks, InputRejection> {
+        BackgroundTasks::from_invocation(input, "background", true)
+    }
+
+    /// An operation that decides mid-body to schedule after-response work,
+    /// which the `Background<T>` return type cannot express.
+    fn scheduling_operation(
+        path: &str,
+        id: &str,
+        log: &EventLog,
+        extract: HandleExtractor,
+        outcome: fn() -> ExecutionOutcome,
+    ) -> ExecutableOperation {
+        let log = Rc::clone(log);
+        ExecutableOperation::typed(ack_descriptor(path, id), move |input| {
+            let tasks = extract(&input)?;
+            let log = Rc::clone(&log);
+            tasks.add_infallible(move || async move {
+                log.borrow_mut().push("task".to_owned());
+            });
+            Ok(Box::pin(async move { outcome() }) as OperationFuture)
+        })
+    }
+
+    fn accepted() -> ExecutionOutcome {
+        ExecutionOutcome::Success {
+            status: 200,
+            headers: Vec::new(),
+            body: None,
+            background: Vec::new(),
+        }
+    }
+
+    fn conflict() -> ExecutionOutcome {
+        ExecutionOutcome::DomainError(OperationFailure::new(
+            409,
+            "conflict",
+            "the event was already ingested",
+        ))
+    }
+
+    #[test]
+    fn a_path_prefix_matches_only_on_segment_boundaries() {
+        let scope = MiddlewareScope::prefix("/ingest");
+        assert!(scope.matches_request("/ingest"));
+        assert!(scope.matches_request("/ingest/events"));
+        assert!(!scope.matches_request("/ingested"));
+        assert!(!scope.matches_request("/"));
+        assert!(MiddlewareScope::prefix("ingest/").matches_request("/ingest/events"));
+        assert!(MiddlewareScope::all().is_global());
+        assert!(!scope.is_global());
+    }
+
+    #[test]
+    fn operation_predicates_select_by_id_after_routing() {
+        let scope = MiddlewareScope::all().with_operation_prefix("ingest.");
+        assert!(scope.matches_operation("/anything", "ingest.events"));
+        assert!(!scope.matches_operation("/anything", "status.read"));
+        assert!(!scope.matches_request("/anything"));
+
+        let scope = MiddlewareScope::all()
+            .with_operation_filter(|id| id.split('.').next_back() == Some("read"));
+        assert!(scope.matches_operation("/anything", "status.read"));
+        assert!(!scope.matches_operation("/anything", "status.write"));
+
+        let scope = MiddlewareScope::prefix("/ingest").with_operation("status.read");
+        assert!(!scope.matches_operation("/status", "status.read"));
+    }
+
+    #[test]
+    fn a_prefix_scoped_layer_observes_only_its_subtree() {
+        let executable = scoped_executable();
+        let events: EventLog = Rc::new(RefCell::new(Vec::new()));
+        let app = TestApp::new(&executable).with_scoped_middleware(
+            MiddlewareScope::prefix("/ingest"),
+            RecordingLayer {
+                name: "ingest",
+                events: Rc::clone(&events),
+            },
+        );
+
+        future::block_on(app.call(Request::get("/ingest/events")));
+        let recorded = events.borrow().clone();
+        assert_eq!(
+            recorded,
+            [
+                "ingest:request",
+                "ingest:operation:ingest.events",
+                "ingest:response"
+            ]
+        );
+
+        events.borrow_mut().clear();
+        future::block_on(app.call(Request::get("/status")));
+        assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_operation_scoped_layer_starts_after_routing() {
+        let executable = scoped_executable();
+        let events: EventLog = Rc::new(RefCell::new(Vec::new()));
+        let app = TestApp::new(&executable).with_scoped_middleware(
+            MiddlewareScope::operation("ingest.events"),
+            RecordingLayer {
+                name: "op",
+                events: Rc::clone(&events),
+            },
+        );
+
+        future::block_on(app.call(Request::get("/ingest/events")));
+        let recorded = events.borrow().clone();
+        assert_eq!(recorded, ["op:operation:ingest.events", "op:response"]);
+
+        events.borrow_mut().clear();
+        future::block_on(app.call(Request::get("/status")));
+        assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_scoped_verifier_does_not_cover_operations_outside_its_scope() {
+        let executable = executable();
+        let outside = future::block_on(
+            TestApp::new(&executable)
+                .with_scoped_middleware(MiddlewareScope::prefix("/other"), PassthroughLayer)
+                .call(Request::get("/secure")),
+        );
+        assert_eq!(outside.status(), 500);
+        assert_eq!(error_code(&outside), "security_verifier_missing");
+
+        let inside = future::block_on(
+            TestApp::new(&executable)
+                .with_scoped_middleware(MiddlewareScope::prefix("/secure"), PassthroughLayer)
+                .call(Request::get("/secure")),
+        );
+        assert_eq!(inside.status(), 200);
+    }
+
+    #[test]
+    fn an_injected_handle_schedules_work_from_the_handler_body() {
+        let log: EventLog = Rc::new(RefCell::new(Vec::new()));
+        let executable = ExecutableApp::new([scheduling_operation(
+            "/ingest",
+            "tasks.ok",
+            &log,
+            extension_handle,
+            accepted,
+        )])
+        .expect("scheduling operation graph should compile");
+
+        let mut response =
+            future::block_on(TestApp::new(&executable).call(Request::get("/ingest")));
+        assert_eq!(response.status(), 200);
+        assert!(log.borrow().is_empty());
+
+        future::block_on(response.run_background()).expect("scheduled task");
+        assert_eq!(log.borrow().clone(), ["task"]);
+    }
+
+    #[test]
+    fn scheduled_work_survives_a_failed_outcome() {
+        let log: EventLog = Rc::new(RefCell::new(Vec::new()));
+        let executable = ExecutableApp::new([scheduling_operation(
+            "/ingest",
+            "tasks.conflict",
+            &log,
+            bare_handle,
+            conflict,
+        )])
+        .expect("scheduling operation graph should compile");
+
+        let mut response =
+            future::block_on(TestApp::new(&executable).call(Request::get("/ingest")));
+        assert_eq!(response.status(), 409);
+        assert_eq!(error_code(&response), "conflict");
+
+        future::block_on(response.run_background()).expect("scheduled task");
+        assert_eq!(log.borrow().clone(), ["task"]);
+    }
+
+    /// An adapter timeout that fires as soon as the handler has scheduled its
+    /// after-response work.
+    struct ReadyWhenScheduled {
+        scheduled: Rc<Cell<bool>>,
+    }
+
+    impl Future for ReadyWhenScheduled {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+            if self.scheduled.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn aborting_operation(log: &EventLog, scheduled: &Rc<Cell<bool>>) -> ExecutableOperation {
+        let log = Rc::clone(log);
+        let scheduled = Rc::clone(scheduled);
+        ExecutableOperation::typed(ack_descriptor("/ingest", "tasks.aborted"), move |input| {
+            let tasks = bare_handle(&input)?;
+            let log = Rc::clone(&log);
+            tasks.add_infallible(move || async move {
+                log.borrow_mut().push("task".to_owned());
+            });
+            scheduled.set(true);
+            Ok(Box::pin(async move { accepted() }) as OperationFuture)
+        })
+    }
+
+    #[test]
+    fn scheduled_work_survives_an_aborted_invocation() {
+        let log: EventLog = Rc::new(RefCell::new(Vec::new()));
+        let scheduled = Rc::new(Cell::new(false));
+        let executable = ExecutableApp::new([aborting_operation(&log, &scheduled)])
+            .expect("scheduling operation graph should compile");
+        let control = InvocationControl::new().with_timeout(ReadyWhenScheduled {
+            scheduled: Rc::clone(&scheduled),
+        });
+
+        let mut response = future::block_on(
+            TestApp::new(&executable).call_controlled(Request::get("/ingest"), control),
+        );
+        assert_eq!(response.status(), 504);
+
+        future::block_on(response.run_background()).expect("scheduled task");
+        assert_eq!(log.borrow().clone(), ["task"]);
+    }
+
+    #[test]
+    fn an_unused_handle_leaves_the_response_untouched() {
+        let executable = scoped_executable();
+        let mut response =
+            future::block_on(TestApp::new(&executable).call(Request::get("/status")));
+
+        assert_eq!(response.status(), 200);
+        assert!(response.take_background_tasks().is_empty());
+    }
+
+    #[test]
+    fn an_error_handler_restyles_every_dispatch_failure() {
+        let executable = executable();
+        let app = TestApp::new(&executable).with_error_handler(HouseStyle);
+
+        let missing = future::block_on(app.call(Request::get("/nope")));
+        assert_eq!(missing.status(), 404);
+        assert_eq!(missing.get_header("x-error-source"), Some("Routing"));
+
+        let unverified = future::block_on(app.call(Request::get("/secure")));
+        assert_eq!(unverified.status(), 503);
+        assert_eq!(unverified.get_header("x-error-source"), Some("Internal"));
+        assert_eq!(error_code(&unverified), "unavailable");
+
+        let allowed = future::block_on(app.call(Request::post("/plain")));
+        assert_eq!(allowed.status(), 405);
+        assert_eq!(allowed.get_header("allow"), Some("GET"));
+        assert_eq!(allowed.get_header("x-error-source"), Some("Routing"));
+    }
+
+    #[test]
+    fn a_typed_domain_status_survives_the_error_handler() {
+        let executable = ExecutableApp::new([
+            outcome_operation("/conflict", "errors.conflict", conflict),
+            outcome_operation("/broken", "errors.broken", || {
+                ExecutionOutcome::InternalError {
+                    code: "boom".to_owned(),
+                    message: "boom".to_owned(),
+                }
+            }),
+        ])
+        .expect("error operation graph should compile");
+        let app = TestApp::new(&executable).with_error_handler(HouseStyle);
+
+        let domain = future::block_on(app.call(Request::get("/conflict")));
+        assert_eq!(domain.status(), 409);
+        assert_eq!(error_code(&domain), "conflict");
+        assert_eq!(domain.get_header("x-error-source"), Some("Domain"));
+
+        let internal = future::block_on(app.call(Request::get("/broken")));
+        assert_eq!(internal.status(), 503);
+        assert_eq!(error_code(&internal), "unavailable");
+    }
+
+    #[test]
+    fn error_handlers_run_before_middleware_sees_the_response() {
+        let executable = executable();
+        let response = future::block_on(
+            TestApp::new(&executable)
+                .with_error_handler(HouseStyle)
+                .with_middleware(StatusStamp)
+                .call(Request::get("/secure")),
+        );
+
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.get_header("x-final-status"), Some("503"));
+    }
+
+    #[test]
+    fn the_owned_adapter_registers_the_same_seams() {
+        let app = HttpApp::new(executable())
+            .with_scoped_middleware(MiddlewareScope::prefix("/other"), PassthroughLayer)
+            .with_error_handler(HouseStyle);
+        let response = future::block_on(app.call(Request::get("/secure")));
+
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.get_header("x-error-source"), Some("Internal"));
     }
 
     #[test]

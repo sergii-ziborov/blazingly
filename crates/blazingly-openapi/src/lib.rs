@@ -1,11 +1,19 @@
 #![forbid(unsafe_code)]
 
 use blazingly_core::{
-    AppDefinition, InputDescriptor, InputSource, ModelDescriptor, OperationDescriptor, SchemaKind,
-    SecurityLocation, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationRule,
+    AppDefinition, FieldMetadata, InputDescriptor, InputSource, ModelDescriptor,
+    OperationDescriptor, SchemaKind, SecurityLocation, SecuritySchemeDescriptor,
+    SecuritySchemeKind, TypeDescriptor, ValidationRule,
 };
 use blazingly_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Recursion budget for a schema-derived example payload.
+///
+/// A model reached through more than this many `$ref` or property hops
+/// contributes `null` instead of another nesting level, so a self-referential
+/// schema cannot make document generation diverge.
+const MAX_EXAMPLE_DEPTH: usize = 8;
 
 /// Browser UI rendered by [`OpenApiService`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,9 +163,7 @@ pub fn to_value(app: &AppDefinition) -> Value {
 /// Generates a deterministic `OpenAPI` document with explicit application info.
 #[must_use]
 pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Value {
-    let mut paths = Map::new();
     let mut schemas = Map::new();
-
     for operation in app.operations() {
         for input in &operation.contract.inputs {
             collect_model(&input.ty, &mut schemas);
@@ -167,7 +173,12 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
                 collect_model(body, &mut schemas);
             }
         }
+    }
 
+    // Examples resolve `$ref` against the component schemas, so every model is
+    // collected before the first operation is projected.
+    let mut paths = Map::new();
+    for operation in app.operations() {
         let path = paths
             .entry(operation.http.path.clone())
             .or_insert_with(|| Value::Object(Map::new()));
@@ -176,7 +187,7 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
         };
         path_item.insert(
             operation.http.method.as_openapi_key().to_owned(),
-            operation_value(operation),
+            operation_value(operation, &schemas),
         );
     }
 
@@ -189,6 +200,18 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
         },
         "paths": paths
     });
+    let tags = app
+        .operations()
+        .iter()
+        .filter_map(operation_tag)
+        .collect::<BTreeSet<_>>();
+    if !tags.is_empty() {
+        document["tags"] = Value::Array(
+            tags.into_iter()
+                .map(|name| json!({ "name": name }))
+                .collect(),
+        );
+    }
     let security_schemes = app
         .security_schemes()
         .iter()
@@ -211,7 +234,7 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
 }
 
 #[allow(clippy::too_many_lines)]
-fn operation_value(operation: &OperationDescriptor) -> Value {
+fn operation_value(operation: &OperationDescriptor, components: &Map<String, Value>) -> Value {
     let responses = operation
         .contract
         .responses
@@ -224,14 +247,13 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
             if response.error_code.is_some() {
                 value["content"] = json!({
                     "application/json": {
-                        "schema": error_schema(response)
+                        "schema": error_schema(response),
+                        "example": error_example(response, components)
                     }
                 });
             } else if let Some(body) = &response.body {
                 value["content"] = json!({
-                    (response_media_type(body)): {
-                        "schema": schema_value(body)
-                    }
+                    (response_media_type(body)): media_type_value(schema_value(body), components)
                 });
             }
             if let Some(code) = &response.error_code {
@@ -265,6 +287,12 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
         "responses": responses,
         "x-blazingly-agent": operation.contract.agent
     });
+    if let Some(tag) = operation_tag(operation) {
+        value["tags"] = json!([tag]);
+    }
+    if let Some(description) = operation_description(operation) {
+        value["description"] = Value::String(description.to_owned());
+    }
     if !operation.contract.dependencies.is_empty() {
         value["x-blazingly-dependencies"] = Value::Array(
             operation
@@ -295,7 +323,7 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
                 InputSource::Path | InputSource::Query | InputSource::Header | InputSource::Cookie
             )
         })
-        .flat_map(parameter_values)
+        .flat_map(|input| parameter_values(input, components))
         .collect::<Vec<_>>();
     if !parameters.is_empty() {
         value["parameters"] = Value::Array(parameters);
@@ -314,9 +342,8 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
         value["requestBody"] = json!({
             "required": input.required,
             "content": {
-                (request_media_type(input.source)): {
-                    "schema": schema_value(&input.ty)
-                }
+                (request_media_type(input.source)):
+                    media_type_value(schema_value(&input.ty), components)
             }
         });
     }
@@ -332,6 +359,215 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
         });
     }
 
+    value
+}
+
+/// The section a browser UI groups this operation under.
+///
+/// The operation model has no tag field, so the group is the namespace of the
+/// stable operation identity: `users.create` and `users.list` both belong to
+/// `users`, and `billing.invoices.void` belongs to `billing.invoices`. An
+/// identity without a namespace stays untagged rather than becoming a section
+/// of its own.
+fn operation_tag(operation: &OperationDescriptor) -> Option<&str> {
+    operation
+        .contract
+        .id
+        .as_str()
+        .rsplit_once('.')
+        .map(|(namespace, _)| namespace)
+        .filter(|namespace| !namespace.is_empty())
+}
+
+/// Prose shown below the summary in a browser UI.
+///
+/// The contract carries one long-form description, the one an operation
+/// declares for agents; it defaults to the summary, so it is only projected
+/// when it says something the summary does not.
+fn operation_description(operation: &OperationDescriptor) -> Option<&str> {
+    let description = operation.contract.mcp.as_ref()?.description.as_str();
+    (!description.is_empty() && description != operation.contract.summary).then_some(description)
+}
+
+/// A media type entry carrying a schema and, when derivable, a sample payload.
+fn media_type_value(schema: Value, components: &Map<String, Value>) -> Value {
+    let example = example_for_schema(&schema, components, MAX_EXAMPLE_DEPTH);
+    let mut value = Map::new();
+    if !example.is_null() {
+        value.insert("example".to_owned(), example);
+    }
+    value.insert("schema".to_owned(), schema);
+    Value::Object(value)
+}
+
+/// The error envelope a failing operation actually returns.
+fn error_example(
+    response: &blazingly_core::ResponseDescriptor,
+    components: &Map<String, Value>,
+) -> Value {
+    let mut error = json!({
+        "code": response.error_code.as_deref().unwrap_or_default(),
+        "message": response.error_message.as_deref().unwrap_or_default()
+    });
+    if let Some(details) = &response.body {
+        error["details"] =
+            example_for_schema(&schema_value(details), components, MAX_EXAMPLE_DEPTH);
+    }
+    json!({ "error": error })
+}
+
+/// Builds a sample payload from a generated schema node.
+///
+/// Deriving the example from the schema rather than from the descriptor means
+/// every keyword the schema already carries — `format`, `minLength`, `const`,
+/// `minimum`, and anything a later projection adds — constrains the sample
+/// without a second traversal of the operation model.
+fn example_for_schema(schema: &Value, components: &Map<String, Value>, depth: usize) -> Value {
+    let (Some(object), 1..) = (schema.as_object(), depth) else {
+        return Value::Null;
+    };
+    for keyword in ["example", "default", "const"] {
+        if let Some(value) = object.get(keyword) {
+            return value.clone();
+        }
+    }
+    if let Some(first) = object
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+    {
+        return first.clone();
+    }
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        let name = reference
+            .rsplit_once('/')
+            .map_or(reference, |(_, name)| name);
+        return components.get(name).map_or(Value::Null, |target| {
+            example_for_schema(target, components, depth - 1)
+        });
+    }
+
+    match schema_type(object) {
+        Some("object") => example_object(object, components, depth),
+        Some("array") => example_array(object, components, depth),
+        Some("string") => Value::String(example_string(object)),
+        Some("integer") => json!(example_integer(object)),
+        Some("number") => json!(example_number(object)),
+        Some("boolean") => Value::Bool(true),
+        _ => Value::Null,
+    }
+}
+
+/// The declared type, skipping the `"null"` member of a nullable union.
+fn schema_type(schema: &Map<String, Value>) -> Option<&str> {
+    match schema.get("type")? {
+        Value::String(name) => Some(name.as_str()),
+        Value::Array(names) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|name| *name != "null"),
+        _ => None,
+    }
+}
+
+fn example_object(
+    schema: &Map<String, Value>,
+    components: &Map<String, Value>,
+    depth: usize,
+) -> Value {
+    let Some(Value::Object(properties)) = schema.get("properties") else {
+        return Value::Object(Map::new());
+    };
+    Value::Object(
+        properties
+            .iter()
+            .map(|(name, property)| {
+                (
+                    name.clone(),
+                    example_for_schema(property, components, depth - 1),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn example_array(
+    schema: &Map<String, Value>,
+    components: &Map<String, Value>,
+    depth: usize,
+) -> Value {
+    let item = schema.get("items").map_or(Value::Null, |items| {
+        example_for_schema(items, components, depth - 1)
+    });
+    let items = schema
+        .get("minItems")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 3);
+    Value::Array(vec![item; usize::try_from(items).unwrap_or(1)])
+}
+
+/// A sample string honouring the format, then the declared length window.
+///
+/// A formatted sample is returned verbatim: trimming an address to a
+/// `maxLength` would only produce a payload the same document rejects.
+fn example_string(schema: &Map<String, Value>) -> String {
+    let sample = match schema.get("format").and_then(Value::as_str) {
+        Some("email") => return "user@example.com".to_owned(),
+        Some("uuid") => return "00000000-0000-4000-8000-000000000000".to_owned(),
+        Some("uri") => return "https://example.com".to_owned(),
+        Some("ip") => return "192.0.2.1".to_owned(),
+        Some("date") => return "2024-01-01".to_owned(),
+        Some("date-time") => return "2024-01-01T00:00:00Z".to_owned(),
+        Some("decimal") => return "1.00".to_owned(),
+        Some("binary") => return "ZXhhbXBsZQ==".to_owned(),
+        _ => "example",
+    };
+
+    let minimum = schema
+        .get("minLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(64);
+    let maximum = schema
+        .get("maxLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let mut value = sample.to_owned();
+    while u64::try_from(value.len()).unwrap_or(u64::MAX) < minimum {
+        value.push('x');
+    }
+    if u64::try_from(value.len()).unwrap_or(u64::MAX) > maximum {
+        value.truncate(usize::try_from(maximum).unwrap_or(usize::MAX));
+    }
+    value
+}
+
+fn example_integer(schema: &Map<String, Value>) -> i64 {
+    let mut value = 1_i64;
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_i64) {
+        value = value.max(minimum);
+    }
+    if let Some(minimum) = schema.get("exclusiveMinimum").and_then(Value::as_i64) {
+        value = value.max(minimum.saturating_add(1));
+    }
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_i64) {
+        value = value.min(maximum);
+    }
+    if let Some(maximum) = schema.get("exclusiveMaximum").and_then(Value::as_i64) {
+        value = value.min(maximum.saturating_sub(1));
+    }
+    value
+}
+
+fn example_number(schema: &Map<String, Value>) -> f64 {
+    let mut value = 1.0_f64;
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+        value = value.max(minimum);
+    }
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+        value = value.min(maximum);
+    }
     value
 }
 
@@ -420,7 +656,7 @@ fn error_schema(response: &blazingly_core::ResponseDescriptor) -> Value {
     })
 }
 
-fn parameter_values(input: &InputDescriptor) -> Vec<Value> {
+fn parameter_values(input: &InputDescriptor, components: &Map<String, Value>) -> Vec<Value> {
     let location = input_source_name(input.source);
     if let Some(model) = &input.ty.model {
         return model
@@ -429,23 +665,43 @@ fn parameter_values(input: &InputDescriptor) -> Vec<Value> {
             .map(|field| {
                 let mut schema = schema_value(&field.ty);
                 apply_validation(&mut schema, &field.validation);
-                json!({
-                    "name": parameter_name(input.source, &field.name),
-                    "in": location,
-                    "required": input.source == InputSource::Path
-                        || (input.required && field.required),
-                    "schema": schema
-                })
+                parameter_value(
+                    parameter_name(input.source, &field.name),
+                    location,
+                    input.source == InputSource::Path || (input.required && field.required),
+                    schema,
+                    components,
+                )
             })
             .collect();
     }
 
-    vec![json!({
-        "name": parameter_name(input.source, &input.name),
-        "in": location,
-        "required": input.source == InputSource::Path || input.required,
-        "schema": schema_value(&input.ty)
-    })]
+    vec![parameter_value(
+        parameter_name(input.source, &input.name),
+        location,
+        input.source == InputSource::Path || input.required,
+        schema_value(&input.ty),
+        components,
+    )]
+}
+
+fn parameter_value(
+    name: String,
+    location: &'static str,
+    required: bool,
+    schema: Value,
+    components: &Map<String, Value>,
+) -> Value {
+    let example = example_for_schema(&schema, components, MAX_EXAMPLE_DEPTH);
+    let mut value = Map::new();
+    value.insert("name".to_owned(), Value::String(name));
+    value.insert("in".to_owned(), Value::String(location.to_owned()));
+    value.insert("required".to_owned(), Value::Bool(required));
+    value.insert("schema".to_owned(), schema);
+    if !example.is_null() {
+        value.insert("example".to_owned(), example);
+    }
+    Value::Object(value)
 }
 
 fn parameter_name(source: InputSource, name: &str) -> String {
@@ -636,6 +892,48 @@ fn model_schema(model: &ModelDescriptor) -> Value {
     })
 }
 
+/// Projects a recovered default, enumeration, or nullability marker.
+///
+/// `OpenAPI` 3.1 follows JSON Schema 2020-12, which dropped the `nullable`
+/// keyword: a value that also accepts `null` widens its own `type` into a union
+/// instead, and a reference is wrapped in an `anyOf` because a `$ref` node has
+/// no type of its own to widen.
+fn apply_field_metadata(schema: &mut Value, metadata: &FieldMetadata) {
+    match metadata {
+        FieldMetadata::Default(value) => schema["default"] = value.clone(),
+        FieldMetadata::Enumeration(values) => {
+            schema["enum"] = Value::Array(
+                values
+                    .iter()
+                    .map(|value| Value::String(value.clone()))
+                    .collect(),
+            );
+        }
+        FieldMetadata::Nullable => widen_with_null(schema),
+    }
+}
+
+fn widen_with_null(schema: &mut Value) {
+    let Some(declared) = schema.as_object().map(|object| object.get("type").cloned()) else {
+        return;
+    };
+    match declared {
+        Some(Value::String(name)) => schema["type"] = json!([name, "null"]),
+        Some(Value::Array(mut names)) => {
+            if !names.iter().any(|name| name.as_str() == Some("null")) {
+                names.push(Value::String("null".to_owned()));
+                schema["type"] = Value::Array(names);
+            }
+        }
+        Some(_) | None => {
+            if schema.get("$ref").is_some() {
+                let referenced = std::mem::replace(schema, Value::Null);
+                *schema = json!({ "anyOf": [referenced, { "type": "null" }] });
+            }
+        }
+    }
+}
+
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
     for rule in validation {
         match rule {
@@ -657,6 +955,10 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
                 // Declarative constraints are encoded as `keyword=value` inside
                 // `Custom`; project the ones that map to a JSON Schema keyword
                 // instead of leaving them as opaque validator strings.
+                if let Some(metadata) = FieldMetadata::parse(validator) {
+                    apply_field_metadata(schema, &metadata);
+                    continue;
+                }
                 #[cfg(feature = "validation")]
                 if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
                     constraint.apply_json_schema(schema);
@@ -682,9 +984,37 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
 #[cfg(test)]
 mod tests {
     use blazingly_core::{
-        App, HttpMethod, OperationDescriptor, ResponseDescriptor, SecurityRequirement,
-        SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
+        AgentPolicy, App, FieldDescriptor, HttpMethod, InputDescriptor, InputSource,
+        McpToolDescriptor, ModelDescriptor, OperationDescriptor, ResponseDescriptor, SchemaKind,
+        SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
+        ValidationRule,
     };
+
+    fn create_user_model() -> ModelDescriptor {
+        ModelDescriptor::new(
+            "CreateUser",
+            vec![
+                FieldDescriptor::new(
+                    "name",
+                    true,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::MinLength(12)],
+                ),
+                FieldDescriptor::new(
+                    "email",
+                    true,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::Email],
+                ),
+                FieldDescriptor::new(
+                    "age",
+                    false,
+                    TypeDescriptor::scalar("u8", SchemaKind::Integer),
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
 
     #[test]
     fn openapi_is_projected_from_the_operation_model() {
@@ -758,6 +1088,305 @@ mod tests {
         assert_eq!(
             document["paths"]["/users"]["get"]["security"][0]["oauth"][0],
             "users:read"
+        );
+    }
+
+    #[test]
+    fn operations_are_grouped_by_the_namespace_of_their_identity() {
+        let create = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            None,
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let list = OperationDescriptor::new(
+            HttpMethod::Get,
+            "/users",
+            "users.list",
+            "List users",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap();
+        let health = OperationDescriptor::new(
+            HttpMethod::Get,
+            "/health",
+            "health",
+            "Report health",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap();
+        let app = App::new()
+            .route(create)
+            .route(list)
+            .route(health)
+            .build()
+            .unwrap();
+
+        let document = super::to_value(&app);
+
+        assert_eq!(document["paths"]["/users"]["post"]["tags"][0], "users");
+        assert_eq!(document["paths"]["/users"]["get"]["tags"][0], "users");
+        assert_eq!(
+            document["tags"].as_array().map(Vec::len),
+            Some(1),
+            "one section per namespace: {}",
+            document["tags"]
+        );
+        assert_eq!(document["tags"][0]["name"], "users");
+        assert!(
+            document["paths"]["/health"]["get"]["tags"].is_null(),
+            "an identity without a namespace stays untagged"
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_projected_only_when_it_adds_to_the_summary() {
+        let described = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            None,
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap()
+        .with_mcp_tool(
+            McpToolDescriptor::new("create_user", "Registers one user and returns its view."),
+            AgentPolicy::default(),
+        );
+        let echoed = OperationDescriptor::new(
+            HttpMethod::Get,
+            "/users",
+            "users.list",
+            "List users",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap()
+        .with_mcp_tool(
+            McpToolDescriptor::new("list_users", "List users"),
+            AgentPolicy::default(),
+        );
+        let app = App::new().route(described).route(echoed).build().unwrap();
+
+        let document = super::to_value(&app);
+
+        assert_eq!(
+            document["paths"]["/users"]["post"]["description"],
+            "Registers one user and returns its view."
+        );
+        assert!(document["paths"]["/users"]["get"]["description"].is_null());
+    }
+
+    #[test]
+    fn bodies_and_parameters_carry_examples_that_satisfy_their_own_schema() {
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/tenants/{tenant_id}/users",
+            "users.create",
+            "Create a user",
+            None,
+            vec![
+                ResponseDescriptor::success(201, Some(TypeDescriptor::model(create_user_model()))),
+                ResponseDescriptor::error(
+                    409,
+                    "email_already_exists",
+                    "A user with this email already exists.",
+                    None,
+                ),
+            ],
+        )
+        .unwrap()
+        .with_inputs(vec![
+            InputDescriptor::new(
+                "tenant_id",
+                InputSource::Path,
+                true,
+                TypeDescriptor::scalar("Uuid", SchemaKind::String),
+            ),
+            InputDescriptor::new(
+                "body",
+                InputSource::Json,
+                true,
+                TypeDescriptor::model(create_user_model()),
+            ),
+        ]);
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+        let operation = &document["paths"]["/tenants/{tenant_id}/users"]["post"];
+
+        let request = &operation["requestBody"]["content"]["application/json"]["example"];
+        assert_eq!(request["email"], "user@example.com");
+        assert_eq!(
+            request["name"], "examplexxxxx",
+            "a sample must reach its own minLength"
+        );
+        assert_eq!(request["age"], 1);
+        assert_eq!(
+            operation["responses"]["201"]["content"]["application/json"]["example"]["email"],
+            "user@example.com"
+        );
+        assert_eq!(operation["parameters"][0]["name"], "tenant_id");
+        assert_eq!(
+            operation["parameters"][0]["example"],
+            "00000000-0000-4000-8000-000000000000"
+        );
+
+        let failure = &operation["responses"]["409"]["content"]["application/json"]["example"];
+        assert_eq!(failure["error"]["code"], "email_already_exists");
+        assert_eq!(
+            failure["error"]["message"],
+            "A user with this email already exists."
+        );
+    }
+
+    #[test]
+    fn every_declared_tag_and_example_keeps_the_document_well_formed() {
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            Some(TypeDescriptor::model(create_user_model())),
+            vec![
+                ResponseDescriptor::success(201, Some(TypeDescriptor::model(create_user_model()))),
+                ResponseDescriptor::error(409, "conflict", "Already exists.", None),
+            ],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+        let declared = document["tags"]
+            .as_array()
+            .expect("a grouped document declares its tags")
+            .iter()
+            .map(|tag| {
+                tag["name"]
+                    .as_str()
+                    .expect("every tag object names a section")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(declared, ["users"]);
+
+        for (_, path_item) in document["paths"].as_object().expect("paths is an object") {
+            for (_, operation) in path_item.as_object().expect("a path item is an object") {
+                for tag in operation["tags"].as_array().into_iter().flatten() {
+                    let tag = tag.as_str().expect("an operation tag is a string");
+                    assert!(
+                        declared.iter().any(|declared| declared == tag),
+                        "operation tag {tag} is not declared at the document root"
+                    );
+                }
+                for (_, response) in operation["responses"]
+                    .as_object()
+                    .expect("responses is an object")
+                {
+                    for (_, media) in response["content"].as_object().into_iter().flatten() {
+                        assert!(
+                            !media["schema"].is_null(),
+                            "an example must accompany a schema, not replace it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_defaults_enumerations_and_nullability_use_openapi_31_spelling() {
+        let model = ModelDescriptor::new(
+            "Article",
+            vec![
+                FieldDescriptor::new(
+                    "status",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![
+                        ValidationRule::Custom("enum=draft|published".to_owned()),
+                        ValidationRule::Custom("default=\"draft\"".to_owned()),
+                    ],
+                ),
+                FieldDescriptor::new(
+                    "subtitle",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::Custom("nullable=true".to_owned())],
+                ),
+                FieldDescriptor::new(
+                    "author",
+                    false,
+                    TypeDescriptor::model(create_user_model()),
+                    vec![ValidationRule::Custom("nullable=true".to_owned())],
+                ),
+            ],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/articles",
+            "articles.create",
+            "Create an article",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+        let properties = &document["components"]["schemas"]["Article"]["properties"];
+
+        assert_eq!(properties["status"]["default"], "draft");
+        assert_eq!(properties["status"]["enum"][0], "draft");
+        assert_eq!(properties["status"]["enum"][1], "published");
+        assert_eq!(
+            properties["subtitle"]["type"],
+            blazingly_json::json!(["string", "null"]),
+            "3.1 has no `nullable` keyword"
+        );
+        assert_eq!(
+            properties["author"]["anyOf"][0]["$ref"], "#/components/schemas/CreateUser",
+            "a nullable reference widens through anyOf"
+        );
+        assert_eq!(properties["author"]["anyOf"][1]["type"], "null");
+        assert!(
+            properties["status"]["x-blazingly-validators"].is_null(),
+            "recovered metadata must not also appear as an opaque validator"
+        );
+        assert_eq!(
+            document["paths"]["/articles"]["post"]["requestBody"]["content"]["application/json"]["example"]
+                ["status"],
+            "draft",
+            "a declared default is the most useful sample value"
+        );
+    }
+
+    #[test]
+    fn a_body_without_a_documented_shape_carries_no_example() {
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            Some(TypeDescriptor::new("CreateUser")),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+
+        assert!(
+            document["paths"]["/users"]["post"]["requestBody"]["content"]["application/json"]
+                ["example"]
+                .is_null(),
+            "an unconstrained schema must not invent a payload"
         );
     }
 }

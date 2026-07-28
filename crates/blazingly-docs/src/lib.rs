@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use blazingly_core::{
-    AppDefinition, InputDescriptor, InputSource, ModelDescriptor, OperationDescriptor, SchemaKind,
-    TypeDescriptor, ValidationRule,
+    AppDefinition, FieldDescriptor, FieldMetadata, InputDescriptor, InputSource, ModelDescriptor,
+    OperationDescriptor, SchemaKind, TypeDescriptor, ValidationRule,
 };
 use blazingly_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -214,15 +214,58 @@ pub fn scaffold(config: &ScaffoldConfig) -> DocsBundle {
 }
 
 /// Generates concise Markdown describing every public API operation.
+///
+/// Operations are grouped by the namespace of their identity, so a large
+/// surface reads as sections rather than as one flat list.
 #[must_use]
 pub fn api_markdown(app: &AppDefinition) -> String {
     let mut output = String::from("# API\n\n");
 
+    let mut sections: BTreeMap<&str, Vec<&OperationDescriptor>> = BTreeMap::new();
+    let mut ungrouped = Vec::new();
     for operation in app.operations() {
-        write_operation(&mut output, operation);
+        match operation_tag(operation) {
+            Some(tag) => sections.entry(tag).or_default().push(operation),
+            None => ungrouped.push(operation),
+        }
+    }
+
+    let grouped = !sections.is_empty();
+    let heading = if grouped { "###" } else { "##" };
+    for (tag, operations) in sections {
+        let _ = writeln!(output, "## {tag}\n");
+        for operation in operations {
+            write_operation(&mut output, operation, heading);
+        }
+    }
+    if grouped && !ungrouped.is_empty() {
+        output.push_str("## Other\n\n");
+    }
+    for operation in ungrouped {
+        write_operation(&mut output, operation, heading);
     }
 
     output
+}
+
+/// The section an operation belongs to, taken from its identity namespace.
+///
+/// `users.create` and `users.list` both belong to `users`; an identity without
+/// a namespace belongs to no section.
+fn operation_tag(operation: &OperationDescriptor) -> Option<&str> {
+    operation
+        .contract
+        .id
+        .as_str()
+        .rsplit_once('.')
+        .map(|(namespace, _)| namespace)
+        .filter(|namespace| !namespace.is_empty())
+}
+
+/// The long-form description an operation declares beyond its summary.
+fn operation_description(operation: &OperationDescriptor) -> Option<&str> {
+    let description = operation.contract.mcp.as_ref()?.description.as_str();
+    (!description.is_empty() && description != operation.contract.summary).then_some(description)
 }
 
 /// Generates agent-oriented Markdown for native MCP tools.
@@ -289,6 +332,9 @@ pub fn ai_markdown(app: &AppDefinition, config: &DocsBundleConfig) -> String {
             operation.contract.id.as_str(),
             operation.contract.summary
         );
+        if let Some(description) = operation_description(operation) {
+            let _ = writeln!(output, "{description}\n");
+        }
         let _ = writeln!(
             output,
             "- HTTP: `{} {}`",
@@ -517,7 +563,7 @@ fn example_arguments_map(inputs: &[InputDescriptor]) -> Map<String, Value> {
     for input in inputs {
         if let Some(model) = &input.ty.model {
             for field in &model.fields {
-                arguments.insert(field.name.clone(), example_value(&field.ty));
+                arguments.insert(field.name.clone(), field_example(field));
             }
         } else {
             arguments.insert(input.name.clone(), example_value(&input.ty));
@@ -539,13 +585,38 @@ fn input_names(input: &InputDescriptor) -> Vec<&str> {
     )
 }
 
+/// A sample field value, preferring what the field itself declares.
+fn field_example(field: &FieldDescriptor) -> Value {
+    let metadata = field
+        .validation
+        .iter()
+        .filter_map(|rule| match rule {
+            ValidationRule::Custom(validator) => FieldMetadata::parse(validator),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for candidate in &metadata {
+        if let FieldMetadata::Default(value) = candidate {
+            return value.clone();
+        }
+    }
+    for candidate in &metadata {
+        if let FieldMetadata::Enumeration(values) = candidate {
+            if let Some(first) = values.first() {
+                return Value::String(first.clone());
+            }
+        }
+    }
+    example_value(&field.ty)
+}
+
 fn example_value(descriptor: &TypeDescriptor) -> Value {
     if let Some(model) = &descriptor.model {
         return Value::Object(
             model
                 .fields
                 .iter()
-                .map(|field| (field.name.clone(), example_value(&field.ty)))
+                .map(|field| (field.name.clone(), field_example(field)))
                 .collect(),
         );
     }
@@ -584,13 +655,16 @@ fn scalar_text(value: &Value) -> String {
         .map_or_else(|| value.to_string(), str::to_owned)
 }
 
-fn write_operation(output: &mut String, operation: &OperationDescriptor) {
+fn write_operation(output: &mut String, operation: &OperationDescriptor, heading: &str) {
     let _ = writeln!(
         output,
-        "## `{}`\n\n{}\n",
+        "{heading} `{}`\n\n{}\n",
         operation.contract.id.as_str(),
         operation.contract.summary
     );
+    if let Some(description) = operation_description(operation) {
+        let _ = writeln!(output, "{description}\n");
+    }
     let _ = writeln!(
         output,
         "- HTTP: `{} {}`",
@@ -675,6 +749,15 @@ const fn input_source_name(source: InputSource) -> &'static str {
     }
 }
 
+/// Renders a recovered default, nullability marker, or enumeration as prose.
+fn describe_metadata(metadata: &FieldMetadata) -> String {
+    match metadata {
+        FieldMetadata::Default(value) => format!("default `{value}`"),
+        FieldMetadata::Nullable => "nullable".to_owned(),
+        FieldMetadata::Enumeration(values) => format!("one of `{}`", values.join("`, `")),
+    }
+}
+
 fn write_model(output: &mut String, model: &ModelDescriptor) {
     let _ = writeln!(output, "\n### `{}` fields\n", model.name);
 
@@ -704,6 +787,10 @@ fn write_model(output: &mut String, model: &ModelDescriptor) {
                 ValidationRule::Custom(validator) => {
                     // A declarative constraint reads better as its own keyword
                     // than as an opaque validator name.
+                    if let Some(metadata) = FieldMetadata::parse(validator) {
+                        let _ = write!(output, ", {}", describe_metadata(&metadata));
+                        continue;
+                    }
                     #[cfg(feature = "validation")]
                     let rendered = blazingly_validation::Constraint::parse(validator)
                         .map(|constraint| constraint.to_string());
@@ -725,8 +812,8 @@ fn write_model(output: &mut String, model: &ModelDescriptor) {
 #[cfg(test)]
 mod tests {
     use blazingly_core::{
-        AgentPolicy, App, HttpMethod, McpToolDescriptor, OperationDescriptor, ResponseDescriptor,
-        TypeDescriptor,
+        AgentPolicy, App, FieldDescriptor, HttpMethod, McpToolDescriptor, ModelDescriptor,
+        OperationDescriptor, ResponseDescriptor, SchemaKind, TypeDescriptor, ValidationRule,
     };
 
     #[test]
@@ -846,6 +933,98 @@ mod tests {
                 .file("deploy/kubernetes/overlays/nginx/ingress.yaml")
                 .unwrap()
                 .contains("ingressClassName: nginx")
+        );
+    }
+
+    #[test]
+    fn api_markdown_groups_operations_and_prints_their_long_description() {
+        let create = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            None,
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap()
+        .with_mcp_tool(
+            McpToolDescriptor::new("create_user", "Registers one user and returns its view."),
+            AgentPolicy::default(),
+        );
+        let health = OperationDescriptor::new(
+            HttpMethod::Get,
+            "/health",
+            "health",
+            "Report health",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap();
+        let app = App::new().route(create).route(health).build().unwrap();
+
+        let document = super::api_markdown(&app);
+
+        assert!(document.contains("## users\n"), "{document}");
+        assert!(document.contains("### `users.create`"), "{document}");
+        assert!(document.contains("## Other\n"), "{document}");
+        assert!(
+            document.contains("Registers one user and returns its view."),
+            "{document}"
+        );
+    }
+
+    #[test]
+    fn recorded_field_metadata_reads_as_prose_and_seeds_the_examples() {
+        let model = ModelDescriptor::new(
+            "CreateArticle",
+            vec![
+                FieldDescriptor::new(
+                    "status",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![
+                        ValidationRule::Custom("enum=draft|published".to_owned()),
+                        ValidationRule::Custom("default=\"draft\"".to_owned()),
+                    ],
+                ),
+                FieldDescriptor::new(
+                    "subtitle",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::Custom("nullable=true".to_owned())],
+                ),
+            ],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/articles",
+            "articles.create",
+            "Create an article",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::api_markdown(&app);
+        assert!(
+            document.contains("one of `draft`, `published`"),
+            "{document}"
+        );
+        assert!(document.contains("default `\"draft\"`"), "{document}");
+        assert!(document.contains(", nullable"), "{document}");
+        assert!(
+            !document.contains("validator `default"),
+            "recovered metadata must not read as an opaque validator: {document}"
+        );
+
+        let bundle = super::bundle(&app, &super::DocsBundleConfig::new("Articles")).unwrap();
+        assert!(
+            bundle
+                .file("examples/http.md")
+                .unwrap()
+                .contains("\"draft\""),
+            "a declared default belongs in the sample request"
         );
     }
 }

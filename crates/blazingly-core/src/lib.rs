@@ -879,6 +879,147 @@ pub fn merge_validation_errors(
     }
 }
 
+/// Records a field validator's violations under the field it was declared on.
+///
+/// A field validator is handed the value alone and cannot see the public name
+/// of the field it is checking, yet the obvious way to write one is to name
+/// that field anyway. Prefixing unconditionally, the way
+/// [`merge_validation_errors`] does for a nested model, turns that into
+/// `published_at.published_at`.
+///
+/// A violation is therefore taken to be about the field itself when its path
+/// is empty or is the field, and to be a path inside the value otherwise.
+pub fn merge_field_validation_errors(
+    target: &mut ValidationErrors,
+    field: &str,
+    nested: &ValidationErrors,
+) {
+    for violation in nested.violations() {
+        let path = if field.is_empty() {
+            violation.field.clone()
+        } else if violation.field.is_empty() || violation.field == field {
+            field.to_owned()
+        } else if is_rooted_at(&violation.field, field) {
+            violation.field.clone()
+        } else {
+            format!("{field}.{}", violation.field)
+        };
+        target.push(path, violation.code.clone(), violation.message.clone());
+    }
+}
+
+/// Reports whether `path` already descends from `field`.
+fn is_rooted_at(path: &str, field: &str) -> bool {
+    path.strip_prefix(field)
+        .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+}
+
+/// A value type whose field rules are declared once and reused by name.
+///
+/// `#[api_model]` implements this for a one-field tuple struct and for a
+/// unit-variant enum. A model that carries such a field inherits
+/// [`ApiConstrained::constraint_rules`] into its own field descriptor and runs
+/// [`ApiConstrained::validate_constraints`] while validating, so a bundle of
+/// rules written once applies to every field declared with the type.
+pub trait ApiConstrained: ApiSchema {
+    /// Rules a model records for every field declared with this type.
+    fn constraint_rules() -> Vec<ValidationRule>;
+
+    /// Runs the declared rules against one value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the violations found. Their field paths are relative to the
+    /// value, so the caller names the field the value was found in.
+    fn validate_constraints(&self) -> Result<(), ValidationErrors>;
+}
+
+/// Field metadata carried inside [`ValidationRule::Custom`].
+///
+/// The contract's rule list has no variant for a default, for nullability, or
+/// for a string enumeration, and its encoding is frozen. `#[api_model]`
+/// therefore writes them as `keyword=value` strings — the channel already used
+/// for `pattern` and the numeric bounds — and a schema projection recovers them
+/// with [`FieldMetadata::parse`] instead of treating them as opaque validator
+/// names.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldMetadata {
+    /// Value substituted when the field is absent from the request.
+    Default(blazingly_json::Value),
+    /// The field accepts `null` in addition to its declared type.
+    Nullable,
+    /// The complete set of accepted string values, in declaration order.
+    Enumeration(Vec<String>),
+}
+
+impl FieldMetadata {
+    /// Parses the canonical `keyword=value` encoding emitted by `#[api_model]`.
+    #[must_use]
+    pub fn parse(encoded: &str) -> Option<Self> {
+        let (keyword, value) = encoded.split_once('=')?;
+        let metadata = match keyword {
+            "default" => Self::Default(blazingly_json::from_str(value).ok()?),
+            "nullable" if value == "true" => Self::Nullable,
+            "enum" if !value.is_empty() => {
+                Self::Enumeration(value.split('|').map(str::to_owned).collect())
+            }
+            _ => return None,
+        };
+        Some(metadata)
+    }
+
+    /// JSON Schema keyword this metadata projects to.
+    #[must_use]
+    pub const fn keyword(&self) -> &'static str {
+        match self {
+            Self::Default(_) => "default",
+            Self::Nullable => "nullable",
+            Self::Enumeration(_) => "enum",
+        }
+    }
+
+    /// JSON Schema value this metadata projects to.
+    #[must_use]
+    pub fn schema_value(&self) -> blazingly_json::Value {
+        match self {
+            Self::Default(value) => value.clone(),
+            Self::Nullable => blazingly_json::Value::Bool(true),
+            Self::Enumeration(values) => blazingly_json::Value::Array(
+                values
+                    .iter()
+                    .map(|value| blazingly_json::Value::String(value.clone()))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Writes the metadata into a JSON Schema object in place.
+    pub fn apply_json_schema(&self, schema: &mut blazingly_json::Value) {
+        if let Some(object) = schema.as_object_mut() {
+            object.insert(self.keyword().to_owned(), self.schema_value());
+        }
+    }
+}
+
+impl fmt::Display for FieldMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default(value) => write!(formatter, "default={value}"),
+            Self::Nullable => formatter.write_str("nullable=true"),
+            Self::Enumeration(values) => {
+                formatter.write_str("enum=")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("|")?;
+                    }
+                    formatter.write_str(value)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 struct ChunkIterator<I> {
     chunks: I,
 }
@@ -1382,11 +1523,13 @@ macro_rules! descriptors {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiSchema, App, BuildError, HttpMethod, InputDescriptor, InputSource, MAX_RESPONSE_HINT,
-        MIN_RESPONSE_HINT, OperationDescriptor, PreparedJson, ResponseDescriptor, SchemaKind,
-        SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
-        UploadFile, UploadSlots, record_response_size, response_size_hint,
+        ApiSchema, App, BuildError, FieldMetadata, HttpMethod, InputDescriptor, InputSource,
+        MAX_RESPONSE_HINT, MIN_RESPONSE_HINT, OperationDescriptor, PreparedJson,
+        ResponseDescriptor, SchemaKind, SecurityRequirement, SecuritySchemeDescriptor,
+        SecuritySchemeKind, TypeDescriptor, UploadFile, UploadSlots, merge_field_validation_errors,
+        record_response_size, response_size_hint,
     };
+    use crate::ValidationErrors;
 
     struct DocumentedPage;
 
@@ -1540,6 +1683,77 @@ mod tests {
             blazingly_json::from_value::<UploadFile>(blazingly_json::json!({"field_name": "a"}))
                 .expect_err("bytes are required");
         assert!(error.to_string().contains("bytes"), "{error}");
+    }
+
+    fn violations(field: &str, nested: &ValidationErrors) -> Vec<String> {
+        let mut merged = ValidationErrors::new();
+        merge_field_validation_errors(&mut merged, field, nested);
+        merged
+            .violations()
+            .iter()
+            .map(|violation| violation.field.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_field_validator_that_names_its_own_field_is_not_doubled() {
+        let mut reported = ValidationErrors::new();
+        reported.push("published_at", "too_far_ahead", "too far ahead");
+        assert_eq!(violations("published_at", &reported), ["published_at"]);
+    }
+
+    #[test]
+    fn a_field_validator_may_still_report_a_path_inside_the_value() {
+        let mut reported = ValidationErrors::new();
+        reported.push("", "invalid", "invalid");
+        reported.push("window.end", "invalid", "invalid");
+        reported.push("slots[0]", "invalid", "invalid");
+        reported.push("end", "invalid", "invalid");
+        assert_eq!(
+            violations("window", &reported),
+            ["window", "window.end", "window.slots[0]", "window.end"]
+        );
+    }
+
+    #[test]
+    fn an_unnamed_field_leaves_the_reported_path_alone() {
+        let mut reported = ValidationErrors::new();
+        reported.push("street", "min_length", "too short");
+        assert_eq!(violations("", &reported), ["street"]);
+    }
+
+    #[test]
+    fn field_metadata_round_trips_through_its_encoding() {
+        for metadata in [
+            FieldMetadata::Default(blazingly_json::json!(20)),
+            FieldMetadata::Default(blazingly_json::json!("draft")),
+            FieldMetadata::Default(blazingly_json::json!(true)),
+            FieldMetadata::Nullable,
+            FieldMetadata::Enumeration(vec!["uk".to_owned(), "ru".to_owned()]),
+        ] {
+            let encoded = metadata.to_string();
+            assert_eq!(
+                FieldMetadata::parse(&encoded),
+                Some(metadata.clone()),
+                "{encoded} did not round trip"
+            );
+        }
+
+        assert_eq!(FieldMetadata::parse("min_items=2"), None);
+        assert_eq!(FieldMetadata::parse("validate_code"), None);
+        assert_eq!(FieldMetadata::parse("nullable=false"), None);
+    }
+
+    #[test]
+    fn field_metadata_projects_json_schema_keywords() {
+        let mut schema = blazingly_json::json!({ "type": "integer" });
+        FieldMetadata::Default(blazingly_json::json!(20)).apply_json_schema(&mut schema);
+        FieldMetadata::Nullable.apply_json_schema(&mut schema);
+        FieldMetadata::Enumeration(vec!["uk".to_owned()]).apply_json_schema(&mut schema);
+
+        assert_eq!(schema["default"], blazingly_json::json!(20));
+        assert_eq!(schema["nullable"], blazingly_json::json!(true));
+        assert_eq!(schema["enum"], blazingly_json::json!(["uk"]));
     }
 
     fn operation(id: &str, method: HttpMethod, path: &str) -> OperationDescriptor {

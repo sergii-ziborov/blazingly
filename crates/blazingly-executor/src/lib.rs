@@ -1066,6 +1066,11 @@ impl OperationOutput for HttpUpgrade {
     }
 }
 
+/// Tasks ride on the response value, so an error outcome discards them: a
+/// rejection, a domain error, and an internal error carry no response value and
+/// therefore no task slot. An operation that must schedule work on a failing
+/// path injects `blazingly_http::BackgroundTasks` instead, whose tasks are
+/// attached to the response whatever the outcome is.
 impl<T: OperationOutput> OperationOutput for Background<T> {
     fn into_execution_outcome(self) -> ExecutionOutcome {
         let (response, tasks) = self.into_parts();
