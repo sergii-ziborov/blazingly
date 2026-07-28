@@ -427,6 +427,28 @@ impl Program {
     }
 }
 
+/// Working buffers reused across matches on one thread.
+///
+/// The simulation needs a mark table and two alternating state sets. Their
+/// sizes are bounded by the compiled program, which is itself bounded, so
+/// holding them per thread costs a few kilobytes and removes every allocation
+/// from the matching path.
+#[derive(Default)]
+struct Scratch {
+    marks: Vec<usize>,
+    active: Vec<usize>,
+    next: Vec<usize>,
+}
+
+thread_local! {
+    static SCRATCH: core::cell::RefCell<Scratch> =
+        const { core::cell::RefCell::new(Scratch {
+            marks: Vec::new(),
+            active: Vec::new(),
+            next: Vec::new(),
+        }) };
+}
+
 /// A compiled pattern that scans input in a single left-to-right pass.
 ///
 /// Matching simulates every alternative in parallel, so run time is linear in
@@ -489,39 +511,74 @@ impl Pattern {
     }
 
     /// Reports whether the value satisfies the pattern.
+    ///
+    /// The simulation runs on per-thread scratch buffers rather than fresh
+    /// allocations. It used to allocate a mark table and an active set per
+    /// call, plus one successor set *per input character*: matching a
+    /// thirteen-character slug cost about fifteen allocations, and a bulk
+    /// request validating fifty items against two pattern rules cost roughly
+    /// fifteen hundred. Under four worker threads that turned into allocator
+    /// contention rather than work, and it showed as a server that used 117% of
+    /// one core where its peers used 250-280% on the same request, and that got
+    /// *slower* going from one connection to sixty-four.
     #[must_use]
     pub fn matches(&self, value: &str) -> bool {
-        let mut marks = vec![usize::MAX; self.instructions.len()];
+        SCRATCH.with_borrow_mut(|scratch| self.matches_with(value, scratch))
+    }
+
+    fn matches_with(&self, value: &str, scratch: &mut Scratch) -> bool {
+        let Scratch {
+            marks,
+            active,
+            next,
+        } = scratch;
+        marks.clear();
+        marks.resize(self.instructions.len(), usize::MAX);
+        active.clear();
+        next.clear();
+
         let mut generation = 0_usize;
-        let mut active = Vec::new();
-        self.add_thread(&mut active, &mut marks, generation, 0);
+        self.add_thread(active, marks, generation, 0);
 
         for character in value.chars() {
-            if !self.anchored_end && self.accepts(&active) {
+            if !self.anchored_end && self.accepts(active) {
                 return true;
             }
             generation += 1;
-            let mut next = Vec::new();
-            for &index in &active {
+            next.clear();
+            for &index in active.iter() {
                 if let Some(Instruction::Consume(matcher)) = self.instructions.get(index)
                     && self
                         .matchers
                         .get(*matcher)
                         .is_some_and(|matcher| matcher.contains(character))
                 {
-                    self.add_thread(&mut next, &mut marks, generation, index + 1);
+                    self.add_thread(next, marks, generation, index + 1);
                 }
             }
             if !self.anchored_start {
-                self.add_thread(&mut next, &mut marks, generation, 0);
+                self.add_thread(next, marks, generation, 0);
             }
-            active = next;
+            std::mem::swap(active, next);
             if active.is_empty() && self.anchored_start {
                 return false;
             }
         }
 
-        self.accepts(&active)
+        self.accepts(active)
+    }
+
+    /// Reports whether the value satisfies the pattern, without touching the
+    /// shared scratch buffers.
+    ///
+    /// [`Pattern::matches`] borrows a thread-local scratch set, so a caller
+    /// already inside that borrow cannot call it again. Nothing in this crate
+    /// does, but a future matcher that recursed would deadlock rather than
+    /// misbehave quietly, and this entry point is the way out.
+    #[must_use]
+    pub fn matches_isolated(&self, value: &str) -> bool {
+        let mut scratch = Scratch::default();
+        self.matches_with(value, &mut scratch)
     }
 
     fn accepts(&self, active: &[usize]) -> bool {
