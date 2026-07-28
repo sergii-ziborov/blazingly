@@ -91,9 +91,12 @@ The first executable vertical slice now includes:
 - experimental HTTP/2 prior-knowledge/ALPN support behind `native-http2`,
   using the same compiled `HttpApp`.
 
-HTTP/1 parsing and framing are isolated in `blazingly-wire`, which contains no
-framework or socket-runtime dependencies and is consumed by both
-`blazingly-native` and the standalone `blazingly-wire-standalone` server.
+HTTP/1 parsing and framing are isolated in
+[`blazingly-wire`](https://github.com/sergii-ziborov/blazingly-wire), a separate
+repository that contains no framework or socket-runtime dependencies and enters
+this workspace as a submodule. It is consumed both by `blazingly-native` and by
+a standard-library, thread-per-connection example server that uses no async at
+all.
 `blazingly-native` contains the Compio adapter and no Tokio, Hyper, or Axum.
 The core and public handler model remain socket- and runtime-neutral and impose
 no unconditional `Send + Sync` bounds. Cloudflare will receive a separate
@@ -316,9 +319,8 @@ The framework workspace contains:
   sessions, and audit;
 - `blazingly-mcp-stdio`: bounded supervised newline-delimited stdio transport;
 - `blazingly-wire`: framework- and runtime-independent HTTP/1 parsing and
-  response framing;
-- `blazingly-wire-standalone`: independent standard-library server consumer
-  proving the wire crate is not coupled to Blazingly;
+  response framing, developed in its own repository and vendored here as a
+  submodule;
 - `blazingly-native`: Tokio-free Compio HTTP/1 and experimental HTTP/2 adapter;
 - `cargo-blazingly`: application discovery, autoreload, diagnostics, and
   production build/run CLI;

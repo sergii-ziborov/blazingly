@@ -1,4 +1,4 @@
-name: Quality
+﻿name: Quality
 
 on:
   push:
@@ -145,6 +145,6 @@ jobs:
           cargo +stable semver-checks check-release \
             --workspace \
             --exclude blazingly-contract \
-            --exclude blazingly-wire-standalone \
+            --exclude blazingly-wire \
             --exclude cargo-blazingly \
             --baseline-rev "$baseline"

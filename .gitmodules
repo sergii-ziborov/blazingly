@@ -1,3 +1,7 @@
-[submodule "crates/blazingly-contract"]
+﻿[submodule "crates/blazingly-contract"]
 	path = crates/blazingly-contract
 	url = ../blazingly-contract
+[submodule "crates/blazingly-wire"]
+	path = crates/blazingly-wire
+	url = ../blazingly-wire
+	branch = main

@@ -46,10 +46,12 @@ release may break the framework Rust API. It must become blocking before
 
 ## Release process
 
-1. Confirm `crates/blazingly-contract` is checked out at a released tag, and
-   that its `version` satisfies the `blazingly-contract` requirement in the
-   root `[workspace.dependencies]`. Commit the submodule pointer. A fresh
-   `git clone --recursive` must build without any further steps.
+1. Confirm both submodules, `crates/blazingly-contract` and
+   `crates/blazingly-wire`, are checked out at a released tag whose `version`
+   satisfies the matching requirement in the root `[workspace.dependencies]`.
+   Commit both submodule pointers. A fresh `git clone --recursive` must build
+   without any further steps. Each submodule releases from its own repository
+   and is published to crates.io before the framework crates that depend on it.
 2. Move the `Unreleased` section of `CHANGELOG.md` into a dated version
    section, and record every intentional breaking change reported by
    `workspace-semver`.
@@ -57,10 +59,10 @@ release may break the framework Rust API. It must become blocking before
    crates.io records it permanently.
 4. Bump `version` in `[workspace.package]`.
 5. Confirm the release gate above is green.
-6. Flip `publish` in `[workspace.package]` to `true`. `blazingly-wire-standalone`
-   keeps `publish = false`; it is a test harness binary.
-7. Publish in dependency order, contract first, then the leaf crates, then
-   `blazingly` and `cargo-blazingly`.
+6. Flip `publish` in `[workspace.package]` to `true`.
+7. Publish in dependency order: the submodule crates `blazingly-contract` and
+   `blazingly-wire` first, from their own repositories, then the leaf crates,
+   then `blazingly` and `cargo-blazingly`.
 8. Tag the release.
 
 The first `1.0.0` requires a stable facade, documented support window,

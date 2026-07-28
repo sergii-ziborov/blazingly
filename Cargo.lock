@@ -339,16 +339,9 @@ dependencies = [
 
 [[package]]
 name = "blazingly-wire"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "httparse",
-]
-
-[[package]]
-name = "blazingly-wire-standalone"
-version = "0.0.1"
-dependencies = [
- "blazingly-wire",
  "httpdate",
 ]
 

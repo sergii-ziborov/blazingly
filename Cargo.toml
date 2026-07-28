@@ -23,7 +23,6 @@ members = [
     "crates/blazingly-templates",
     "crates/blazingly-validation",
     "crates/blazingly-wire",
-    "crates/blazingly-wire-standalone",
 ]
 resolver = "3"
 
@@ -71,7 +70,7 @@ blazingly-realtime = { path = "crates/blazingly-realtime" }
 blazingly-security = { path = "crates/blazingly-security" }
 blazingly-templates = { path = "crates/blazingly-templates" }
 blazingly-validation = { path = "crates/blazingly-validation" }
-blazingly-wire = { path = "crates/blazingly-wire" }
+blazingly-wire = { version = "0.1.0", path = "crates/blazingly-wire" }
 base64 = "0.22"
 brotli = "8"
 compio = { version = "0.17.0", default-features = false, features = [

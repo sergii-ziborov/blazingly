@@ -41,8 +41,12 @@ depend on:
 The shared crates keep this boundary. `blazingly-wire` owns HTTP/1 parsing,
 request framing, chunk decoding, and response-head encoding with only
 `httparse` as a dependency. It imports no Blazingly contract, router, executor,
-OpenAPI, MCP, socket, or runtime crate. Both `blazingly-native` and the
-standard-library `blazingly-wire-standalone` binary consume it.
+OpenAPI, MCP, socket, or runtime crate. It now lives in its own repository and
+enters this workspace as a submodule, because that independence was real rather
+than aspirational: `blazingly-native` drives it asynchronously over Compio
+completion I/O, and the standard-library, thread-per-connection
+`standalone_server` example in the wire repository drives the same codec with
+no async at all.
 
 `blazingly-native` is an optional adapter using Compio and futures-I/O
 compatibility; its dependency tree contains no Tokio, Hyper, or Axum. Each
