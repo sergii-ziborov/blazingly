@@ -136,7 +136,7 @@ result.
 | MCP discovery | implemented | harness missing |
 | MCP tool call | implemented through JSON-RPC and stdio | harness missing |
 | Streaming response | runtime-neutral pull stream; HTTP/1 chunked and HTTP/2 DATA framing | throughput, slow-reader, and producer-failure scenarios missing |
-| Streaming upload | buffered extractors with decoded-size limits | zero-copy upload contract and benchmark missing |
+| Streaming upload | `UploadBody` plus the `UploadBody::into_multipart` reader, which yields fields and borrowed chunks over the adapter's stream under its existing decoded-size, chunk-count, and read-deadline limits; `Multipart<T>` and `File<UploadFile>` still buffer, by design | 5 MiB multipart scenario runs; see "2026-07-29 streaming multipart upload" below |
 
 The primary application benchmark remains:
 
@@ -150,6 +150,40 @@ JSON parse
 ```
 
 Hello-world routing is a secondary microbenchmark.
+
+## 2026-07-29 streaming multipart upload
+
+The upload scenario posts one 5 MiB `multipart/form-data` cover to
+`POST /admin/articles/1/cover` from the `blazingly-apibench` harness. Three
+servers were interleaved sample by sample, one round each in turn, and all
+three were confirmed to answer the same body before anything was measured. The
+only difference between the two Blazingly rows is the handler: one uses the
+buffered `File<UploadFile>` extractor, the other `UploadBody::into_multipart`.
+
+Peak RSS is the median of the samples in each cell — five at 8 and 32
+connections, three at 64. A repeat of the eight-connection block with seven
+rounds agreed within 1 MiB on every row. The idle floor is the same four-worker
+process measured after startup and before any load, so the last column is what
+the uploads themselves cost: Blazingly idles at 15.6 MiB and Axum at 15.0 MiB.
+
+| Server | 8 conns | 32 conns | 64 conns | 8 → 64 |
+| --- | --- | --- | --- | --- |
+| Blazingly, `File<UploadFile>` | 106.2 MiB | 299.9 MiB | 556.9 MiB | 5.2x |
+| Blazingly, streaming multipart | 25.8 MiB | 25.9 MiB | 26.5 MiB | 1.03x |
+| Axum, streaming multipart | 34.2 MiB | 67.8 MiB | 105.9 MiB | 3.1x |
+
+Above each server's own idle floor, the streaming reader costs 10.2, 10.3, and
+10.9 MiB at the three concurrencies. Eight-folding the connections leaves its
+working set where it was, so peak resident memory has stopped scaling with the
+requests in flight — which is the property the row above claims and the only
+one this run establishes. Nothing but the transport chunk in hand and a
+delimiter of look-ahead is held per request, whatever the upload's size.
+
+Throughput from this run is **not** comparable and is not reported as a
+result: the host carried 55–86% background CPU from unrelated work throughout,
+and every implementation's own best-to-worst spread across samples exceeded the
+gaps between implementations. A quiet-host rerun is required before any
+throughput claim is made about the streaming path.
 
 ## Acceptance gates
 

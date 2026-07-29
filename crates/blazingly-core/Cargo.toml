@@ -16,6 +16,11 @@ blazingly-contract.workspace = true
 blazingly-json.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+# The streaming multipart reader is pull-based, so its tests have to drive a
+# future. Test-only; the crate itself still ships no runtime.
+futures-lite.workspace = true
+
 [lints]
 workspace = true
 

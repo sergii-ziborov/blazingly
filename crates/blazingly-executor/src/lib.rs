@@ -4,9 +4,11 @@ use base64::Engine;
 use blazingly_core::{
     Accepted, ApiError, ApiModel, ApiSchema, App, AppDefinition, Background, BackgroundTask,
     BodyStreamError, Cookie, Created, File, Form, Header, HttpUpgrade, InputSource, Json,
-    Multipart, NoContent, OperationDescriptor, OperationFailure, OperationId, Path, PreparedJson,
-    Query, ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
-    StreamingBody, TypeDescriptor, UploadFile, UploadSlots, WithHeaders,
+    MAX_MULTIPART_HEADER_BYTES, MAX_MULTIPART_PARTS, Multipart, MultipartError, MultipartStream,
+    NoContent, OperationDescriptor, OperationFailure, OperationId, Path, PreparedJson, Query,
+    ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
+    StreamingBody, TypeDescriptor, UploadFile, UploadSlots, WithHeaders, find_bytes,
+    multipart_boundary, multipart_part_headers,
 };
 pub use blazingly_di::DependencyError;
 use blazingly_di::{
@@ -570,6 +572,9 @@ pub trait HttpRequestParts {
 pub struct UploadBody {
     stream: StreamingBody,
     bytes_read: u64,
+    /// Captured at extraction, because the boundary a streaming multipart
+    /// reader needs lives in the request head, not in the body it is handed.
+    content_type: Option<String>,
 }
 
 impl UploadBody {
@@ -578,7 +583,39 @@ impl UploadBody {
         Self {
             stream,
             bytes_read: 0,
+            content_type: None,
         }
+    }
+
+    /// Records the request's declared media type.
+    #[must_use]
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// The request's declared media type, when it had one.
+    #[must_use]
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    /// Reads this body as a `multipart/form-data` document.
+    ///
+    /// The document is parsed while it arrives, so a handler that consumes each
+    /// part chunk by chunk never has the upload resident. This is the streaming
+    /// counterpart of the buffered `Multipart<T>` and `File<UploadFile>`
+    /// extractors, which materialize every part before the handler starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultipartError::Malformed`] when the request did not declare
+    /// `multipart/form-data` with a usable boundary.
+    pub fn into_multipart(self) -> Result<MultipartStream, MultipartError> {
+        let content_type = self.content_type.ok_or(MultipartError::Malformed(
+            "missing multipart Content-Type header",
+        ))?;
+        MultipartStream::new(self.stream, &content_type)
     }
 
     #[must_use]
@@ -645,7 +682,13 @@ impl FromInvocation for UploadBody {
         let stream = request
             .take_body_stream()
             .unwrap_or_else(|| StreamingBody::once(request.body().to_vec()));
-        Ok(Self::new(stream))
+        let body = Self::new(stream);
+        Ok(
+            match request.value(InputSource::Header, "content-type", 0) {
+                Some(content_type) => body.with_content_type(content_type),
+                None => body,
+            },
+        )
     }
 }
 
@@ -2867,9 +2910,6 @@ const fn is_header_name_byte(byte: u8) -> bool {
         )
 }
 
-const MAX_MULTIPART_PARTS: usize = 256;
-const MAX_MULTIPART_HEADER_BYTES: usize = 16 * 1024;
-
 struct MultipartPart<'body> {
     name: String,
     file_name: Option<String>,
@@ -2908,31 +2948,6 @@ fn parse_multipart_request(
     parse_multipart(request.body(), &boundary)
 }
 
-fn multipart_boundary(content_type: &str) -> Option<String> {
-    let mut parameters = header_parameters(content_type);
-    if !parameters
-        .next()?
-        .trim()
-        .eq_ignore_ascii_case("multipart/form-data")
-    {
-        return None;
-    }
-    for parameter in parameters {
-        let (name, value) = parameter.split_once('=')?;
-        if name.trim().eq_ignore_ascii_case("boundary") {
-            let boundary = unquote_header_value(value.trim())?;
-            if boundary.is_empty()
-                || boundary.len() > 70
-                || boundary.bytes().any(|byte| byte <= b' ' || byte >= 127)
-            {
-                return None;
-            }
-            return Some(boundary);
-        }
-    }
-    None
-}
-
 fn parse_multipart<'body>(
     body: &'body [u8],
     boundary: &str,
@@ -2963,14 +2978,14 @@ fn parse_multipart<'body>(
         }
         let headers = std::str::from_utf8(&body[position..header_end])
             .map_err(|_| multipart_rejection("multipart part headers are not valid UTF-8"))?;
-        let (name, file_name, content_type) = multipart_part_headers(headers)?;
+        let headers = multipart_part_headers(headers).map_err(multipart_rejection)?;
         let data_start = header_end + 4;
         let boundary_start = find_multipart_boundary(body, &delimiter, data_start)
             .ok_or_else(|| multipart_rejection("multipart part has no closing boundary"))?;
         parts.push(MultipartPart {
-            name,
-            file_name,
-            content_type,
+            name: headers.name,
+            file_name: headers.file_name,
+            content_type: headers.content_type,
             bytes: &body[data_start..boundary_start],
         });
         if parts.len() > MAX_MULTIPART_PARTS {
@@ -2990,93 +3005,6 @@ fn parse_multipart<'body>(
     }
 }
 
-fn multipart_part_headers(
-    headers: &str,
-) -> Result<(String, Option<String>, Option<String>), InputRejection> {
-    let mut name = None;
-    let mut file_name = None;
-    let mut content_type = None;
-    for line in headers.split("\r\n") {
-        let (header_name, value) = line
-            .split_once(':')
-            .ok_or_else(|| multipart_rejection("multipart part header is malformed"))?;
-        if header_name.eq_ignore_ascii_case("content-disposition") {
-            let mut parameters = header_parameters(value);
-            if !parameters
-                .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("form-data"))
-            {
-                return Err(multipart_rejection(
-                    "multipart Content-Disposition must be form-data",
-                ));
-            }
-            for parameter in parameters {
-                let Some((parameter_name, parameter_value)) = parameter.split_once('=') else {
-                    continue;
-                };
-                if parameter_name.trim().eq_ignore_ascii_case("name") {
-                    name = unquote_header_value(parameter_value.trim());
-                } else if parameter_name.trim().eq_ignore_ascii_case("filename") {
-                    file_name = unquote_header_value(parameter_value.trim());
-                }
-            }
-        } else if header_name.eq_ignore_ascii_case("content-type") {
-            content_type = Some(value.trim().to_owned());
-        }
-    }
-    let name = name
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| multipart_rejection("multipart part has no field name"))?;
-    Ok((name, file_name, content_type))
-}
-
-fn header_parameters(value: &str) -> impl Iterator<Item = &str> {
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut ranges = Vec::new();
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' && quoted {
-            escaped = true;
-        } else if character == '"' {
-            quoted = !quoted;
-        } else if character == ';' && !quoted {
-            ranges.push((start, index));
-            start = index + character.len_utf8();
-        }
-    }
-    ranges.push((start, value.len()));
-    ranges
-        .into_iter()
-        .map(move |(start, end)| &value[start..end])
-}
-
-fn unquote_header_value(value: &str) -> Option<String> {
-    if let Some(value) = value.strip_prefix('"') {
-        let value = value.strip_suffix('"')?;
-        let mut output = String::with_capacity(value.len());
-        let mut escaped = false;
-        for character in value.chars() {
-            if escaped {
-                output.push(character);
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else {
-                output.push(character);
-            }
-        }
-        if escaped {
-            return None;
-        }
-        Some(output)
-    } else {
-        Some(value.to_owned())
-    }
-}
-
 fn find_multipart_boundary(body: &[u8], delimiter: &[u8], from: usize) -> Option<usize> {
     let mut position = from;
     while let Some(found) = find_bytes(body, b"\r\n--", position) {
@@ -3090,14 +3018,6 @@ fn find_multipart_boundary(body: &[u8], delimiter: &[u8], from: usize) -> Option
         position = found + 2;
     }
     None
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    haystack
-        .get(from..)?
-        .windows(needle.len())
-        .position(|window| window == needle)
-        .map(|position| from + position)
 }
 
 fn multipart_argument_value(
@@ -3608,12 +3528,13 @@ macro_rules! routes {
 #[cfg(test)]
 mod tests {
     use super::{
-        FromInvocation, HttpRequestParts, InvocationInput, multipart_argument_value,
-        parse_multipart_request,
+        FromInvocation, HttpRequestParts, InvocationInput, UploadBody, Value,
+        multipart_argument_value, parse_multipart_request,
     };
     use blazingly_core::{
-        ApiModel, ApiSchema, FieldDescriptor, InputSource, ModelDescriptor, Multipart, SchemaKind,
-        TypeDescriptor, UploadFile, UploadSlots, ValidationErrors,
+        ApiError, ApiModel, ApiSchema, FieldDescriptor, File, InputSource, ModelDescriptor,
+        Multipart, MultipartError, SchemaKind, TypeDescriptor, UploadFile, UploadSlots,
+        ValidationErrors,
     };
     use serde::Deserialize;
     use std::borrow::Cow;
@@ -3756,6 +3677,113 @@ mod tests {
             input.attachments[1].file_name.as_deref(),
             Some("cover1.png")
         );
+    }
+
+    /// The same request as `request`, with the `Content-Type` header removed.
+    struct HeadlessRequest {
+        body: Vec<u8>,
+    }
+
+    impl HttpRequestParts for HeadlessRequest {
+        fn value(&self, _source: InputSource, _name: &str, _index: usize) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn body(&self) -> &[u8] {
+            &self.body
+        }
+    }
+
+    fn upload_body(request: &dyn HttpRequestParts) -> UploadBody {
+        UploadBody::from_invocation(&InvocationInput::Http(request), "body", true)
+            .expect("a streaming body is always available over HTTP")
+    }
+
+    #[test]
+    fn the_streaming_extractor_reads_the_body_the_buffered_one_would_have_bought() {
+        let request = request(&[(b'a', 8), (b'b', 16)]);
+        let File(buffered) = File::<Vec<UploadFile>>::from_invocation(
+            &InvocationInput::Http(&request),
+            "attachments",
+            true,
+        )
+        .expect("the buffered extractor decodes");
+
+        let mut stream = upload_body(&request)
+            .into_multipart()
+            .expect("the request declares a boundary");
+        let streamed = futures_lite::future::block_on(async {
+            let mut parts = Vec::new();
+            while let Some(field) = stream.next_field().await.expect("the document parses") {
+                if field.name() != "attachments" {
+                    continue;
+                }
+                parts.push(field.into_upload(1 << 20).await.expect("the part fits"));
+            }
+            parts
+        });
+
+        assert_eq!(streamed, buffered);
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed[0].bytes, vec![b'a'; 8]);
+        assert_eq!(streamed[1].file_name.as_deref(), Some("cover1.png"));
+    }
+
+    #[test]
+    fn both_multipart_readers_reject_a_malformed_body_the_same_way() {
+        let malformed = Request {
+            content_type: format!("multipart/form-data; boundary={BOUNDARY}"),
+            body: b"this is not a multipart document".to_vec(),
+        };
+
+        let rejection = File::<UploadFile>::from_invocation(
+            &InvocationInput::Http(&malformed),
+            "attachments",
+            true,
+        )
+        .expect_err("the buffered extractor rejects the body");
+
+        let mut stream = upload_body(&malformed)
+            .into_multipart()
+            .expect("the request declares a boundary");
+        let failure = futures_lite::future::block_on(stream.next_field())
+            .expect_err("the streaming extractor rejects the body")
+            .into_failure()
+            .expect("the failure projects");
+
+        assert_eq!(failure.status, rejection.status);
+        assert_eq!(failure.code, rejection.code);
+        assert_eq!(failure.message, rejection.message);
+        let streamed_details: Value = blazingly_json::from_slice(
+            &failure
+                .details
+                .expect("the streaming failure carries details"),
+        )
+        .expect("valid JSON");
+        assert_eq!(
+            streamed_details,
+            rejection
+                .details
+                .expect("the buffered rejection carries details")
+        );
+        assert_eq!(failure.status, 422);
+        assert_eq!(failure.code, "invalid_multipart");
+    }
+
+    #[test]
+    fn a_request_without_a_content_type_cannot_be_read_as_multipart() {
+        let request = HeadlessRequest {
+            body: request(&[(b'a', 4)]).body,
+        };
+        let error = upload_body(&request)
+            .into_multipart()
+            .map(|_| ())
+            .expect_err("a multipart body needs a declared boundary");
+        assert_eq!(
+            error,
+            MultipartError::Malformed("missing multipart Content-Type header")
+        );
+        assert_eq!(error.status(), 422);
     }
 
     #[test]

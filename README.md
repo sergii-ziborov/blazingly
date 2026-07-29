@@ -29,8 +29,10 @@ The first executable vertical slice now includes:
   `TestApp`;
 - `Path<T>`, `Query<T>`, `Header<T>`, `Cookie<T>`, `Json<T>`, `Form<T>`,
   `Multipart<T>`, and `File<T>` with multiple handler arguments;
-- pull-based `UploadBody` request streaming with bounded native HTTP/1
-  backpressure and contract/OpenAPI projection;
+- pull-based `UploadBody` request streaming with bounded native backpressure
+  and contract/OpenAPI projection, plus `UploadBody::into_multipart` for
+  reading a `multipart/form-data` body field by field and chunk by chunk
+  without holding the upload;
 - aliases, custom validators, rich nested error locations, and typed
   UUID/URL/IP/date/date-time/decimal validation;
 - `Accepted<T>`, `Created<T>`, `NoContent`, `Status<CODE, T>`, and validated

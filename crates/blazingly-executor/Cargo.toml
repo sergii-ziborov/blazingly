@@ -23,5 +23,10 @@ blazingly-json.workspace = true
 serde = { workspace = true, features = ["std"] }
 serde_path_to_error.workspace = true
 
+[dev-dependencies]
+# The streaming multipart extractor is pull-based, so its tests have to drive a
+# future. Test-only; the crate itself still ships no runtime.
+futures-lite.workspace = true
+
 [lints]
 workspace = true

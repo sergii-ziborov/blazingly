@@ -3325,8 +3325,8 @@ mod tests {
         HttpMiddleware, MulticoreServer, Rejection, Runtime, Server, ServerLimits, parse_head,
     };
     use blazingly_core::{
-        HttpMethod, HttpUpgrade, InputDescriptor, InputSource, Json, OperationDescriptor,
-        ResponseDescriptor, ResponseHeader, SchemaKind, TypeDescriptor,
+        ApiError, HttpMethod, HttpUpgrade, InputDescriptor, InputSource, Json, MultipartError,
+        OperationDescriptor, ResponseDescriptor, ResponseHeader, SchemaKind, TypeDescriptor,
     };
     use blazingly_executor::{
         DependencyError, ExecutableApp, ExecutableOperation, ExecutionOutcome, FromInvocation,
@@ -3674,6 +3674,213 @@ mod tests {
                 }
             }) as OperationFuture)
         })
+    }
+
+    const MULTIPART_BOUNDARY: &str = "blazingly-native-cover";
+
+    /// Assembles one `multipart/form-data` document with a single file part.
+    fn multipart_document(data: &[u8]) -> Vec<u8> {
+        let mut body = format!(
+            "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"cover.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    /// Frames `body` as a `POST /cover` request that closes the connection.
+    fn multipart_request(body: &[u8]) -> Vec<u8> {
+        let mut request = format!(
+            "POST /cover HTTP/1.1\r\nhost: localhost\r\ncontent-type: multipart/form-data; \
+             boundary={MULTIPART_BOUNDARY}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
+    fn multipart_failure(error: &MultipartError) -> ExecutionOutcome {
+        error.clone().into_failure().map_or_else(
+            |error| ExecutionOutcome::InternalError {
+                code: error.code,
+                message: error.message,
+            },
+            ExecutionOutcome::DomainError,
+        )
+    }
+
+    /// A streaming multipart upload that counts the `file` part and drops it.
+    ///
+    /// Nothing but the chunk in hand is ever held, which is the property the
+    /// buffered `File<UploadFile>` extractor cannot offer.
+    fn streaming_multipart_operation() -> ExecutableOperation {
+        let descriptor = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/cover",
+            "cover.stream",
+            "Streaming cover upload",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .expect("the streaming multipart descriptor is valid")
+        .with_inputs(vec![InputDescriptor::new(
+            "body",
+            InputSource::Stream,
+            true,
+            TypeDescriptor::scalar("UploadBody", SchemaKind::Binary),
+        )]);
+        ExecutableOperation::typed(descriptor, |input| {
+            let body = UploadBody::from_invocation(&input, "body", true)?;
+            Ok(Box::pin(async move {
+                let mut multipart = match body.into_multipart() {
+                    Ok(multipart) => multipart,
+                    Err(error) => return multipart_failure(&error),
+                };
+                let mut bytes = 0_usize;
+                loop {
+                    let mut field = match multipart.next_field().await {
+                        Ok(Some(field)) => field,
+                        Ok(None) => break,
+                        Err(error) => return multipart_failure(&error),
+                    };
+                    if field.name() != "file" {
+                        continue;
+                    }
+                    loop {
+                        match field.next_chunk().await {
+                            Ok(Some(chunk)) => {
+                                record(format!("handler:{}", chunk.len()));
+                                bytes += chunk.len();
+                            }
+                            Ok(None) => break,
+                            Err(error) => return multipart_failure(&error),
+                        }
+                    }
+                }
+                ExecutionOutcome::Success {
+                    status: 200,
+                    headers: vec![ResponseHeader::new("content-type", "text/plain")],
+                    body: Some(format!("bytes={bytes}").into_bytes()),
+                    background: Vec::new(),
+                }
+            }) as OperationFuture)
+        })
+    }
+
+    #[test]
+    fn the_plaintext_socket_streams_a_multipart_upload() {
+        let payload = vec![7_u8; 1 << 20];
+        let response = native_exchange_with_limits(
+            vec![streaming_multipart_operation()],
+            multipart_request(&multipart_document(&payload)),
+            ServerLimits::new().with_max_body_bytes(4 * 1024 * 1024),
+        );
+
+        // The response head alone is what a failure would show, so only its
+        // first line and the trailing count are printed on a mismatch.
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let head = response.lines().next().unwrap_or_default().to_owned();
+        assert!(response.starts_with("HTTP/1.1 200 "), "{head}");
+        assert!(
+            response.ends_with(&format!("bytes={}", payload.len())),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn the_compatibility_transport_streams_a_multipart_upload_before_the_client_finishes_it() {
+        clear_events();
+        let document = multipart_document(&[3_u8; 32]);
+        let head = format!(
+            "POST /cover HTTP/1.1\r\nhost: localhost\r\ncontent-type: multipart/form-data; \
+             boundary={MULTIPART_BOUNDARY}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            document.len()
+        )
+        .into_bytes();
+        // The split lands inside the file part, so the handler can only see a
+        // chunk before the last segment if the body is genuinely streamed.
+        let split = document.len() - 16;
+        let server = Server::new(
+            ExecutableApp::new([streaming_multipart_operation()])
+                .expect("the streaming multipart app compiles"),
+        );
+        let mut transport = StagedTransport::new(vec![
+            ("head", head),
+            ("first", document[..split].to_vec()),
+            ("last", document[split..].to_vec()),
+        ]);
+
+        future::block_on(server.serve_io(&mut transport)).expect("the connection completes");
+
+        let events = recorded_events();
+        let first_chunk = events
+            .iter()
+            .position(|event| event.starts_with("handler:"))
+            .unwrap_or_else(|| panic!("the handler never saw a chunk: {events:?}"));
+        assert!(
+            first_chunk < event_position(&events, "client:last"),
+            "the compatibility transport buffered the whole body before dispatch: {events:?}"
+        );
+        let written = transport.written();
+        assert!(written.starts_with("HTTP/1.1 200 "), "{written}");
+        assert!(written.ends_with("bytes=32"), "{written}");
+    }
+
+    #[test]
+    fn a_malformed_multipart_body_is_rejected_while_streaming() {
+        let response = native_exchange(
+            vec![streaming_multipart_operation()],
+            multipart_request(b"this is not a multipart document"),
+        );
+
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(response.starts_with("HTTP/1.1 422 "), "{response}");
+        assert!(response.contains("invalid_multipart"), "{response}");
+    }
+
+    #[test]
+    fn a_truncated_multipart_body_is_not_answered_with_a_success() {
+        let document = multipart_document(&[5_u8; 4096]);
+        let mut request = multipart_request(&document);
+        // Keep the announced Content-Length but stop sending, the way an
+        // aborted upload does.
+        request.truncate(request.len() - 2048);
+        let response = native_exchange(vec![streaming_multipart_operation()], request);
+
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(!response.contains(" 200 "), "{response}");
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+        assert!(response.contains("incomplete_body"), "{response}");
+    }
+
+    #[test]
+    fn transport_limits_still_bound_a_streamed_multipart_upload() {
+        let document = multipart_document(&[1_u8; 64]);
+        let mut request = format!(
+            "POST /cover HTTP/1.1\r\nhost: localhost\r\ncontent-type: multipart/form-data; \
+             boundary={MULTIPART_BOUNDARY}\r\ntransfer-encoding: chunked\r\nconnection: \
+             close\r\n\r\n"
+        )
+        .into_bytes();
+        for piece in document.chunks(32) {
+            request.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            request.extend_from_slice(piece);
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+
+        let response = native_exchange_with_limits(
+            vec![streaming_multipart_operation()],
+            request,
+            ServerLimits::new().with_max_chunks(2),
+        );
+
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(response.starts_with("HTTP/1.1 413 "), "{response}");
+        assert!(response.contains("too_many_chunks"), "{response}");
     }
 
     /// A POST route without a declared body input, so the adapter buffers the

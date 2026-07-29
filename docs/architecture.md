@@ -272,8 +272,10 @@ path uses Compio sockets directly, without a futures-I/O compatibility buffer,
 and coalesces a bounded number of already ordered pipelined responses into each
 write. TLS and experimental HTTP/2 retain the compatibility path. HTTP/2
 supports concurrently scheduled handlers and pull-based response bodies on
-independent streams. The pinned codec is still canary quality, and request
-bodies remain buffered on HTTP/2 and the generic TLS compatibility path.
+independent streams. The pinned codec is still canary quality. Request bodies
+reach the streaming boundary on all three paths — the plaintext socket, the
+generic compatibility transport TLS runs over, and HTTP/2 — for operations that
+declare a stream input; every other operation is still handed a buffered body.
 
 `blazingly-http` owns the adapter-neutral middleware hooks and request-local
 extension carrier. `blazingly-middleware` implements HTTP policy and negotiated
@@ -284,9 +286,26 @@ before body parsing, and authenticated state reaches handlers through
 and actual transport scheme before trusted proxy normalization, so forwarded
 headers are ignored unless the immediate peer matches configured CIDRs.
 
-`UploadBody` is the transport-neutral request-stream extractor. Plaintext
-native HTTP/1 dispatches after the request head and transfers Content-Length or
-decoded chunked data through a bounded local channel, so socket reads follow
-handler demand. `TestApp` provides a buffered semantic fallback. HTTP/2 and the
-generic TLS compatibility path must adopt the same early-dispatch boundary
-before they can claim streaming upload support.
+`UploadBody` is the transport-neutral request-stream extractor. An operation
+that declares it takes the early-dispatch path: the adapter hands the handler
+its arguments after the request head and transfers Content-Length or decoded
+chunked data through a bounded local channel, so socket reads follow handler
+demand. Plaintext native HTTP/1, the generic compatibility transport that TLS
+runs over, and HTTP/2 all reach that boundary; `TestApp` provides a buffered
+semantic fallback.
+
+`UploadBody::into_multipart` reads a `multipart/form-data` body over that same
+stream, yielding one `MultipartField` at a time and one borrowed chunk at a
+time. It is the streaming counterpart of the declarative `Multipart<T>` and
+`File<UploadFile>` extractors, which materialize every part before the handler
+starts and are still the right default for small forms. The reader holds one
+transport chunk plus a delimiter of look-ahead whatever the upload's size, so a
+handler that consumes each part chunk by chunk holds nothing; peak resident
+memory then does not grow with the uploads in flight.
+
+The reader re-implements no limits. It drives the adapter's stream, so the
+decoded-size limit, the chunk-count limit, and the body read deadline apply
+while the body is arriving. A malformed document is rejected with the 422
+`invalid_multipart` the buffered extractor already answers with, and a producer
+failure mid-body is surfaced as an error rather than read as the end of the
+body, so a truncated upload cannot be reported as a complete one.

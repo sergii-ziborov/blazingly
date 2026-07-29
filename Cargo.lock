@@ -184,6 +184,7 @@ version = "0.0.1"
 dependencies = [
  "blazingly-contract",
  "blazingly-json",
+ "futures-lite",
  "serde",
 ]
 
@@ -225,6 +226,7 @@ dependencies = [
  "blazingly-di",
  "blazingly-json",
  "blazingly-validation",
+ "futures-lite",
  "serde",
  "serde_path_to_error",
 ]
