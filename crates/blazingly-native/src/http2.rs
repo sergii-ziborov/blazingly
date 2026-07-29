@@ -340,7 +340,9 @@ fn begin_streaming_request<'app>(
     } else {
         content_length.map(|length| u64::try_from(length).unwrap_or(u64::MAX))
     };
-    let (sender, body) = incoming_body_channel(exact_length);
+    // HTTP/2 producers bypass the queue limit — receive-window credit is the
+    // backpressure — so the historical bound is kept rather than scaled.
+    let (sender, body) = incoming_body_channel(exact_length, READ_CHUNK_BYTES * 2);
     if let Some(request) = streams.requests.get_mut(&stream_id) {
         *request.body_stream.borrow_mut() = Some(body);
     }

@@ -185,6 +185,7 @@ dependencies = [
  "blazingly-contract",
  "blazingly-json",
  "futures-lite",
+ "memchr",
  "serde",
 ]
 
@@ -323,7 +324,9 @@ dependencies = [
  "async-trait",
  "blazingly-core",
  "blazingly-http",
+ "cpu-time",
  "http",
+ "memory-stats",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-otlp",
@@ -510,6 +513,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cargo-blazingly"
 version = "0.0.1"
 dependencies = [
+ "blazingly-docs",
  "blazingly-json",
  "ctrlc",
  "serde",
@@ -836,6 +840,16 @@ checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
 dependencies = [
  "libc",
  "num_cpus",
+ "winapi",
+]
+
+[[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
  "winapi",
 ]
 
@@ -1573,6 +1587,16 @@ name = "memo-map"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
+
+[[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "minijinja"

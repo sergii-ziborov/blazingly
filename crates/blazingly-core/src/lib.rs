@@ -551,6 +551,17 @@ pub trait BodyStream: 'static {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Vec<u8>, BodyStreamError>>>;
+
+    /// Offers a spent chunk's buffer back to the producer.
+    ///
+    /// A consumer that copies chunks out of the stream can return the vector
+    /// here once it is done with it; a producer that refills recycled buffers
+    /// then moves a long body with a handful of allocations instead of one
+    /// per chunk. Purely an optimization hint: the buffer's contents are dead
+    /// either way, and the default implementation simply drops it.
+    fn recycle(self: Pin<&mut Self>, spent: Vec<u8>) {
+        drop(spent);
+    }
 }
 
 /// Typed streaming HTTP response body.
@@ -609,6 +620,14 @@ impl StreamingBody {
     /// not request another chunk until the previous one has been written.
     pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>, BodyStreamError>> {
         poll_fn(|context| self.stream.as_mut().poll_next(context)).await
+    }
+
+    /// Hands a spent chunk's buffer back to the producer for reuse.
+    ///
+    /// See [`BodyStream::recycle`]; producers that do not reuse buffers
+    /// simply drop it.
+    pub fn recycle(&mut self, spent: Vec<u8>) {
+        self.stream.as_mut().recycle(spent);
     }
 }
 
@@ -1183,10 +1202,9 @@ pub fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> 
     let last_start = haystack.len().checked_sub(needle.len())?;
     let mut position = from;
     while position <= last_start {
-        let offset = haystack
-            .get(position..=last_start)?
-            .iter()
-            .position(|byte| byte == first)?;
+        // The first-byte scan runs over every byte of a streamed upload, so
+        // it uses `memchr`'s vectorized search rather than a scalar loop.
+        let offset = memchr::memchr(*first, haystack.get(position..=last_start)?)?;
         let candidate = position + offset;
         if haystack.get(candidate + 1..candidate + needle.len()) == Some(rest) {
             return Some(candidate);
@@ -1475,6 +1493,8 @@ impl MultipartStream {
                 Some(Ok(chunk)) => {
                     // Dropping the consumed prefix before growing the buffer is
                     // what keeps a five-megabyte upload resident in kilobytes.
+                    // The leftover is at most a delimiter's worth of withheld
+                    // look-ahead, so the move is a few dozen bytes per refill.
                     if self.cursor > 0 {
                         self.buffer.drain(..self.cursor);
                         self.cursor = 0;
@@ -1483,6 +1503,9 @@ impl MultipartStream {
                         .bytes_read
                         .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
                     self.buffer.extend_from_slice(&chunk);
+                    // The chunk's bytes now live in the window, so its buffer
+                    // goes back to the producer to be refilled.
+                    self.body.recycle(chunk);
                     return Ok(true);
                 }
                 Some(Err(error)) => {

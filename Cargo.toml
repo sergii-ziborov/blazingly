@@ -90,6 +90,10 @@ flate2 = "1"
 hmac = "0.12"
 httparse = "1.10"
 httpdate = "1.0.3"
+# SIMD substring search for the streaming multipart boundary scanner. Already
+# in the dependency graph transitively; used directly where a scalar byte loop
+# was the dominant per-byte cost of large uploads.
+memchr = "2"
 minijinja = "2.21"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 rust_decimal = "1"

@@ -52,6 +52,12 @@ const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 const MAX_PIPELINE_WRITE_BYTES: usize = 64 * 1024;
 const MAX_HEADER_CAPACITY: usize = blazingly_wire::MAX_HEADER_CAPACITY;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+const DEFAULT_STREAM_READ_BYTES: usize = 64 * 1024;
+/// Most spent chunk buffers one body channel keeps for reuse.
+///
+/// Bounded by what can circulate through one streamed body at a time: two
+/// queued windows, one buffer being filled, and one in the consumer's hands.
+const MAX_SPARE_BUFFERS: usize = 4;
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,6 +102,7 @@ pub struct ServerLimits {
     max_chunks: usize,
     max_pipeline_batch: usize,
     max_requests_per_connection: Option<NonZeroUsize>,
+    stream_read_bytes: usize,
     header_read_timeout: Duration,
     body_read_timeout: Duration,
     idle_timeout: Duration,
@@ -114,6 +121,7 @@ impl ServerLimits {
             max_chunks: DEFAULT_MAX_CHUNKS,
             max_pipeline_batch: DEFAULT_MAX_PIPELINE_BATCH,
             max_requests_per_connection: None,
+            stream_read_bytes: DEFAULT_STREAM_READ_BYTES,
             header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT,
             body_read_timeout: DEFAULT_BODY_READ_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -171,6 +179,26 @@ impl ServerLimits {
     #[must_use]
     pub const fn with_max_requests_per_connection(mut self, count: Option<NonZeroUsize>) -> Self {
         self.max_requests_per_connection = count;
+        self
+    }
+
+    /// Sets the read window for streaming request bodies.
+    ///
+    /// A streamed upload travels as owned chunks of at most this many bytes,
+    /// and each chunk costs one read, one pass through the body channel, and
+    /// one wakeup of the consuming handler. The window therefore trades a
+    /// bounded amount of per-upload memory — at most a handful of windows is
+    /// ever in flight for one request — against per-chunk overhead. The
+    /// default of 64 KiB moves a five-megabyte upload in eighty chunks where
+    /// the 8 KiB connection buffer would take six hundred forty, for tens of
+    /// kilobytes of look-ahead per in-flight upload.
+    ///
+    /// The body channel's queue limit scales with this window, so enlarging it
+    /// never strangles the producer against a fixed queue.
+    #[must_use]
+    pub const fn with_stream_read_bytes(mut self, bytes: usize) -> Self {
+        assert!(bytes > 0, "stream_read_bytes must be greater than zero");
+        self.stream_read_bytes = bytes;
         self
     }
 
@@ -239,6 +267,11 @@ impl ServerLimits {
     #[must_use]
     pub const fn max_requests_per_connection(self) -> Option<NonZeroUsize> {
         self.max_requests_per_connection
+    }
+
+    #[must_use]
+    pub const fn stream_read_bytes(self) -> usize {
+        self.stream_read_bytes
     }
 
     #[must_use]
@@ -1537,7 +1570,10 @@ where
         });
         if streams_request_body {
             let dispatched = {
-                let mut reader = CompatChunkReader { io: &mut *io };
+                let mut reader = CompatChunkReader {
+                    io: &mut *io,
+                    scratch: Vec::new(),
+                };
                 dispatch_streaming(
                     app,
                     limits,
@@ -1908,7 +1944,7 @@ async fn send_streaming_chunk(
     if response.is_some() {
         return false;
     }
-    let mut delivery = Box::pin(sender.send(chunk));
+    let mut delivery = std::pin::pin!(sender.send(chunk));
     let activity = std::future::poll_fn(|context| {
         if let Poll::Ready(response) = response_future.as_mut().poll(context) {
             return Poll::Ready(Activity::Response(Box::new(response)));
@@ -1931,9 +1967,16 @@ async fn send_streaming_chunk(
 /// other transport reads through `futures-io`. Both feed the same streaming
 /// upload loop, so a TLS peer gets the same backpressure, deadlines, and
 /// decoded-size limits as a plaintext one.
+///
+/// `read_chunk` fills the caller-supplied vector, which arrives empty but
+/// keeps whatever capacity earlier chunks retired through the body channel's
+/// spare pool; reusing it is what keeps a long upload from paying one
+/// allocation per chunk. The method is an `async fn` so each call is an
+/// inline-pinned future rather than a fresh heap allocation.
 trait BodyChunkReader {
-    /// Reads the next body chunk, yielding an empty vector at end of input.
-    fn read_chunk(&mut self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + '_>>;
+    /// Reads up to `window` bytes into `buffer`, yielding it back empty at
+    /// end of input.
+    async fn read_chunk(&mut self, buffer: Vec<u8>, window: usize) -> io::Result<Vec<u8>>;
 }
 
 /// Streaming body reader over the plaintext Compio socket.
@@ -1942,41 +1985,51 @@ struct NativeChunkReader<'io> {
 }
 
 impl BodyChunkReader for NativeChunkReader<'_> {
-    fn read_chunk(&mut self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + '_>> {
-        Box::pin(async move {
-            let result =
-                CompioAsyncReadExt::append(&mut *self.io, Vec::with_capacity(READ_CHUNK_BYTES))
-                    .await;
-            result.0.map(|_| result.1)
-        })
+    async fn read_chunk(&mut self, mut buffer: Vec<u8>, window: usize) -> io::Result<Vec<u8>> {
+        buffer.clear();
+        buffer.reserve(window);
+        let result = CompioAsyncReadExt::append(&mut *self.io, buffer).await;
+        result.0.map(|_| result.1)
     }
 }
 
 /// Streaming body reader over any generic transport, TLS included.
+///
+/// `futures-io` reads borrow an initialized slice, so the reader keeps one
+/// zeroed scratch window alive for the whole request and copies each read
+/// into the caller's recycled buffer instead of zeroing a fresh vector per
+/// chunk.
 struct CompatChunkReader<'io, IO> {
     io: &'io mut IO,
+    scratch: Vec<u8>,
 }
 
 impl<IO> BodyChunkReader for CompatChunkReader<'_, IO>
 where
     IO: AsyncRead + Unpin,
 {
-    fn read_chunk(&mut self) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + '_>> {
-        Box::pin(async move {
-            let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
-            let read = self.io.read(&mut chunk).await?;
-            chunk.truncate(read);
-            Ok(chunk)
-        })
+    async fn read_chunk(&mut self, mut buffer: Vec<u8>, window: usize) -> io::Result<Vec<u8>> {
+        buffer.clear();
+        if self.scratch.len() < window {
+            self.scratch.resize(window, 0);
+        }
+        let read = self.io.read(&mut self.scratch[..window]).await?;
+        buffer.extend_from_slice(&self.scratch[..read]);
+        Ok(buffer)
     }
 }
 
-async fn read_body_chunk(
-    reader: &mut dyn BodyChunkReader,
+async fn read_body_chunk<R>(
+    reader: &mut R,
+    buffer: Vec<u8>,
+    window: usize,
     mut response_future: Pin<&mut dyn Future<Output = Response>>,
     response: &mut Option<Response>,
-) -> io::Result<Vec<u8>> {
-    let mut read = reader.read_chunk();
+) -> io::Result<Vec<u8>>
+where
+    R: BodyChunkReader,
+{
+    let mut read = std::pin::pin!(reader.read_chunk(buffer, window));
     if response.is_none() {
         enum Activity {
             Read(io::Result<Vec<u8>>),
@@ -1998,16 +2051,20 @@ async fn read_body_chunk(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn dispatch_streaming(
+async fn dispatch_streaming<R>(
     app: &HttpApp,
     limits: ServerLimits,
-    reader: &mut dyn BodyChunkReader,
+    reader: &mut R,
     buffer: &mut Vec<u8>,
     parsed: &ParsedHead,
     peer_addr: Option<SocketAddr>,
     scheme: &'static str,
     request_timeout: Option<Duration>,
-) -> Result<Response, StreamingRequestError> {
+) -> Result<Response, StreamingRequestError>
+where
+    R: BodyChunkReader,
+{
+    let window = limits.stream_read_bytes;
     let exact_length = match parsed.body {
         BodyFraming::ContentLength(length) => {
             if length > limits.max_body_bytes {
@@ -2021,7 +2078,7 @@ async fn dispatch_streaming(
         }
         BodyFraming::Chunked => None,
     };
-    let (sender, body) = incoming_body_channel(exact_length);
+    let (sender, body) = incoming_body_channel(exact_length, window.saturating_mul(2));
     let request = owned_request(parsed, buffer, body, peer_addr, scheme)?;
     consume_prefix(buffer, parsed.head_bytes);
     let mut response_future: Pin<Box<dyn Future<Output = Response>>> =
@@ -2039,37 +2096,65 @@ async fn dispatch_streaming(
     match parsed.body {
         BodyFraming::ContentLength(length) => {
             let mut remaining = length;
-            while remaining > 0 {
-                if buffer.is_empty() {
-                    let Ok(chunk) = within(
-                        limits.body_read_timeout,
-                        read_body_chunk(&mut *reader, response_future.as_mut(), &mut response),
-                    )
-                    .await
-                    else {
-                        sender.fail(BodyStreamError::new(
-                            "upload_timeout",
-                            "request body stalled past the configured deadline",
-                        ));
-                        return Err(StreamingRequestError::Io(deadline_error(
-                            "request body read",
-                        )));
-                    };
-                    let chunk = chunk?;
-                    if chunk.is_empty() {
-                        sender.fail(BodyStreamError::new(
-                            "incomplete_upload",
-                            "request body ended before Content-Length bytes arrived",
-                        ));
-                        return Err(StreamingRequestError::Incomplete(
-                            "request body ended before Content-Length bytes arrived",
-                        ));
-                    }
-                    buffer.extend_from_slice(&chunk);
-                }
-                let available = remaining.min(buffer.len()).min(READ_CHUNK_BYTES);
-                let chunk = buffer.drain(..available).collect::<Vec<_>>();
+            // Body bytes that arrived coalesced with the request head are
+            // relayed out of the connection buffer first.
+            while remaining > 0 && !buffer.is_empty() {
+                let available = remaining.min(buffer.len()).min(window);
+                let mut chunk = sender.take_spare();
+                chunk.extend_from_slice(&buffer[..available]);
+                consume_prefix(buffer, available);
                 remaining -= available;
+                if receiver_open {
+                    receiver_open = send_streaming_chunk(
+                        &sender,
+                        chunk,
+                        response_future.as_mut(),
+                        &mut response,
+                    )
+                    .await;
+                }
+            }
+            // The rest is read into owned chunks that go to the body channel
+            // as they are, without a pass through the connection buffer.
+            while remaining > 0 {
+                let spare = sender.take_spare();
+                let Ok(chunk) = within(
+                    limits.body_read_timeout,
+                    read_body_chunk(
+                        &mut *reader,
+                        spare,
+                        window,
+                        response_future.as_mut(),
+                        &mut response,
+                    ),
+                )
+                .await
+                else {
+                    sender.fail(BodyStreamError::new(
+                        "upload_timeout",
+                        "request body stalled past the configured deadline",
+                    ));
+                    return Err(StreamingRequestError::Io(deadline_error(
+                        "request body read",
+                    )));
+                };
+                let mut chunk = chunk?;
+                if chunk.is_empty() {
+                    sender.fail(BodyStreamError::new(
+                        "incomplete_upload",
+                        "request body ended before Content-Length bytes arrived",
+                    ));
+                    return Err(StreamingRequestError::Incomplete(
+                        "request body ended before Content-Length bytes arrived",
+                    ));
+                }
+                if chunk.len() > remaining {
+                    // Pipelined bytes past this body belong to the next
+                    // request head and stay in the connection buffer.
+                    buffer.extend_from_slice(&chunk[remaining..]);
+                    chunk.truncate(remaining);
+                }
+                remaining -= chunk.len();
                 if receiver_open {
                     receiver_open = send_streaming_chunk(
                         &sender,
@@ -2086,10 +2171,12 @@ async fn dispatch_streaming(
             loop {
                 match decoder.advance(buffer)? {
                     StreamingChunk::Data(range) => {
-                        let chunk = range
-                            .bytes(buffer)
-                            .expect("decoder ranges stay inside the receive buffer")
-                            .to_vec();
+                        let mut chunk = sender.take_spare();
+                        chunk.extend_from_slice(
+                            range
+                                .bytes(buffer)
+                                .expect("decoder ranges stay inside the receive buffer"),
+                        );
                         let consumed = decoder.consumed_prefix();
                         consume_prefix(buffer, consumed);
                         decoder.discard_prefix(consumed);
@@ -2108,9 +2195,16 @@ async fn dispatch_streaming(
                         break;
                     }
                     StreamingChunk::NeedMore => {
+                        let spare = sender.take_spare();
                         let Ok(chunk) = within(
                             limits.body_read_timeout,
-                            read_body_chunk(&mut *reader, response_future.as_mut(), &mut response),
+                            read_body_chunk(
+                                &mut *reader,
+                                spare,
+                                window,
+                                response_future.as_mut(),
+                                &mut response,
+                            ),
                         )
                         .await
                         else {
@@ -2133,6 +2227,7 @@ async fn dispatch_streaming(
                             ));
                         }
                         buffer.extend_from_slice(&chunk);
+                        sender.store_spare(chunk);
                     }
                 }
             }
@@ -2707,10 +2802,22 @@ struct IncomingBodyState {
     #[cfg(feature = "http2")]
     consumed_bytes: usize,
     max_queued_bytes: usize,
+    /// Spent chunk buffers the consumer handed back for the producer to
+    /// refill. Capped at [`MAX_SPARE_BUFFERS`]; anything past that is dropped.
+    spare: Vec<Vec<u8>>,
     closed: bool,
     receiver_open: bool,
     consumer_waker: Option<Waker>,
     producer_waker: Option<Waker>,
+}
+
+impl IncomingBodyState {
+    fn store_spare(&mut self, mut spent: Vec<u8>) {
+        if spent.capacity() > 0 && self.spare.len() < MAX_SPARE_BUFFERS {
+            spent.clear();
+            self.spare.push(spent);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2794,6 +2901,16 @@ impl IncomingBodySender {
         }
     }
 
+    /// Pops one recycled chunk buffer, or an empty vector when none is spare.
+    fn take_spare(&self) -> Vec<u8> {
+        self.state.borrow_mut().spare.pop().unwrap_or_default()
+    }
+
+    /// Returns a spent chunk buffer to the pool for [`Self::take_spare`].
+    fn store_spare(&self, spent: Vec<u8>) {
+        self.state.borrow_mut().store_spare(spent);
+    }
+
     fn fail(&self, error: BodyStreamError) {
         let mut state = self.state.borrow_mut();
         if state.receiver_open {
@@ -2838,6 +2955,10 @@ impl BodyStream for NativeIncomingBody {
         state.consumer_waker = Some(context.waker().clone());
         Poll::Pending
     }
+
+    fn recycle(self: Pin<&mut Self>, spent: Vec<u8>) {
+        self.state.borrow_mut().store_spare(spent);
+    }
 }
 
 impl Drop for NativeIncomingBody {
@@ -2850,13 +2971,17 @@ impl Drop for NativeIncomingBody {
     }
 }
 
-fn incoming_body_channel(exact_length: Option<u64>) -> (IncomingBodySender, StreamingBody) {
+fn incoming_body_channel(
+    exact_length: Option<u64>,
+    max_queued_bytes: usize,
+) -> (IncomingBodySender, StreamingBody) {
     let state = Rc::new(RefCell::new(IncomingBodyState {
         chunks: VecDeque::new(),
         queued_bytes: 0,
         #[cfg(feature = "http2")]
         consumed_bytes: 0,
-        max_queued_bytes: READ_CHUNK_BYTES * 2,
+        max_queued_bytes,
+        spare: Vec::new(),
         closed: false,
         receiver_open: true,
         consumer_waker: None,

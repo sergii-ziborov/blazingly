@@ -655,6 +655,7 @@ impl UploadBody {
                 ));
             }
             body.extend_from_slice(&chunk);
+            self.stream.recycle(chunk);
         }
         Ok(body)
     }
