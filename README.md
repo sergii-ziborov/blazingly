@@ -16,6 +16,36 @@ ergonomics plus OpenAPI is 7/10; Blazingly reaches 8.5/10 only when native MCP
 executes the same typed operations and produces correct agent-safe responses
 and AI documentation.
 
+**Building an API with Blazingly?** Start at
+[getting started](docs/getting-started.md): install, a first application, a
+validated model, a typed error, dependency injection, running it, the OpenAPI
+document, and MCP. The rest of `docs/` is written for people working on the
+framework.
+
+## Publication status
+
+Blazingly is **not yet published to crates.io**. `publish` in
+`[workspace.package]` is `false` and the release gate for flipping it is in
+[stability and SemVer](docs/stability.md). Until then, depend on it from Git:
+
+```toml
+[dependencies]
+blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }
+```
+
+Cargo checks out the three submodules itself, so no separate clone step is
+needed. The same applies to the CLI:
+
+```console
+cargo install --git https://github.com/sergii-ziborov/blazingly cargo-blazingly
+```
+
+Of the three submodule crates, only
+[`blazingly-json`](https://github.com/sergii-ziborov/blazingly-json) is on
+crates.io (`0.1.0`); `blazingly-contract` and `blazingly-wire` release from
+their own repositories and are not published yet. Release history is in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Current milestone
 
 The first executable vertical slice now includes:
@@ -81,8 +111,8 @@ The first executable vertical slice now includes:
 - request IDs, W3C trace context, structured access events, `tracing`,
   optional OpenTelemetry parent propagation, and Prometheus request/error/
   latency metrics;
-- `cargo blazingly dev/run/build/check/discover/doctor`, application
-  discovery, `Blazingly.toml`, and polling autoreload;
+- `cargo blazingly new/dev/run/build/check/openapi/routes/discover/doctor`,
+  application discovery, `Blazingly.toml`, and polling autoreload;
 - optional database/ORM pool contracts, queue contracts with an in-memory
   conformance adapter, compiled MiniJinja templates, and concrete JWT/OAuth2/
   API-key/signed-session auth providers;
@@ -107,12 +137,15 @@ no unconditional `Send + Sync` bounds. Cloudflare will receive a separate
 adapter over the same operation graph; no Compio, socket, TLS, or native HTTP
 codec type crosses into contract/core/executor.
 
-HTTP/2 is intentionally marked experimental because its pinned Sans-I/O codec
-is currently a canary release. Its handlers and response streams execute
-concurrently, but HTTP/2 request uploads and the TLS compatibility path still
-buffer request bodies. Plaintext native HTTP/1 is the current true streaming
-upload path. TLS certificate/reload ergonomics, asymmetric JWT/JWKS discovery,
-server-side session stores, key rotation, and CSRF helpers remain follow-up
+HTTP/2 sits outside the release contour: it is off by default behind
+`native-http2`, its pinned Sans-I/O codec is an upstream canary release, and no
+release gate mentions it. A supported HTTP/2 will live in a separate
+`blazingly-http2` repository; the reasoning is in
+[stability and SemVer](docs/stability.md). Request bodies reach the streaming
+boundary on the plaintext socket, on the generic compatibility transport TLS
+runs over, and on HTTP/2, for operations that declare a stream input; every
+other operation is handed a buffered body. TLS certificate/reload ergonomics,
+asymmetric JWT/JWKS discovery, key rotation, and CSRF helpers remain follow-up
 work. Contract security is enforced before body parsing by the same middleware
 pipeline in `TestApp`, native HTTP/1, and HTTP/2.
 
@@ -294,15 +327,38 @@ are recorded in [benchmark status](docs/benchmark-status.md).
 
 ## Repositories
 
-- `blazingly-contract`: independent portable operation contracts, pinned here
-  to the local `v0.3.0` release commit while its registry publication is
+Three crates are developed in their own repositories and enter this workspace as
+submodules under `crates/`:
+
+- `blazingly-contract`: independent portable operation contracts, pinned to its
+  `v0.3.0` tag; registry publication is pending;
+- `blazingly-wire`: framework- and runtime-independent HTTP/1 parsing and
+  response framing, pinned to its `v0.1.0` tag; registry publication is
   pending;
 - `blazingly-json`: the JSON engine every crate here encodes and decodes with,
-  developed in its own repository and consumed as a path dependency while its
-  registry publication is pending;
+  published as `blazingly-json 0.1.0`.
+
+Four more repositories are external and not submodules. The three adapters
+implement the framework's database and queue seams against real backends and
+are deliberately kept out of the workspace so vendor-specific code never
+enters the framework tree:
+
+- `blazingly-sqlite`: SQLite adapter over `rusqlite` — separate read and
+  write connection lanes (one writer, many WAL readers), read-heavy pragma
+  tuning, prepared-statement caching, dirty reads via `read_uncommitted` on
+  shared-cache pools, migrations with drift detection;
+- `blazingly-postgres`: PostgreSQL adapter with the frontend/backend
+  protocol version 3 implemented directly over `std::net::TcpStream` —
+  SCRAM-SHA-256, binary parameter binding, all four isolation levels,
+  SQLSTATE error classification, advisory-locked migrations; no
+  `postgres`/`tokio-postgres` dependency and no async runtime in its tree;
+- `blazingly-redis`: Redis Streams adapter for the queue seam with RESP
+  implemented directly — consumer groups, at-least-once delivery with
+  redelivery of dead consumers' work, delayed nacks via a sorted set, and
+  dead-lettering with a bounded attempt count;
 - `blazingly-benchmarks`: external conformance and performance comparisons.
 
-The framework workspace contains:
+The framework workspace contains those three submodule crates plus:
 
 - `blazingly-core`: application model and HTTP bindings;
 - `blazingly-database`: bounded blocking pool integration for synchronous DB
@@ -325,9 +381,6 @@ The framework workspace contains:
 - `blazingly-mcp`: tools/resources/prompts, JSON-RPC, Streamable HTTP,
   sessions, and audit;
 - `blazingly-mcp-stdio`: bounded supervised newline-delimited stdio transport;
-- `blazingly-wire`: framework- and runtime-independent HTTP/1 parsing and
-  response framing, developed in its own repository and vendored here as a
-  submodule;
 - `blazingly-native`: Tokio-free Compio HTTP/1 adapter, plus an HTTP/2 adapter
   kept outside the release contour (see [stability](docs/stability.md));
 - `cargo-blazingly`: application discovery, autoreload, diagnostics, and
@@ -359,7 +412,8 @@ contract/core/DI/executor/HTTP/macros facade.
 Security reporting, fuzz/Miri/sanitizer coverage, and the pre-1.0 compatibility
 policy are documented in [SECURITY.md](SECURITY.md) and
 [stability and SemVer](docs/stability.md).
-See also the [developer CLI workflow](docs/developer-workflow.md) and
+See also [getting started](docs/getting-started.md), the
+[developer CLI workflow](docs/developer-workflow.md), and the
 [ecosystem integration boundary](docs/ecosystem.md).
 
 ## License

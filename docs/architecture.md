@@ -203,8 +203,12 @@ both transports invoke the same operation semantics.
     metrics, and error counters: implemented.
 13. `cargo blazingly` discovery/autoreload/production commands plus database,
     queue, template, and auth integration crates: implemented as the initial
-    ecosystem surface; production vendor-specific adapters remain separate
-    follow-up packages.
+    ecosystem surface. Three production adapters exist in their own
+    repositories — `blazingly-sqlite` and `blazingly-postgres` for the
+    database seam (the latter implementing the PostgreSQL wire protocol
+    directly, with no async runtime in its tree) and `blazingly-redis` for
+    the queue seam on Redis Streams; see `docs/ecosystem.md`. NATS,
+    RabbitMQ, Kafka, and SQS adapters remain follow-up packages.
 14. Fuzz targets, Miri, AddressSanitizer, dependency audit, security reporting,
     and SemVer checks/policy: configured. AddressSanitizer now covers
     `blazingly-native`; Miri cannot, because Compio reaches io_uring and IOCP
