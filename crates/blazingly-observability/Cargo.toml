@@ -53,5 +53,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ], optional = true }
 uuid.workspace = true
 
+# Process metrics. `unsafe_code` is forbidden workspace-wide, so the
+# `GetProcessTimes` and `GetProcessMemoryInfo` calls live in these two safe
+# wrappers instead of direct `windows-sys` FFI. Neither pulls in a runtime.
+[target.'cfg(windows)'.dependencies]
+cpu-time = "1"
+memory-stats = "1"
+
 [lints]
 workspace = true

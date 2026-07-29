@@ -59,14 +59,60 @@ impl From<std::io::Error> for TransportError {
     }
 }
 
+/// Blocking request/response exchange carrying OTLP export payloads.
+///
+/// This is the transport seam under the exporter. The bundled implementation,
+/// [`BlockingHttpClient`], speaks plaintext HTTP/1.1 only; an application that
+/// needs TLS, a proxy, or redirects implements this trait over whatever HTTP
+/// client it already ships and hands it to
+/// [`build_with_transport`](super::build_with_transport) or
+/// [`install_with_transport`](super::install_with_transport). The request and
+/// response types are the `http` crate's, re-exported by `opentelemetry_http`.
+///
+/// The SDK batch span processor calls [`send`](Self::send) on its dedicated
+/// export thread, so the implementation may block.
+pub trait BlockingTransport: std::fmt::Debug + Send + Sync {
+    /// Sends one OTLP request and returns the collector's response.
+    ///
+    /// A non-2xx status must come back as a response, not an error: the
+    /// exporter classifies retries off the status code and the `retry-after`
+    /// header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when no response was obtained at all — connection
+    /// failure, timeout, or a response that could not be parsed.
+    fn send(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError>;
+}
+
+/// Adapts a [`BlockingTransport`] to the async [`HttpClient`] the exporter
+/// consumes. The future completes synchronously, which is exactly what the
+/// batch processor's dedicated export thread blocks on.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TransportClient<T>(pub(super) T);
+
+#[async_trait]
+impl<T: BlockingTransport> HttpClient for TransportClient<T> {
+    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        self.0.send(request)
+    }
+}
+
 /// Blocking HTTP/1.1 client that POSTs OTLP payloads without an async runtime.
 ///
 /// Each call opens a connection, writes the request, reads the response, and
 /// closes the connection, all on the calling thread. That is safe under the SDK
 /// batch span processor, which owns a dedicated export thread and blocks on the
-/// export future there. TLS, proxies, redirects, and connection reuse are out of
-/// scope; supply your own [`HttpClient`] through
-/// [`install_with_client`](super::install_with_client) when you need them.
+/// export future there.
+///
+/// This transport is plaintext only: no TLS, no proxies, no redirects. Spans
+/// travel unencrypted and unauthenticated, so a production deployment should
+/// point it at an OpenTelemetry Collector or vendor agent sidecar on localhost
+/// — the standard pattern — and let that hop own TLS and credentials toward
+/// the backend. To reach an `https` collector directly, implement
+/// [`BlockingTransport`] over the HTTP client the application already ships
+/// and build the pipeline with
+/// [`build_with_transport`](super::build_with_transport).
 #[derive(Clone, Copy, Debug)]
 pub struct BlockingHttpClient {
     timeout: Duration,
@@ -135,10 +181,16 @@ impl Default for BlockingHttpClient {
     }
 }
 
+impl BlockingTransport for BlockingHttpClient {
+    fn send(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        self.post(request).map_err(Into::into)
+    }
+}
+
 #[async_trait]
 impl HttpClient for BlockingHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        self.post(request).map_err(Into::into)
+        BlockingTransport::send(self, request)
     }
 }
 
@@ -393,6 +445,20 @@ mod tests {
             Endpoint::parse(&"https://collector:4318/v1/traces".parse().expect("uri")),
             Err(TransportError::UnsupportedEndpoint(_))
         ));
+    }
+
+    #[test]
+    fn the_bundled_transport_is_plaintext_only() {
+        let client = BlockingHttpClient::default();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://collector:4318/v1/traces")
+            .body(Bytes::new())
+            .expect("request builds");
+        // Refused before any byte leaves the process, so the test needs no
+        // network and plaintext is never sent to a TLS port.
+        let error = BlockingTransport::send(&client, request).expect_err("https must be refused");
+        assert!(error.to_string().contains("not a plain http URL"));
     }
 
     #[test]

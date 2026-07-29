@@ -49,6 +49,7 @@ const MAX_TRACESTATE_KEY_BYTES: usize = 256;
 const MAX_TRACESTATE_VALUE_BYTES: usize = 256;
 /// `/proc/self/stat` reports CPU time in `USER_HZ`, fixed at 100 by the procfs
 /// ABI regardless of the kernel's internal tick rate.
+#[cfg(target_os = "linux")]
 const PROC_USER_HZ: u64 = 100;
 
 type LabelSet = Vec<(String, String)>;
@@ -1242,31 +1243,64 @@ fn set_remote_parent(_span: &tracing::Span, _trace: &TraceContext) {}
 
 /// Resident set size of this process, in bytes.
 ///
-/// Reads `/proc/self/status`. Returns `None` on every other platform: a
-/// portable reading needs `GetProcessMemoryInfo` on Windows and `task_info` on
-/// macOS, both of which mean either `unsafe` FFI or a new dependency, and this
-/// crate forbids the first and avoids the second. The
+/// Linux reads `/proc/self/status`; Windows reads the working set through
+/// `GetProcessMemoryInfo`. Returns `None` on every other platform — macOS
+/// would need mach `task_info`, unverified here — and the
 /// `process_resident_memory_bytes` family is simply absent from a scrape where
 /// this returns `None`.
 #[must_use]
 pub fn process_resident_memory_bytes() -> Option<u64> {
+    platform_resident_memory_bytes()
+}
+
+/// Total user plus system CPU time consumed by this process.
+///
+/// Exposed as `process_cpu_seconds_total`. Linux reads `/proc/self/stat`;
+/// Windows reads `GetProcessTimes`. Returns `None` on every other platform,
+/// for the same reason as [`process_resident_memory_bytes`]. A [`Duration`] is
+/// returned rather than seconds so the platform resolution — centiseconds
+/// under procfs, 100 ns under Windows — survives exactly.
+#[must_use]
+pub fn process_cpu_time() -> Option<Duration> {
+    platform_cpu_time()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_resident_memory_bytes() -> Option<u64> {
     read_proc("/proc/self/status")
         .as_deref()
         .and_then(parse_vm_rss_kib)
         .map(|kib| kib * 1024)
 }
 
-/// Total user plus system CPU time consumed by this process.
-///
-/// Reads `/proc/self/stat` and is exposed as `process_cpu_seconds_total`.
-/// Returns `None` on every other platform, for the same reason as
-/// [`process_resident_memory_bytes`]. A [`Duration`] is returned rather than
-/// seconds so the centisecond resolution of procfs survives exactly.
-#[must_use]
-pub fn process_cpu_time() -> Option<Duration> {
+#[cfg(windows)]
+fn platform_resident_memory_bytes() -> Option<u64> {
+    memory_stats::memory_stats().and_then(|stats| u64::try_from(stats.physical_mem).ok())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn platform_resident_memory_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn platform_cpu_time() -> Option<Duration> {
     process_cpu_ticks().map(|ticks| Duration::from_millis(ticks * (1_000 / PROC_USER_HZ)))
 }
 
+#[cfg(windows)]
+fn platform_cpu_time() -> Option<Duration> {
+    cpu_time::ProcessTime::try_now()
+        .ok()
+        .map(|time| time.as_duration())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn platform_cpu_time() -> Option<Duration> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn process_cpu_ticks() -> Option<u64> {
     read_proc("/proc/self/stat")
         .as_deref()
@@ -1278,13 +1312,9 @@ fn read_proc(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_proc(_path: &str) -> Option<String> {
-    None
-}
-
 /// Reads `VmRSS` out of `/proc/self/status`, which reports it in kibibytes and
 /// so needs no page size lookup.
+#[cfg(any(target_os = "linux", test))]
 fn parse_vm_rss_kib(status: &str) -> Option<u64> {
     let line = status
         .lines()
@@ -1303,6 +1333,7 @@ fn parse_vm_rss_kib(status: &str) -> Option<u64> {
 /// The second field is the executable name in parentheses and may itself
 /// contain spaces and parentheses, so the fixed-position fields are counted
 /// from the final `)` rather than from the start of the line.
+#[cfg(any(target_os = "linux", test))]
 fn parse_stat_cpu_ticks(stat: &str) -> Option<u64> {
     let tail = &stat[stat.rfind(')')? + 1..];
     let mut fields = tail.split_whitespace();
@@ -1322,21 +1353,29 @@ fn write_process_metrics(output: &mut String) {
             bytes,
         );
     }
-    if let Some(ticks) = process_cpu_ticks() {
+    if let Some(cpu) = process_cpu_time() {
         write_family_header(
             output,
             "process_cpu_seconds_total",
             "Total user and system CPU time of this process in seconds",
             "counter",
         );
-        // Rendered from integer centiseconds so the value is exact.
-        let _ = writeln!(
-            output,
-            "process_cpu_seconds_total {}.{:02}",
-            ticks / PROC_USER_HZ,
-            ticks % PROC_USER_HZ
-        );
+        // Rendered from the integer nanosecond count so the value is exact.
+        let _ = writeln!(output, "process_cpu_seconds_total {}", format_seconds(cpu));
     }
+}
+
+/// Renders a [`Duration`] as decimal seconds without a float round-trip.
+fn format_seconds(duration: Duration) -> String {
+    let nanos = duration.subsec_nanos();
+    if nanos == 0 {
+        return duration.as_secs().to_string();
+    }
+    let mut rendered = format!("{}.{nanos:09}", duration.as_secs());
+    while rendered.ends_with('0') {
+        rendered.pop();
+    }
+    rendered
 }
 
 fn sanitized_buckets(buckets: impl IntoIterator<Item = f64>) -> Vec<f64> {
@@ -2018,16 +2057,49 @@ mod tests {
         assert_eq!(parse_stat_cpu_ticks("42 (server) S 1 2 3"), None);
         assert_eq!(parse_stat_cpu_ticks("no parenthesis here"), None);
 
-        // Both readers agree on availability: either procfs answers or neither
-        // family is exposed.
-        assert_eq!(
-            process_resident_memory_bytes().is_some(),
-            cfg!(target_os = "linux") && process_cpu_time().is_some()
-        );
-        if let Some(cpu) = process_cpu_time() {
+        // Both readers agree on availability: procfs answers on Linux, the
+        // process information APIs answer on Windows, and neither family is
+        // exposed anywhere else.
+        let supported = cfg!(any(target_os = "linux", windows));
+        assert_eq!(process_resident_memory_bytes().is_some(), supported);
+        assert_eq!(process_cpu_time().is_some(), supported);
+        if cfg!(target_os = "linux")
+            && let Some(cpu) = process_cpu_time()
+        {
             assert_eq!(cpu.subsec_millis() % 10, 0, "procfs resolution is 10ms");
         }
         assert_valid_exposition(&Metrics::new().prometheus());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_metrics_are_live_and_plausible() {
+        let rss = process_resident_memory_bytes().expect("GetProcessMemoryInfo answers");
+        assert!(rss > 1 << 20, "test process RSS at or under 1 MiB: {rss}");
+        assert!(rss < 1 << 40, "test process RSS at or over 1 TiB: {rss}");
+
+        // GetProcessTimes ticks in scheduler quanta, so burn cycles until it
+        // moves off zero rather than asserting against a freshly started
+        // process.
+        let mut spin = 0_u64;
+        while process_cpu_time() == Some(Duration::ZERO) {
+            spin = spin.wrapping_add(1);
+            std::hint::black_box(spin);
+        }
+        let cpu = process_cpu_time().expect("GetProcessTimes answers");
+        assert!(cpu > Duration::ZERO);
+
+        let text = Metrics::new().prometheus();
+        assert!(text.contains("process_resident_memory_bytes "));
+        assert!(text.contains("process_cpu_seconds_total "));
+        assert_valid_exposition(&text);
+    }
+
+    #[test]
+    fn cpu_seconds_render_exactly_from_integer_nanoseconds() {
+        assert_eq!(format_seconds(Duration::from_secs(9)), "9");
+        assert_eq!(format_seconds(Duration::from_millis(7_310)), "7.31");
+        assert_eq!(format_seconds(Duration::new(1, 100)), "1.0000001");
     }
 
     #[test]

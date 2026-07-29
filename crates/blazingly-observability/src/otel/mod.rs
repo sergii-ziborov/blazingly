@@ -7,6 +7,17 @@
 //! `std::net` I/O on that thread. No Tokio, and no reactor, appears anywhere in
 //! the dependency graph.
 //!
+//! The bundled transport is plaintext HTTP/1.1: no TLS, no proxy support, no
+//! redirects. Exported spans travel unencrypted and unauthenticated, so the
+//! default exporter belongs on a trusted network only. The standard production
+//! pattern is an OpenTelemetry Collector or vendor agent sidecar on localhost
+//! — the default endpoint — receiving plaintext OTLP and owning TLS,
+//! credentials, and retries toward the backend. To send `https` directly
+//! instead, implement [`BlockingTransport`] over an HTTP client the
+//! application already ships and build the pipeline with
+//! [`build_with_transport`] or [`install_with_transport`]; a client that is
+//! already async can implement [`HttpClient`] and use [`build_with_client`].
+//!
 //! ```no_run
 //! use blazingly_observability::otel::{OtlpConfig, install};
 //!
@@ -24,7 +35,9 @@
 
 mod http_client;
 
-pub use http_client::{BlockingHttpClient, TransportError};
+pub use http_client::{BlockingHttpClient, BlockingTransport, TransportError};
+
+use http_client::TransportClient;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_http::HttpClient;
@@ -270,6 +283,26 @@ pub fn build_with_client(
     })
 }
 
+/// Builds an export pipeline over a caller-supplied blocking transport.
+///
+/// This is the seam for everything the bundled plaintext transport will not
+/// do: TLS, authenticating proxies, redirects, connection reuse. Implement
+/// [`BlockingTransport`] over the HTTP client the application already ships
+/// and pass it here; [`build`] keeps the default [`BlockingHttpClient`]
+/// exactly as it is. The transport is called from the SDK export thread and
+/// may block it.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError::Exporter`] when the OTLP exporter rejects the
+/// configuration.
+pub fn build_with_transport(
+    config: &OtlpConfig,
+    transport: impl BlockingTransport + 'static,
+) -> Result<TelemetryPipeline, TelemetryError> {
+    build_with_client(config, TransportClient(transport))
+}
+
 /// Builds a pipeline and installs it as the global `tracing` subscriber.
 ///
 /// Hold the returned pipeline for the process lifetime and call
@@ -303,6 +336,23 @@ pub fn install_with_client(
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|_| TelemetryError::SubscriberAlreadySet)?;
     Ok(pipeline)
+}
+
+/// Installs a global subscriber over a pipeline using a caller-supplied
+/// blocking transport.
+///
+/// See [`build_with_transport`] for what the transport seam is for.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError::Exporter`] when the OTLP exporter rejects the
+/// configuration, and [`TelemetryError::SubscriberAlreadySet`] when a global
+/// subscriber is already installed.
+pub fn install_with_transport(
+    config: &OtlpConfig,
+    transport: impl BlockingTransport + 'static,
+) -> Result<TelemetryPipeline, TelemetryError> {
+    install_with_client(config, TransportClient(transport))
 }
 
 #[cfg(test)]
@@ -361,6 +411,80 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::info_span!("probe").in_scope(|| {});
         });
+        pipeline.shutdown().expect("shutdown drains the batch");
+    }
+
+    /// One request as a caller-supplied transport saw it.
+    type SeenRequest = (String, Vec<(String, String)>, usize);
+
+    #[derive(Debug)]
+    struct RecordingTransport {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+    }
+
+    impl BlockingTransport for RecordingTransport {
+        fn send(
+            &self,
+            request: opentelemetry_http::Request<opentelemetry_http::Bytes>,
+        ) -> Result<
+            opentelemetry_http::Response<opentelemetry_http::Bytes>,
+            opentelemetry_http::HttpError,
+        > {
+            let headers = request
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_owned(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            self.seen.lock().expect("recorder lock").push((
+                request.uri().to_string(),
+                headers,
+                request.body().len(),
+            ));
+            Ok(opentelemetry_http::Response::builder()
+                .status(200)
+                .body(opentelemetry_http::Bytes::new())?)
+        }
+    }
+
+    #[test]
+    fn a_caller_supplied_transport_carries_the_export() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = RecordingTransport {
+            seen: std::sync::Arc::clone(&seen),
+        };
+        let config = OtlpConfig::default()
+            .with_endpoint("http://collector.test:4318/v1/traces")
+            .with_header("authorization", "Bearer token");
+        let pipeline = build_with_transport(&config, transport).expect("pipeline builds");
+        let subscriber = tracing_subscriber::registry().with(pipeline.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("probe").in_scope(|| {});
+        });
+        pipeline.force_flush().expect("flush drains the batch");
+
+        let seen = seen.lock().expect("recorder lock");
+        assert!(!seen.is_empty(), "the transport saw no export request");
+        let (uri, headers, body_length) = &seen[0];
+        assert_eq!(uri, "http://collector.test:4318/v1/traces");
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer token"),
+            "configured header is missing: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "content-type" && value == "application/x-protobuf"),
+            "protobuf content type is missing: {headers:?}"
+        );
+        assert!(*body_length > 0, "export request carried no payload");
+        drop(seen);
         pipeline.shutdown().expect("shutdown drains the batch");
     }
 }
