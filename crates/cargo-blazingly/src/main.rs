@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
@@ -23,10 +23,13 @@ USAGE:
     cargo blazingly <COMMAND> [OPTIONS] [-- APP_ARGS...]
 
 COMMANDS:
+    new         Generate a minimal runnable Blazingly project
     dev         Build an app, run it, and rebuild it when sources change
     run         Build the release binary and launch it directly
     build       Build the selected app in release mode
     check       Type-check the selected app
+    openapi     Build the app and print its OpenAPI document
+    routes      Build the app and print its operation table
     discover    List discoverable Blazingly binary targets
     doctor      Verify Cargo, Rust, config, and app discovery
 
@@ -42,6 +45,18 @@ OPTIONS:
         --no-reload            Run dev without watching files
         --no-build             Launch the existing binary without building (run)
         --debug                Use the debug profile for run/build
+        --out <FILE>           Write openapi/routes output to a file
+        --framework-path <DIR> Local Blazingly checkout for new (path dependency)
+
+`openapi` and `routes` build the debug profile, then run the binary with
+BLAZINGLY_EMIT=openapi|routes and forward its stdout. The framework prints the
+document during server construction and exits before serving; the run also sets
+BLAZINGLY_LISTEN_ADDRESS=127.0.0.1:0 and BLAZINGLY_WORKERS=1 so it cannot race
+a serving instance for the listen port.
+
+`new <name>` scaffolds Cargo.toml, src/main.rs, and .gitignore in ./<name>.
+With `--framework-path` the project uses a path dependency on that checkout;
+without it, a Git dependency on the Blazingly repository.
 
 Blazingly.toml:
     [app]
@@ -61,6 +76,15 @@ application main reads and the generated Deployment manifest sets.
 ";
 
 const ADDRESS_VARIABLE: &str = "BLAZINGLY_LISTEN_ADDRESS";
+// Mirrors `blazingly_http::EMIT_VARIABLE`; `HttpApp::new` prints the requested
+// document and exits when it is set, which is the whole `openapi`/`routes`
+// contract.
+const EMIT_VARIABLE: &str = "BLAZINGLY_EMIT";
+const WORKERS_VARIABLE: &str = "BLAZINGLY_WORKERS";
+const EMIT_ADDRESS: &str = "127.0.0.1:0";
+const FRAMEWORK_GIT_URL: &str = "https://github.com/sergii-ziborov/blazingly";
+const GIT_DEPENDENCY_NOTE: &str = "# Blazingly is unpublished; switch this Git dependency to a version\n\
+                                   # requirement once it is on crates.io.\n";
 const STAGE_DIRECTORY: &str = "blazingly-dev";
 const STAGE_ATTEMPTS: u32 = 10;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -98,6 +122,11 @@ fn run() -> Result<u8, CliError> {
         println!("cargo-blazingly {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
+    // `new` runs before metadata discovery: it is the one command that works
+    // outside a Cargo workspace.
+    if command == "new" {
+        return new_project(&arguments[1..]);
+    }
 
     let options = CliOptions::parse(&arguments[1..])?;
     let metadata = cargo_metadata()?;
@@ -110,7 +139,7 @@ fn run() -> Result<u8, CliError> {
             Ok(0)
         }
         "doctor" => doctor(&metadata, &config, &options, &candidates),
-        "dev" | "run" | "build" | "check" => {
+        "dev" | "run" | "build" | "check" | "openapi" | "routes" => {
             let session = Session {
                 metadata: &metadata,
                 config: &config,
@@ -122,6 +151,7 @@ fn run() -> Result<u8, CliError> {
                 "run" => session.run_app(),
                 "build" => session.cargo_status("build"),
                 "check" => session.cargo_status("check"),
+                "openapi" | "routes" => session.emit(&command),
                 _ => unreachable!(),
             }
         }
@@ -171,6 +201,7 @@ struct CliOptions {
     reload: bool,
     debug: bool,
     no_build: bool,
+    out: Option<PathBuf>,
     app_arguments: Vec<String>,
 }
 
@@ -212,6 +243,10 @@ impl CliOptions {
                 "--no-reload" => options.reload = false,
                 "--no-build" => options.no_build = true,
                 "--debug" => options.debug = true,
+                "--out" => {
+                    options.out =
+                        Some(PathBuf::from(option_value(arguments, &mut index, "--out")?));
+                }
                 "--" => {
                     options
                         .app_arguments
@@ -587,6 +622,144 @@ fn effective_address<'a>(config: &'a FileConfig, options: &'a CliOptions) -> Opt
     options.address.as_deref().or(config.app.address.as_deref())
 }
 
+/// Generates a minimal runnable project in `./<name>` from the shared
+/// `blazingly-docs` scaffold.
+fn new_project(arguments: &[String]) -> Result<u8, CliError> {
+    let mut name: Option<String> = None;
+    let mut framework_path: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-h" | "--help" => return Err(CliError::Usage(HELP.to_owned())),
+            "--framework-path" => {
+                framework_path = Some(PathBuf::from(option_value(
+                    arguments,
+                    &mut index,
+                    "--framework-path",
+                )?));
+            }
+            argument if argument.starts_with('-') => {
+                return Err(CliError::Usage(format!("unknown option `{argument}`")));
+            }
+            argument => {
+                if name.is_some() {
+                    return Err(CliError::Usage("`new` accepts one project name".to_owned()));
+                }
+                name = Some(argument.to_owned());
+            }
+        }
+        index += 1;
+    }
+    let Some(name) = name else {
+        return Err(CliError::Usage(
+            "`new` requires a project name: cargo blazingly new <name>".to_owned(),
+        ));
+    };
+    validate_package_name(&name)?;
+    let dependency = framework_dependency(framework_path.as_deref())?;
+    let root = env::current_dir()
+        .map_err(|error| CliError::Process("could not read the working directory", error))?
+        .join(&name);
+    if root.exists() {
+        return Err(CliError::Usage(format!(
+            "{} already exists",
+            root.display()
+        )));
+    }
+    let files = project_files(&name, &dependency, framework_path.is_none());
+    for (relative, contents) in &files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| CliError::Io(parent.to_owned(), error))?;
+        }
+        fs::write(&path, contents).map_err(|error| CliError::Io(path.clone(), error))?;
+    }
+    println!("Created {}", root.display());
+    for relative in files.keys() {
+        println!("  {relative}");
+    }
+    println!("Next: run `cargo blazingly dev` inside {name}");
+    Ok(0)
+}
+
+fn validate_package_name(name: &str) -> Result<(), CliError> {
+    let valid_start = name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
+    let valid_rest = name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if valid_start && valid_rest {
+        Ok(())
+    } else {
+        Err(CliError::Usage(format!(
+            "`{name}` is not a valid package name; use ASCII letters, digits, `-`, and `_`, \
+             starting with a letter or `_`"
+        )))
+    }
+}
+
+/// The Cargo dependency expression for `blazingly`: a path dependency on a
+/// local checkout, or a Git dependency while the framework is unpublished.
+fn framework_dependency(framework_path: Option<&Path>) -> Result<String, CliError> {
+    let Some(path) = framework_path else {
+        return Ok(format!(
+            "{{ git = \"{FRAMEWORK_GIT_URL}\", features = [\"native\"] }}"
+        ));
+    };
+    let crate_directory = resolve_framework_crate(path)?;
+    Ok(format!(
+        "{{ path = \"{}\", features = [\"native\"] }}",
+        toml_path_text(&crate_directory)
+    ))
+}
+
+/// Accepts either the workspace root of a Blazingly checkout or the
+/// `blazingly` crate directory itself.
+fn resolve_framework_crate(path: &Path) -> Result<PathBuf, CliError> {
+    let absolute =
+        std::path::absolute(path).map_err(|error| CliError::Io(path.to_owned(), error))?;
+    let nested = absolute.join("crates").join("blazingly");
+    let candidate = if nested.join("Cargo.toml").is_file() {
+        nested
+    } else {
+        absolute
+    };
+    let manifest = candidate.join("Cargo.toml");
+    let text =
+        fs::read_to_string(&manifest).map_err(|error| CliError::Io(manifest.clone(), error))?;
+    if !text.contains("name = \"blazingly\"") {
+        return Err(CliError::Usage(format!(
+            "`--framework-path` does not reach the `blazingly` crate: {} declares no `name = \"blazingly\"`",
+            manifest.display()
+        )));
+    }
+    Ok(candidate)
+}
+
+/// A path in a Cargo manifest string; forward slashes work on every platform
+/// and need no TOML escaping.
+fn toml_path_text(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+fn project_files(name: &str, dependency: &str, git_dependency: bool) -> BTreeMap<String, String> {
+    let config = blazingly_docs::ScaffoldConfig::new(name)
+        .with_dependency(dependency)
+        .without_kubernetes();
+    let mut files = blazingly_docs::scaffold(&config).into_files();
+    if git_dependency && let Some(cargo_toml) = files.get_mut("Cargo.toml") {
+        *cargo_toml = cargo_toml.replacen(
+            "\nblazingly = ",
+            &format!("\n{GIT_DEPENDENCY_NOTE}blazingly = "),
+            1,
+        );
+    }
+    files.insert(".gitignore".to_owned(), "/target\n".to_owned());
+    files
+}
+
 struct Session<'a> {
     metadata: &'a CargoMetadata,
     config: &'a FileConfig,
@@ -728,6 +901,50 @@ impl Session<'_> {
             .status()
             .map_err(|error| CliError::Process("could not run application", error))?;
         Ok(exit_code(status.code()))
+    }
+
+    /// The application run for `openapi` and `routes`: the binary prints one
+    /// introspection document during server construction and exits.
+    fn emit_command(&self, binary: &Path, mode: &str) -> Command {
+        let mut command = self.app_command(binary);
+        command
+            .env(EMIT_VARIABLE, mode)
+            .env(ADDRESS_VARIABLE, EMIT_ADDRESS)
+            .env(WORKERS_VARIABLE, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        command
+    }
+
+    /// Builds the debug profile so `openapi`/`routes` share the `dev` build
+    /// cache, runs the binary as an emit run, and forwards its stdout.
+    fn emit(&self, mode: &str) -> Result<u8, CliError> {
+        let outcome = self.build(false)?;
+        if !outcome.succeeded() {
+            return Ok(outcome.code);
+        }
+        let binary = self.executable(outcome, false);
+        let output = self
+            .emit_command(&binary, mode)
+            .output()
+            .map_err(|error| CliError::Process("could not run application", error))?;
+        if !output.status.success() {
+            return Ok(exit_code(output.status.code()));
+        }
+        if let Some(path) = self.options.out.as_deref() {
+            fs::write(path, &output.stdout)
+                .map_err(|error| CliError::Io(path.to_owned(), error))?;
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&output.stdout)
+                .and_then(|()| stdout.flush())
+                .map_err(|error| {
+                    CliError::Process("could not forward application output", error)
+                })?;
+        }
+        Ok(0)
     }
 
     fn spawn(&self, binary: &Path) -> Result<Child, CliError> {
@@ -1362,6 +1579,105 @@ mod tests {
         assert!(variables.iter().any(|(key, value)| {
             key == ADDRESS_VARIABLE && value.as_deref() == Some("127.0.0.1:8000")
         }));
+    }
+
+    #[test]
+    fn emit_runs_set_the_introspection_variables() {
+        let metadata = metadata();
+        let config = FileConfig::default();
+        let options =
+            CliOptions::parse(&arguments(&["--address", "127.0.0.1:8000"])).expect("arguments");
+        let session = Session {
+            metadata: &metadata,
+            config: &config,
+            options: &options,
+            app: application(TargetKind::Bin),
+        };
+        let command = session.emit_command(Path::new("/workspace/target/debug/server"), "openapi");
+        let variables = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let value_of = |name: &str| {
+            variables
+                .iter()
+                .find(|(key, _)| key == name)
+                .and_then(|(_, value)| value.clone())
+        };
+        assert_eq!(value_of(EMIT_VARIABLE).as_deref(), Some("openapi"));
+        // An emit run must never race a serving instance for the listen port.
+        assert_eq!(value_of(ADDRESS_VARIABLE).as_deref(), Some(EMIT_ADDRESS));
+        assert_eq!(value_of(WORKERS_VARIABLE).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn unpublished_framework_defaults_to_the_git_dependency() {
+        let dependency = framework_dependency(None).expect("git dependency");
+        assert!(dependency.contains(&format!("git = \"{FRAMEWORK_GIT_URL}\"")));
+        assert!(dependency.contains("features = [\"native\"]"));
+    }
+
+    #[test]
+    fn framework_path_resolves_the_workspace_checkout() {
+        let root =
+            env::temp_dir().join(format!("cargo-blazingly-framework-{}", std::process::id()));
+        let crate_directory = root.join("crates").join("blazingly");
+        fs::create_dir_all(&crate_directory).expect("temporary directory");
+        fs::write(
+            crate_directory.join("Cargo.toml"),
+            "[package]\nname = \"blazingly\"\n",
+        )
+        .expect("manifest");
+        let dependency = framework_dependency(Some(&root)).expect("path dependency");
+        assert!(dependency.starts_with("{ path = \""));
+        assert!(dependency.contains("crates/blazingly"));
+        assert!(dependency.contains("features = [\"native\"]"));
+        assert!(!dependency.contains('\\'));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn generated_project_annotates_the_git_dependency() {
+        let git = framework_dependency(None).expect("git dependency");
+        let files = project_files("demo", &git, true);
+        let cargo_toml = files.get("Cargo.toml").expect("manifest");
+        assert!(cargo_toml.contains("name = \"demo\""));
+        assert!(cargo_toml.contains(GIT_DEPENDENCY_NOTE));
+        assert!(cargo_toml.contains(&format!("blazingly = {git}")));
+        assert!(
+            files.get("src/main.rs").is_some_and(|main| {
+                main.contains("MulticoreServer") && main.contains("#[get(")
+            })
+        );
+        assert!(
+            files
+                .get(".gitignore")
+                .is_some_and(|ignore| ignore.contains("/target"))
+        );
+    }
+
+    #[test]
+    fn path_projects_keep_the_dependency_unannotated() {
+        let files = project_files("demo", "{ path = \"../blazingly\" }", false);
+        let cargo_toml = files.get("Cargo.toml").expect("manifest");
+        assert!(!cargo_toml.contains(GIT_DEPENDENCY_NOTE));
+        assert!(cargo_toml.contains("blazingly = { path = \"../blazingly\" }"));
+    }
+
+    #[test]
+    fn package_names_reject_cargo_incompatible_input() {
+        assert!(validate_package_name("api").is_ok());
+        assert!(validate_package_name("users_api-2").is_ok());
+        assert!(validate_package_name("_internal").is_ok());
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("1api").is_err());
+        assert!(validate_package_name("api server").is_err());
+        assert!(validate_package_name("api/server").is_err());
     }
 
     #[test]

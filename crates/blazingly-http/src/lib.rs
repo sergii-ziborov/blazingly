@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use blazingly_core::{
-    BackgroundTask, BackgroundTaskError, BodyStreamError, HttpMethod, HttpUpgrade, InputSource,
-    OperationDescriptor, ResponseHeader, SecuritySchemeDescriptor, StreamingBody,
+    AppDefinition, BackgroundTask, BackgroundTaskError, BodyStreamError, HttpMethod, HttpUpgrade,
+    InputSource, OperationDescriptor, ResponseHeader, SecuritySchemeDescriptor, StreamingBody,
 };
 use blazingly_executor::{
     DependencyError, ExecutableApp, ExecutionOutcome, FromInvocation,
@@ -23,6 +23,10 @@ use std::rc::Rc;
 use std::str::Utf8Error;
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Environment variable that turns server construction into a print-and-exit
+/// introspection run. See [`HttpApp::new`] for the contract.
+pub const EMIT_VARIABLE: &str = "BLAZINGLY_EMIT";
 
 /// A runtime-neutral HTTP request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1020,8 +1024,28 @@ pub struct HttpApp {
 }
 
 impl HttpApp {
+    /// Compiles the router for an owned application.
+    ///
+    /// # Introspection contract
+    ///
+    /// When the [`EMIT_VARIABLE`] environment variable (`BLAZINGLY_EMIT`) is
+    /// set to `openapi` or `routes`, construction prints the `OpenAPI`
+    /// document or the operation table to stdout and terminates the process
+    /// with exit code 0 instead of returning, before any socket is served.
+    /// Every native serving path constructs an `HttpApp`, so
+    /// `cargo blazingly openapi` and `cargo blazingly routes` run an
+    /// unmodified application binary as a printer through this seam. The exit
+    /// inside a constructor is deliberate and is part of the CLI contract.
+    ///
+    /// The document is rendered with [`OpenApiConfig::default`]; an
+    /// application's own [`HttpApp::with_openapi`] configuration is not known
+    /// at construction time. Any other non-empty value terminates with exit
+    /// code 2, so a typo never falls through to serving. An unset or empty
+    /// variable leaves construction unaffected, and [`TestApp`] never
+    /// consults the variable.
     #[must_use]
     pub fn new(app: ExecutableApp) -> Self {
+        emit_and_exit_if_requested(&app);
         let router = Router::new(&app);
         Self {
             app,
@@ -1184,6 +1208,77 @@ impl HttpApp {
             .ok()
             .and_then(|route| route.body_source())
     }
+}
+
+/// Prints the requested introspection output and terminates the process when
+/// [`EMIT_VARIABLE`] is set. Runs on every [`HttpApp::new`] call; a normal
+/// serving process returns immediately from the unset-variable check.
+///
+/// A multicore server constructs one `HttpApp` per worker, so the emission is
+/// guarded by a process-wide [`std::sync::Once`]: exactly one thread prints,
+/// every caller exits.
+fn emit_and_exit_if_requested(app: &ExecutableApp) {
+    static EMITTED: std::sync::Once = std::sync::Once::new();
+    let Some(mode) = std::env::var_os(EMIT_VARIABLE) else {
+        return;
+    };
+    if mode.is_empty() {
+        return;
+    }
+    let mut code = 0;
+    EMITTED.call_once(|| code = emit(app, &mode.to_string_lossy()));
+    std::process::exit(code);
+}
+
+/// Writes one introspection document to stdout and returns the process exit
+/// code: 0 on success, 1 on a serialization or write failure, 2 on an
+/// unrecognized mode.
+fn emit(app: &ExecutableApp, mode: &str) -> i32 {
+    use std::io::Write as _;
+    let output = match mode {
+        "openapi" => match openapi_document_text(app.definition()) {
+            Ok(document) => document,
+            Err(error) => {
+                eprintln!("error: the OpenAPI document could not be serialized: {error}");
+                return 1;
+            }
+        },
+        "routes" => routes_table_text(app.definition()),
+        unknown => {
+            eprintln!("error: {EMIT_VARIABLE} must be `openapi` or `routes`, not `{unknown}`");
+            return 2;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(output.as_bytes()).is_err() || stdout.flush().is_err() {
+        return 1;
+    }
+    0
+}
+
+/// The pretty-printed `OpenAPI` document emitted for `BLAZINGLY_EMIT=openapi`.
+fn openapi_document_text(definition: &AppDefinition) -> Result<String, blazingly_json::Error> {
+    let document = blazingly_openapi::to_value(definition);
+    let mut text = blazingly_json::to_string_pretty(&document)?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// The tab-separated operation table emitted for `BLAZINGLY_EMIT=routes`.
+fn routes_table_text(definition: &AppDefinition) -> String {
+    use std::fmt::Write as _;
+    let mut table = String::from("METHOD\tPATH\tOPERATION\tSUMMARY\n");
+    for operation in definition.operations() {
+        let _ = writeln!(
+            table,
+            "{}\t{}\t{}\t{}",
+            operation.http.method.as_str(),
+            operation.http.path,
+            operation.contract.id.as_str(),
+            operation.contract.summary
+        );
+    }
+    table
 }
 
 /// An in-memory borrowed HTTP adapter over the shared executable operation graph.
@@ -2686,6 +2781,33 @@ mod tests {
         let owned = HttpApp::new(executable).with_unverified_security_schemes(true);
         let response = future::block_on(owned.call(Request::get("/secure")));
         assert_eq!(response.status(), 200);
+    }
+
+    #[test]
+    fn routes_emission_lists_every_operation() {
+        let executable = executable();
+        let table = super::routes_table_text(executable.definition());
+        assert!(table.starts_with("METHOD\tPATH\tOPERATION\tSUMMARY\n"));
+        assert!(table.contains("GET\t/secure\thttp.secure\tReports the normalized connection\n"));
+        assert!(table.contains("GET\t/plain\thttp.plain\tReports the normalized connection\n"));
+    }
+
+    #[test]
+    fn openapi_emission_serializes_the_default_document() {
+        let executable = executable();
+        let text = super::openapi_document_text(executable.definition())
+            .expect("the OpenAPI document serializes");
+        assert!(text.ends_with('\n'));
+        let document: Value = blazingly_json::from_str(&text).expect("emitted JSON parses");
+        assert_eq!(document["openapi"].as_str(), Some("3.1.0"));
+        assert_eq!(
+            document["paths"]["/secure"]["get"]["operationId"].as_str(),
+            Some("http.secure")
+        );
+        assert_eq!(
+            document["paths"]["/plain"]["get"]["operationId"].as_str(),
+            Some("http.plain")
+        );
     }
 
     #[test]

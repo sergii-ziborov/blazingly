@@ -12,6 +12,7 @@ categories.workspace = true
 publish.workspace = true
 
 [dependencies]
+blazingly-docs.workspace = true
 blazingly-json.workspace = true
 ctrlc.workspace = true
 serde = { workspace = true, features = ["std"] }
