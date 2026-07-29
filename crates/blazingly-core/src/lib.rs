@@ -19,6 +19,12 @@ pub use blazingly_contract::{
     SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationErrors, ValidationRule,
 };
 
+// Hidden rather than documented: the module exists so the OpenAPI and MCP
+// projections share one traversal, and hiding it keeps the dialect trait free
+// to grow required methods without a major version bump.
+#[doc(hidden)]
+pub mod schema;
+
 // ---------------------------------------------------------------------------
 // Response body sizing
 // ---------------------------------------------------------------------------

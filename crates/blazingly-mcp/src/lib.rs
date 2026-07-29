@@ -16,9 +16,10 @@ pub use registry::{
     PromptRole, RegistryError, ResourceContent, ResourceDescriptor,
 };
 
+use blazingly_core::schema::{self, SchemaDialect};
 use blazingly_core::{
-    AppDefinition, Confirmation, FieldMetadata, InputDescriptor, InputSource, ModelDescriptor,
-    OperationDescriptor, OperationRisk, OutputExposure, SchemaKind, TypeDescriptor, ValidationRule,
+    AppDefinition, Confirmation, InputDescriptor, InputSource, ModelDescriptor,
+    OperationDescriptor, OperationRisk, OutputExposure, TypeDescriptor, ValidationRule,
 };
 use blazingly_executor::{ExecutableApp, ExecutionOutcome};
 use blazingly_json::Map;
@@ -392,152 +393,38 @@ const fn input_source_name(source: InputSource) -> &'static str {
     }
 }
 
-fn schema_value(descriptor: &TypeDescriptor) -> Value {
-    if let Some(model) = &descriptor.model {
-        return model_schema(model);
-    }
-
-    let mut value = match (&descriptor.schema, &descriptor.items) {
-        (SchemaKind::Array(_), Some(items)) => {
-            json!({ "type": "array", "items": schema_value(items) })
-        }
-        _ => schema_kind_value(&descriptor.schema),
-    };
-    apply_known_string_format(&mut value, &descriptor.rust_name);
-    value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
-    value
-}
-
-fn apply_known_string_format(schema: &mut Value, rust_name: &str) {
-    let format = match rust_name {
-        "Uuid" => "uuid",
-        "Url" => "uri",
-        "IpAddress" => "ip",
-        "Date" => "date",
-        "DateTime" => "date-time",
-        "Decimal" => "decimal",
-        _ => return,
-    };
-    schema["format"] = Value::String(format.to_owned());
-}
-
-fn schema_kind_value(schema: &SchemaKind) -> Value {
-    match schema {
-        SchemaKind::String => json!({ "type": "string" }),
-        SchemaKind::Binary => json!({ "type": "string", "contentEncoding": "base64" }),
-        SchemaKind::Integer => json!({ "type": "integer" }),
-        SchemaKind::Number => json!({ "type": "number" }),
-        SchemaKind::Boolean => json!({ "type": "boolean" }),
-        SchemaKind::Array(item) => {
-            json!({ "type": "array", "items": schema_kind_value(item) })
-        }
-        SchemaKind::Object => json!({ "type": "object" }),
-        SchemaKind::Any => json!({}),
-    }
-}
-
-fn model_schema(model: &ModelDescriptor) -> Value {
-    let mut properties = Map::new();
-    let mut required = Vec::new();
-
-    for field in &model.fields {
-        let mut schema = schema_value(&field.ty);
-        apply_validation(&mut schema, &field.validation);
-        properties.insert(field.name.clone(), schema);
-        if field.required {
-            required.push(field.name.clone());
-        }
-    }
-
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    })
-}
-
-/// Projects a recovered default, enumeration, or nullability marker.
+/// JSON Schema 2020-12 dialect for MCP tool declarations.
 ///
-/// MCP tool schemas follow JSON Schema 2020-12, which has no `nullable`
-/// keyword: a value that also accepts `null` widens its own `type` into a
-/// union instead. This projection inlines every model schema, so unlike the
-/// `OpenAPI` document there is no `$ref` node to wrap in an `anyOf`.
-fn apply_field_metadata(schema: &mut Value, metadata: &FieldMetadata) {
-    match metadata {
-        FieldMetadata::Default(value) => schema["default"] = value.clone(),
-        FieldMetadata::Enumeration(values) => {
-            schema["enum"] = Value::Array(
-                values
-                    .iter()
-                    .map(|value| Value::String(value.clone()))
-                    .collect(),
-            );
-        }
-        FieldMetadata::Nullable => widen_with_null(schema),
+/// A tool schema travels alone — there is no components section to point
+/// into — so every model is inlined in place, and a binary payload is asked
+/// for as base64 text because tool arguments arrive inside a JSON document.
+struct McpDialect;
+
+impl SchemaDialect for McpDialect {
+    fn model_node(&self, _descriptor: &TypeDescriptor, model: &ModelDescriptor) -> Value {
+        schema::model_schema(self, model)
+    }
+
+    fn binary_node(&self) -> Value {
+        json!({ "type": "string", "contentEncoding": "base64" })
+    }
+
+    /// Projects a declarative constraint recovered by the validation crate,
+    /// so an agent reads the real bound instead of an opaque string.
+    #[cfg(feature = "validation")]
+    fn project_custom_validator(&self, schema: &mut Value, validator: &str) -> bool {
+        blazingly_validation::Constraint::parse(validator)
+            .map(|constraint| constraint.apply_json_schema(schema))
+            .is_some()
     }
 }
 
-fn widen_with_null(schema: &mut Value) {
-    match schema.get("type").cloned() {
-        Some(Value::String(name)) => schema["type"] = json!([name, "null"]),
-        Some(Value::Array(mut names)) => {
-            if !names.iter().any(|name| name.as_str() == Some("null")) {
-                names.push(Value::String("null".to_owned()));
-                schema["type"] = Value::Array(names);
-            }
-        }
-        // A schema with no declared type constrains nothing, so it already
-        // accepts `null`.
-        Some(_) | None => {}
-    }
+fn schema_value(descriptor: &TypeDescriptor) -> Value {
+    schema::schema_value(&McpDialect, descriptor)
 }
 
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
-    for rule in validation {
-        match rule {
-            ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
-            ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
-            ValidationRule::Email => schema["format"] = json!("email"),
-            ValidationRule::Alias(alias) => {
-                let aliases = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-aliases")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                aliases
-                    .as_array_mut()
-                    .expect("alias extension must be an array")
-                    .push(Value::String(alias.clone()));
-            }
-            ValidationRule::Custom(validator) => {
-                // Declarative constraints are encoded as `keyword=value` inside
-                // `Custom`; project the ones that map to a JSON Schema keyword
-                // so an agent reads the real bound, not an opaque string.
-                if let Some(metadata) = FieldMetadata::parse(validator) {
-                    apply_field_metadata(schema, &metadata);
-                    continue;
-                }
-                #[cfg(feature = "validation")]
-                if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
-                    constraint.apply_json_schema(schema);
-                    continue;
-                }
-                let validators = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-validators")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                validators
-                    .as_array_mut()
-                    .expect("validator extension must be an array")
-                    .push(Value::String(validator.clone()));
-            }
-            ValidationRule::Nested => {
-                schema["x-blazingly-nested-validation"] = Value::Bool(true);
-            }
-        }
-    }
+    schema::apply_validation(&McpDialect, schema, validation);
 }
 
 #[cfg(test)]

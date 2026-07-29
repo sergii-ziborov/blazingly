@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
+use blazingly_core::schema::{self, SchemaDialect};
 use blazingly_core::{
-    AppDefinition, FieldMetadata, InputDescriptor, InputSource, ModelDescriptor,
-    OperationDescriptor, SchemaKind, SecurityLocation, SecuritySchemeDescriptor,
-    SecuritySchemeKind, TypeDescriptor, ValidationRule,
+    AppDefinition, InputDescriptor, InputSource, ModelDescriptor, OperationDescriptor, SchemaKind,
+    SecurityLocation, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationRule,
 };
 use blazingly_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -740,51 +740,37 @@ fn request_media_type(source: InputSource) -> &'static str {
     }
 }
 
-fn schema_value(descriptor: &TypeDescriptor) -> Value {
-    if let Some(model) = &descriptor.model {
-        return json!({
+/// JSON Schema dialect for the `OpenAPI` 3.1 document.
+///
+/// Each model is written once under `#/components/schemas` and referenced in
+/// place, and a binary payload keeps the `format: "binary"` spelling the
+/// `OpenAPI` ecosystem expects.
+struct OpenApiDialect;
+
+impl SchemaDialect for OpenApiDialect {
+    fn model_node(&self, descriptor: &TypeDescriptor, model: &ModelDescriptor) -> Value {
+        json!({
             "$ref": format!("#/components/schemas/{}", model.name),
             "x-rust-type": descriptor.rust_name
-        });
+        })
     }
 
-    let mut value = match (&descriptor.schema, &descriptor.items) {
-        (SchemaKind::Array(_), Some(items)) => {
-            json!({ "type": "array", "items": schema_value(items) })
-        }
-        _ => schema_kind_value(&descriptor.schema),
-    };
-    apply_known_string_format(&mut value, &descriptor.rust_name);
-    value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
-    value
-}
-
-fn apply_known_string_format(schema: &mut Value, rust_name: &str) {
-    let format = match rust_name {
-        "Uuid" => "uuid",
-        "Url" => "uri",
-        "IpAddress" => "ip",
-        "Date" => "date",
-        "DateTime" => "date-time",
-        "Decimal" => "decimal",
-        _ => return,
-    };
-    schema["format"] = Value::String(format.to_owned());
-}
-
-fn schema_kind_value(schema: &SchemaKind) -> Value {
-    match schema {
-        SchemaKind::String => json!({ "type": "string" }),
-        SchemaKind::Binary => json!({ "type": "string", "format": "binary" }),
-        SchemaKind::Integer => json!({ "type": "integer" }),
-        SchemaKind::Number => json!({ "type": "number" }),
-        SchemaKind::Boolean => json!({ "type": "boolean" }),
-        SchemaKind::Array(item) => {
-            json!({ "type": "array", "items": schema_kind_value(item) })
-        }
-        SchemaKind::Object => json!({ "type": "object" }),
-        SchemaKind::Any => json!({}),
+    fn binary_node(&self) -> Value {
+        json!({ "type": "string", "format": "binary" })
     }
+
+    /// Projects a declarative constraint recovered by the validation crate,
+    /// so a reader sees the real bound instead of an opaque string.
+    #[cfg(feature = "validation")]
+    fn project_custom_validator(&self, schema: &mut Value, validator: &str) -> bool {
+        blazingly_validation::Constraint::parse(validator)
+            .map(|constraint| constraint.apply_json_schema(schema))
+            .is_some()
+    }
+}
+
+fn schema_value(descriptor: &TypeDescriptor) -> Value {
+    schema::schema_value(&OpenApiDialect, descriptor)
 }
 
 fn collect_model(descriptor: &TypeDescriptor, schemas: &mut Map<String, Value>) {
@@ -872,113 +858,11 @@ fn security_scheme_value(scheme: &SecuritySchemeDescriptor) -> Value {
 }
 
 fn model_schema(model: &ModelDescriptor) -> Value {
-    let mut properties = Map::new();
-    let mut required = Vec::new();
-
-    for field in &model.fields {
-        let mut schema = schema_value(&field.ty);
-        apply_validation(&mut schema, &field.validation);
-        properties.insert(field.name.clone(), schema);
-        if field.required {
-            required.push(field.name.clone());
-        }
-    }
-
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    })
-}
-
-/// Projects a recovered default, enumeration, or nullability marker.
-///
-/// `OpenAPI` 3.1 follows JSON Schema 2020-12, which dropped the `nullable`
-/// keyword: a value that also accepts `null` widens its own `type` into a union
-/// instead, and a reference is wrapped in an `anyOf` because a `$ref` node has
-/// no type of its own to widen.
-fn apply_field_metadata(schema: &mut Value, metadata: &FieldMetadata) {
-    match metadata {
-        FieldMetadata::Default(value) => schema["default"] = value.clone(),
-        FieldMetadata::Enumeration(values) => {
-            schema["enum"] = Value::Array(
-                values
-                    .iter()
-                    .map(|value| Value::String(value.clone()))
-                    .collect(),
-            );
-        }
-        FieldMetadata::Nullable => widen_with_null(schema),
-    }
-}
-
-fn widen_with_null(schema: &mut Value) {
-    let Some(declared) = schema.as_object().map(|object| object.get("type").cloned()) else {
-        return;
-    };
-    match declared {
-        Some(Value::String(name)) => schema["type"] = json!([name, "null"]),
-        Some(Value::Array(mut names)) => {
-            if !names.iter().any(|name| name.as_str() == Some("null")) {
-                names.push(Value::String("null".to_owned()));
-                schema["type"] = Value::Array(names);
-            }
-        }
-        Some(_) | None => {
-            if schema.get("$ref").is_some() {
-                let referenced = std::mem::replace(schema, Value::Null);
-                *schema = json!({ "anyOf": [referenced, { "type": "null" }] });
-            }
-        }
-    }
+    schema::model_schema(&OpenApiDialect, model)
 }
 
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
-    for rule in validation {
-        match rule {
-            ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
-            ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
-            ValidationRule::Email => schema["format"] = json!("email"),
-            ValidationRule::Alias(alias) => {
-                let aliases = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-aliases")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                aliases
-                    .as_array_mut()
-                    .expect("alias extension must be an array")
-                    .push(Value::String(alias.clone()));
-            }
-            ValidationRule::Custom(validator) => {
-                // Declarative constraints are encoded as `keyword=value` inside
-                // `Custom`; project the ones that map to a JSON Schema keyword
-                // instead of leaving them as opaque validator strings.
-                if let Some(metadata) = FieldMetadata::parse(validator) {
-                    apply_field_metadata(schema, &metadata);
-                    continue;
-                }
-                #[cfg(feature = "validation")]
-                if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
-                    constraint.apply_json_schema(schema);
-                    continue;
-                }
-                let validators = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-validators")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                validators
-                    .as_array_mut()
-                    .expect("validator extension must be an array")
-                    .push(Value::String(validator.clone()));
-            }
-            ValidationRule::Nested => {
-                schema["x-blazingly-nested-validation"] = Value::Bool(true);
-            }
-        }
-    }
+    schema::apply_validation(&OpenApiDialect, schema, validation);
 }
 
 #[cfg(test)]

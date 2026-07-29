@@ -12,7 +12,12 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- The OpenAPI and MCP projections now share one schema traversal
+  (`blazingly-core`'s hidden `schema` module) instead of two copied ones, so a
+  keyword one document learns can no longer silently go missing from the
+  other. Both generated documents are byte-for-byte unchanged.
 
 ## [0.1.0] - 2026-07-29
 
