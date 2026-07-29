@@ -79,6 +79,16 @@ jobs:
             blazingly
           "
           for crate in $order; do
+            # A version already on crates.io needs no verify build: ask the
+            # registry first so a resumed release skips in seconds, not
+            # minutes per crate.
+            version="$(cargo metadata --format-version 1 --no-deps \
+              | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
+            if curl -sf "https://crates.io/api/v1/crates/$crate/$version" \
+              | jq -e '.version.num' >/dev/null 2>&1; then
+              echo "SKIP $crate $version: already on crates.io"
+              continue
+            fi
             attempt=0
             while true; do
               attempt=$((attempt + 1))

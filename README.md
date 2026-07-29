@@ -24,26 +24,19 @@ framework.
 
 ## Publication status
 
-Blazingly is **not yet published to crates.io**. `publish` in
-`[workspace.package]` is `false` and the release gate for flipping it is in
-[stability and SemVer](docs/stability.md). Until then, depend on it from Git:
-
-```toml
-[dependencies]
-blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }
-```
-
-Cargo checks out the three submodules itself, so no separate clone step is
-needed. The same applies to the CLI:
+**Published.** Blazingly `0.1.0` is on crates.io; the release gate that was
+walked before flipping `publish` is in [stability and SemVer](docs/stability.md).
 
 ```console
-cargo install --git https://github.com/sergii-ziborov/blazingly cargo-blazingly
+cargo add blazingly
+cargo install cargo-blazingly
 ```
 
-Of the three submodule crates, only
-[`blazingly-json`](https://github.com/sergii-ziborov/blazingly-json) is on
-crates.io (`0.1.0`); `blazingly-contract` and `blazingly-wire` release from
-their own repositories and are not published yet. Release history is in
+The workspace MSRV is Rust 1.88. The three submodule crates
+(`blazingly-contract`, `blazingly-wire`, `blazingly-json`) publish from their
+own repositories. To track unreleased work on `main`, use a Git dependency
+instead: `blazingly = { git = "https://github.com/sergii-ziborov/blazingly" }`
+— Cargo checks the submodules out itself. Release history is in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Current milestone

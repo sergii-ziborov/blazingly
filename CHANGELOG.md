@@ -14,6 +14,19 @@ pinned submodule revision is recorded as a single entry.
 
 Nothing yet.
 
+## [0.1.1] - 2026-07-29
+
+No Rust API changes.
+
+- Every first-party crate now ships its own README describing what the
+  crate is and whether it is usable without the facade, replacing the
+  workspace README that all crates.io pages previously shared. Eleven
+  crates reached crates.io as 0.1.0 before this landed; their pages are
+  corrected by this version, because a published version's files are
+  immutable.
+- The release workflow asks the registry before publishing, so a
+  resumed release skips already-published versions in seconds.
+
 ## [0.1.0] - 2026-07-29
 
 First release. Everything below is new; there is no prior published version to
