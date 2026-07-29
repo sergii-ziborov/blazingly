@@ -1,0 +1,115 @@
+name: Release
+
+# Publishes the workspace to crates.io when a version tag lands. The tag is
+# the release decision; everything else here is verification and ordering.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # The tag must name the commit it publishes: re-run the primary gate at the
+  # tagged revision and refuse a tag that disagrees with the workspace version.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+      - name: tag matches workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "blazingly") | .version')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match workspace version $version" >&2
+            exit 1
+          fi
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+
+  # Dependency order, computed from cargo metadata over normal+build edges.
+  # Submodule crates publish from this checkout too; a version that is already
+  # on crates.io is skipped, which also makes a re-run of a half-finished
+  # release safe. crates.io throttles new crates, so the loop sleeps and
+  # retries rather than failing the release on a rate limit.
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: publish in dependency order
+        run: |
+          order="
+            blazingly-contract
+            blazingly-deploy
+            blazingly-di
+            blazingly-json
+            blazingly-macros
+            blazingly-queue
+            blazingly-wire
+            blazingly-core
+            blazingly-validation
+            blazingly-docs
+            blazingly-executor
+            blazingly-mcp
+            blazingly-mcp-stdio
+            blazingly-openapi
+            blazingly-realtime
+            blazingly-templates
+            cargo-blazingly
+            blazingly-database
+            blazingly-http
+            blazingly-middleware
+            blazingly-native
+            blazingly-observability
+            blazingly-security
+            blazingly
+          "
+          for crate in $order; do
+            attempt=0
+            while true; do
+              attempt=$((attempt + 1))
+              echo "::group::publish $crate (attempt $attempt)"
+              set +e
+              output="$(cargo publish -p "$crate" 2>&1)"
+              code=$?
+              set -e
+              echo "$output"
+              echo "::endgroup::"
+              if [ $code -eq 0 ]; then
+                echo "OK $crate"
+                break
+              fi
+              if grep -qiE "already uploaded|already exists" <<<"$output"; then
+                echo "SKIP $crate: this version is already on crates.io"
+                break
+              fi
+              if grep -qiE "429|rate limit|too many" <<<"$output"; then
+                echo "rate limited on $crate; sleeping 630s"
+                sleep 630
+                continue
+              fi
+              if grep -qiE "no matching package|failed to select a version" <<<"$output" \
+                && [ $attempt -le 5 ]; then
+                echo "index propagation lag on $crate; sleeping 60s"
+                sleep 60
+                continue
+              fi
+              echo "FATAL: $crate failed for a reason retries cannot fix" >&2
+              exit 1
+            done
+          done
+          echo "release complete: every crate published or already present"
