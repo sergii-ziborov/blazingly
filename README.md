@@ -352,10 +352,18 @@ enters the framework tree:
   SCRAM-SHA-256, binary parameter binding, all four isolation levels,
   SQLSTATE error classification, advisory-locked migrations; no
   `postgres`/`tokio-postgres` dependency and no async runtime in its tree;
-- `blazingly-redis`: Redis Streams adapter for the queue seam with RESP
-  implemented directly — consumer groups, at-least-once delivery with
-  redelivery of dead consumers' work, delayed nacks via a sorted set, and
-  dead-lettering with a bounded attempt count;
+- `blazingly-redis`: Redis backends for three distributed seams with RESP
+  implemented directly — the Streams queue (consumer groups, at-least-once
+  delivery with redelivery of dead consumers' work, dead-lettering with a
+  bounded attempt count), a rate-limit store whose check-and-consume is one
+  Lua script so two pods cannot both pass on the last token, and a session
+  store with server-enforced expiry;
+- `blazingly-nats`: NATS JetStream adapter for the queue seam with the core
+  protocol and a JetStream JSON layer implemented directly — durable pull
+  consumers, the server's own delivery count as the attempt number,
+  nack-with-delay, publish dedup via `Nats-Msg-Id`;
+- `blazingly-examples`: a gallery of six complete runnable applications,
+  from a 15-minute CRUD to MCP tools over stdio and Streamable HTTP;
 - `blazingly-benchmarks`: external conformance and performance comparisons.
 
 The framework workspace contains those three submodule crates plus:

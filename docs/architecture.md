@@ -206,9 +206,11 @@ both transports invoke the same operation semantics.
     ecosystem surface. Three production adapters exist in their own
     repositories — `blazingly-sqlite` and `blazingly-postgres` for the
     database seam (the latter implementing the PostgreSQL wire protocol
-    directly, with no async runtime in its tree) and `blazingly-redis` for
-    the queue seam on Redis Streams; see `docs/ecosystem.md`. NATS,
-    RabbitMQ, Kafka, and SQS adapters remain follow-up packages.
+    directly, with no async runtime in its tree), `blazingly-redis` for
+    the queue seam on Redis Streams plus distributed rate-limit and
+    session stores, and `blazingly-nats` for the queue seam on JetStream;
+    see `docs/ecosystem.md`. RabbitMQ, Kafka, and SQS adapters remain
+    follow-up packages.
 14. Fuzz targets, Miri, AddressSanitizer, dependency audit, security reporting,
     and SemVer checks/policy: configured. AddressSanitizer now covers
     `blazingly-native`; Miri cannot, because Compio reaches io_uring and IOCP

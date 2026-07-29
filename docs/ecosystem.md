@@ -70,6 +70,23 @@ live backend:
   scripts, so nothing is silently lost, and duplicates remain possible in
   the windows the README names.
 
+- `blazingly-nats` implements the queue seam on NATS JetStream, with the
+  core NATS protocol and a dependency-free JSON layer for the JetStream API
+  written directly. One topic maps to one work-queue stream plus a durable
+  pull consumer; the attempt number is JetStream's own `num_delivered`, so
+  no stored counter can drift; nack-with-delay is `-NAK {"delay": ns}`;
+  publish dedup forwards the adapter's message-id header as `Nats-Msg-Id`.
+  Dead-lettering is publish-then-terminate, and the crash window between
+  the two operations is documented rather than hidden — JetStream has no
+  server-side scripting to close it.
+- `blazingly-redis` additionally provides distributed stores for two more
+  seams (feature-gated): a `RateLimitStore` whose token-bucket
+  check-and-consume runs as a single Lua script on the server's own clock,
+  so multiple pods share one bucket and a skewed pod cannot mint tokens,
+  and a `SessionStore` with absolute server-enforced expiry. Both verified
+  end-to-end through the framework's real middleware across two simulated
+  pods.
+
 The seam crates in this workspace define and test the stable contracts; the
-adapter repositories carry the vendor code. NATS, RabbitMQ, Kafka, and SQS
+adapter repositories carry the vendor code. RabbitMQ, Kafka, and SQS
 adapters remain follow-up packages of the same shape.
