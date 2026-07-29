@@ -17,7 +17,7 @@ pub use registry::{
 };
 
 use blazingly_core::{
-    AppDefinition, Confirmation, InputDescriptor, InputSource, ModelDescriptor,
+    AppDefinition, Confirmation, FieldMetadata, InputDescriptor, InputSource, ModelDescriptor,
     OperationDescriptor, OperationRisk, OutputExposure, SchemaKind, TypeDescriptor, ValidationRule,
 };
 use blazingly_executor::{ExecutableApp, ExecutionOutcome};
@@ -457,6 +457,42 @@ fn model_schema(model: &ModelDescriptor) -> Value {
     })
 }
 
+/// Projects a recovered default, enumeration, or nullability marker.
+///
+/// MCP tool schemas follow JSON Schema 2020-12, which has no `nullable`
+/// keyword: a value that also accepts `null` widens its own `type` into a
+/// union instead. This projection inlines every model schema, so unlike the
+/// `OpenAPI` document there is no `$ref` node to wrap in an `anyOf`.
+fn apply_field_metadata(schema: &mut Value, metadata: &FieldMetadata) {
+    match metadata {
+        FieldMetadata::Default(value) => schema["default"] = value.clone(),
+        FieldMetadata::Enumeration(values) => {
+            schema["enum"] = Value::Array(
+                values
+                    .iter()
+                    .map(|value| Value::String(value.clone()))
+                    .collect(),
+            );
+        }
+        FieldMetadata::Nullable => widen_with_null(schema),
+    }
+}
+
+fn widen_with_null(schema: &mut Value) {
+    match schema.get("type").cloned() {
+        Some(Value::String(name)) => schema["type"] = json!([name, "null"]),
+        Some(Value::Array(mut names)) => {
+            if !names.iter().any(|name| name.as_str() == Some("null")) {
+                names.push(Value::String("null".to_owned()));
+                schema["type"] = Value::Array(names);
+            }
+        }
+        // A schema with no declared type constrains nothing, so it already
+        // accepts `null`.
+        Some(_) | None => {}
+    }
+}
+
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
     for rule in validation {
         match rule {
@@ -478,6 +514,10 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
                 // Declarative constraints are encoded as `keyword=value` inside
                 // `Custom`; project the ones that map to a JSON Schema keyword
                 // so an agent reads the real bound, not an opaque string.
+                if let Some(metadata) = FieldMetadata::parse(validator) {
+                    apply_field_metadata(schema, &metadata);
+                    continue;
+                }
                 #[cfg(feature = "validation")]
                 if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
                     constraint.apply_json_schema(schema);
@@ -503,8 +543,9 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
 #[cfg(test)]
 mod tests {
     use blazingly_core::{
-        AgentPolicy, App, Confirmation, HttpMethod, McpToolDescriptor, OperationDescriptor,
-        OperationRisk, ResponseDescriptor, TypeDescriptor,
+        AgentPolicy, App, Confirmation, FieldDescriptor, HttpMethod, McpToolDescriptor,
+        ModelDescriptor, OperationDescriptor, OperationRisk, ResponseDescriptor, SchemaKind,
+        TypeDescriptor, ValidationRule,
     };
 
     #[test]
@@ -553,6 +594,105 @@ mod tests {
         assert_eq!(
             discovery["tools"][0]["x-blazingly"]["confirmation"],
             "required"
+        );
+    }
+
+    #[test]
+    fn recovered_metadata_projects_real_json_schema_keywords() {
+        let author = ModelDescriptor::new(
+            "Author",
+            vec![FieldDescriptor::new(
+                "name",
+                true,
+                TypeDescriptor::scalar("String", SchemaKind::String),
+                Vec::new(),
+            )],
+        );
+        let model = ModelDescriptor::new(
+            "SearchArticles",
+            vec![
+                FieldDescriptor::new(
+                    "limit",
+                    false,
+                    TypeDescriptor::scalar("u32", SchemaKind::Integer),
+                    vec![ValidationRule::Custom("default=20".to_owned())],
+                ),
+                FieldDescriptor::new(
+                    "language",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::Custom("enum=uk|ru|en".to_owned())],
+                ),
+                FieldDescriptor::new(
+                    "subtitle",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::Custom("nullable=true".to_owned())],
+                ),
+                FieldDescriptor::new(
+                    "author",
+                    false,
+                    TypeDescriptor::model(author),
+                    vec![ValidationRule::Custom("nullable=true".to_owned())],
+                ),
+                FieldDescriptor::new(
+                    "code",
+                    false,
+                    TypeDescriptor::scalar("String", SchemaKind::String),
+                    vec![ValidationRule::Custom("validate_code".to_owned())],
+                ),
+            ],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/articles/search",
+            "articles.search",
+            "Search articles",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .expect("operation should be valid")
+        .with_mcp_tool(
+            McpToolDescriptor::new("search_articles", "Search articles"),
+            AgentPolicy {
+                risk: OperationRisk::Read,
+                confirmation: Confirmation::Never,
+                idempotent: true,
+            },
+        );
+        let app = App::new()
+            .route(operation)
+            .build()
+            .expect("application should be valid");
+
+        let discovery = super::to_value(&app);
+        let properties = &discovery["tools"][0]["inputSchema"]["properties"];
+
+        assert_eq!(properties["limit"]["default"], blazingly_json::json!(20));
+        assert_eq!(
+            properties["language"]["enum"],
+            blazingly_json::json!(["uk", "ru", "en"])
+        );
+        assert_eq!(
+            properties["subtitle"]["type"],
+            blazingly_json::json!(["string", "null"]),
+            "JSON Schema 2020-12 has no `nullable` keyword"
+        );
+        assert_eq!(
+            properties["author"]["type"],
+            blazingly_json::json!(["object", "null"]),
+            "an inlined model schema widens its own type"
+        );
+        for field in ["limit", "language", "subtitle", "author"] {
+            assert!(
+                properties[field]["x-blazingly-validators"].is_null(),
+                "recovered metadata on `{field}` must not also appear as an opaque validator"
+            );
+        }
+        assert_eq!(
+            properties["code"]["x-blazingly-validators"],
+            blazingly_json::json!(["validate_code"]),
+            "an opaque custom validator stays in the extension array"
         );
     }
 }
