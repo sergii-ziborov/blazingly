@@ -27,7 +27,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -41,36 +41,37 @@ categories = [
     "asynchronous",
     "development-tools",
 ]
-# Release gate for flipping this to `true` (docs/stability.md, "Release
-# process"): CI `test`, `security-audit`, `miri`, `address-sanitizer`,
-# `fuzz-smoke`, `contract-semver`, `feature-combinations`, and `rustdoc` green;
-# `workspace-semver` reviewed; blazingly-contract pinned to a released tag whose
-# version satisfies the [workspace.dependencies] requirement; CHANGELOG.md
-# section promoted from Unreleased.
-publish = false
+# The release gate (docs/stability.md, "Release process") was walked step by
+# step before this flipped: CI `test`, `security-audit`, `miri`,
+# `address-sanitizer`, `fuzz-smoke`, `contract-semver`,
+# `feature-combinations`, and `rustdoc` green on the release commit;
+# `workspace-semver` reviewed (advisory, no baseline before the first
+# release); submodules pinned to released tags satisfying the
+# [workspace.dependencies] requirements; CHANGELOG.md section promoted.
+publish = true
 
 [workspace.dependencies]
 blazingly-contract = { version = "0.3.0", path = "crates/blazingly-contract" }
-blazingly-core = { path = "crates/blazingly-core" }
-blazingly-database = { path = "crates/blazingly-database" }
-blazingly-deploy = { path = "crates/blazingly-deploy" }
-blazingly-docs = { path = "crates/blazingly-docs" }
-blazingly-di = { path = "crates/blazingly-di" }
-blazingly-executor = { path = "crates/blazingly-executor" }
-blazingly-http = { path = "crates/blazingly-http" }
+blazingly-core = { version = "0.1.0", path = "crates/blazingly-core" }
+blazingly-database = { version = "0.1.0", path = "crates/blazingly-database" }
+blazingly-deploy = { version = "0.1.0", path = "crates/blazingly-deploy" }
+blazingly-docs = { version = "0.1.0", path = "crates/blazingly-docs" }
+blazingly-di = { version = "0.1.0", path = "crates/blazingly-di" }
+blazingly-executor = { version = "0.1.0", path = "crates/blazingly-executor" }
+blazingly-http = { version = "0.1.0", path = "crates/blazingly-http" }
 blazingly-json = { version = "0.1.0", path = "crates/blazingly-json" }
-blazingly-macros = { path = "crates/blazingly-macros" }
-blazingly-middleware = { path = "crates/blazingly-middleware" }
-blazingly-mcp = { path = "crates/blazingly-mcp" }
-blazingly-mcp-stdio = { path = "crates/blazingly-mcp-stdio" }
-blazingly-native = { path = "crates/blazingly-native" }
-blazingly-observability = { path = "crates/blazingly-observability" }
-blazingly-openapi = { path = "crates/blazingly-openapi" }
-blazingly-queue = { path = "crates/blazingly-queue" }
-blazingly-realtime = { path = "crates/blazingly-realtime" }
-blazingly-security = { path = "crates/blazingly-security" }
-blazingly-templates = { path = "crates/blazingly-templates" }
-blazingly-validation = { path = "crates/blazingly-validation" }
+blazingly-macros = { version = "0.1.0", path = "crates/blazingly-macros" }
+blazingly-middleware = { version = "0.1.0", path = "crates/blazingly-middleware" }
+blazingly-mcp = { version = "0.1.0", path = "crates/blazingly-mcp" }
+blazingly-mcp-stdio = { version = "0.1.0", path = "crates/blazingly-mcp-stdio" }
+blazingly-native = { version = "0.1.0", path = "crates/blazingly-native" }
+blazingly-observability = { version = "0.1.0", path = "crates/blazingly-observability" }
+blazingly-openapi = { version = "0.1.0", path = "crates/blazingly-openapi" }
+blazingly-queue = { version = "0.1.0", path = "crates/blazingly-queue" }
+blazingly-realtime = { version = "0.1.0", path = "crates/blazingly-realtime" }
+blazingly-security = { version = "0.1.0", path = "crates/blazingly-security" }
+blazingly-templates = { version = "0.1.0", path = "crates/blazingly-templates" }
+blazingly-validation = { version = "0.1.0", path = "crates/blazingly-validation" }
 blazingly-wire = { version = "0.1.0", path = "crates/blazingly-wire" }
 base64 = "0.22"
 brotli = "8"
