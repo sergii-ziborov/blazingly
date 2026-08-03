@@ -2139,6 +2139,8 @@ pub struct Plugin {
     hooks: PluginHooks,
     startup_hooks: Vec<LifecycleHook>,
     shutdown_hooks: Vec<LifecycleHook>,
+    mount_prefix: Option<String>,
+    id_namespace: Option<String>,
 }
 
 impl Plugin {
@@ -2161,7 +2163,37 @@ impl Plugin {
             },
             startup_hooks: Vec::new(),
             shutdown_hooks: Vec::new(),
+            mount_prefix: None,
+            id_namespace: None,
         }
+    }
+
+    /// Mounts every operation in this scope, and below it, under a path prefix.
+    ///
+    /// The prefix is joined in front of each declared route path when the
+    /// application is compiled, so one module — a function returning a
+    /// `Plugin` — can be mounted at two prefixes by calling it twice, without
+    /// restating a handler. Prefixes nest: a mounted plugin inside a mounted
+    /// plugin serves under both. The prefix must start with `/`, must not end
+    /// with `/`, and declares no `{...}` parameters of its own.
+    #[must_use]
+    pub fn mount(mut self, prefix: impl Into<String>) -> Self {
+        self.mount_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Namespaces every operation identity in this scope, and below it.
+    ///
+    /// A stable id names an operation in the contract, the documents, and
+    /// compatibility reports, so mounting the same module twice needs two
+    /// identities: `with_id_namespace("v1")` turns `notes.create` into
+    /// `v1.notes.create`, which also groups the operations under their own
+    /// section in a browser UI. An MCP tool declared by the operation is
+    /// prefixed the same way, so both mounts stay callable as distinct tools.
+    #[must_use]
+    pub fn with_id_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.id_namespace = Some(namespace.into());
+        self
     }
 
     #[must_use]
@@ -2437,6 +2469,14 @@ pub enum ExecutableBuildError {
     InvalidPluginName {
         plugin: String,
     },
+    InvalidMountPrefix {
+        plugin: String,
+        prefix: String,
+    },
+    InvalidIdNamespace {
+        plugin: String,
+        namespace: String,
+    },
     DuplicateProvider {
         plugin: String,
         dependency: &'static str,
@@ -2478,6 +2518,16 @@ impl fmt::Display for ExecutableBuildError {
             Self::InvalidPluginName { plugin } => {
                 write!(formatter, "invalid plugin name `{plugin}`")
             }
+            Self::InvalidMountPrefix { plugin, prefix } => write!(
+                formatter,
+                "plugin `{plugin}` mount prefix {prefix:?} must start with '/', \
+                 not end with '/', and declare no path parameters"
+            ),
+            Self::InvalidIdNamespace { plugin, namespace } => write!(
+                formatter,
+                "plugin `{plugin}` id namespace {namespace:?} must contain only \
+                 ASCII letters, digits, '-' or '_'"
+            ),
             Self::DuplicateProvider { plugin, dependency } => {
                 write!(
                     formatter,
@@ -2648,6 +2698,7 @@ impl ExecutableApp {
             &HashMap::new(),
             &HookScope::default(),
             "",
+            &MountPoint::default(),
             &mut collector,
         )?;
         overrides.validate()?;
@@ -2801,6 +2852,7 @@ fn collect_plugin(
     inherited: &HashMap<core::any::TypeId, usize>,
     inherited_hooks: &HookScope,
     parent_path: &str,
+    parent_mount: &MountPoint,
     collector: &mut PluginCollector<'_>,
 ) -> Result<(), ExecutableBuildError> {
     let Plugin {
@@ -2812,6 +2864,8 @@ fn collect_plugin(
         hooks: plugin_hooks,
         startup_hooks: plugin_startup_hooks,
         shutdown_hooks: plugin_shutdown_hooks,
+        mount_prefix,
+        id_namespace,
     } = plugin;
     let path = if parent_path.is_empty() {
         name.clone()
@@ -2821,6 +2875,7 @@ fn collect_plugin(
     if !valid_plugin_name(&name) {
         return Err(ExecutableBuildError::InvalidPluginName { plugin: path });
     }
+    let mount = parent_mount.nested(&path, mount_prefix, id_namespace)?;
 
     let mut visible = inherited.clone();
     collector.security_schemes.extend(plugin_security_schemes);
@@ -2850,20 +2905,102 @@ fn collect_plugin(
     for id in registration_ids {
         collector.registrations[id].visible.clone_from(&visible);
     }
-    collector.operations.extend(
-        plugin_operations
-            .into_iter()
-            .map(|operation| ScopedOperation {
-                operation,
-                visible: visible.clone(),
-                plugin: path.clone(),
-                hooks: hooks.clone(),
-            }),
-    );
+    for mut operation in plugin_operations {
+        mount.apply(&mut operation.descriptor, &path)?;
+        collector.operations.push(ScopedOperation {
+            operation,
+            visible: visible.clone(),
+            plugin: path.clone(),
+            hooks: hooks.clone(),
+        });
+    }
     for child in plugins {
-        collect_plugin(child, &visible, &hooks, &path, collector)?;
+        collect_plugin(child, &visible, &hooks, &path, &mount, collector)?;
     }
     Ok(())
+}
+
+/// The accumulated mount of a plugin scope: a path prefix and an id namespace.
+///
+/// Both nest — a mounted plugin inside a mounted plugin serves under the
+/// joined prefix and the dotted namespace — and both are applied to each
+/// operation descriptor exactly once, while the descriptor is owned here,
+/// before `App::build` re-validates path placeholders and uniqueness against
+/// the joined values.
+#[derive(Clone, Default)]
+struct MountPoint {
+    prefix: String,
+    namespace: String,
+}
+
+impl MountPoint {
+    fn nested(
+        &self,
+        plugin: &str,
+        prefix: Option<String>,
+        namespace: Option<String>,
+    ) -> Result<Self, ExecutableBuildError> {
+        let mut nested = self.clone();
+        if let Some(prefix) = prefix {
+            if !valid_mount_prefix(&prefix) {
+                return Err(ExecutableBuildError::InvalidMountPrefix {
+                    plugin: plugin.to_owned(),
+                    prefix,
+                });
+            }
+            nested.prefix.push_str(&prefix);
+        }
+        if let Some(namespace) = namespace {
+            if !valid_plugin_name(&namespace) {
+                return Err(ExecutableBuildError::InvalidIdNamespace {
+                    plugin: plugin.to_owned(),
+                    namespace,
+                });
+            }
+            if !nested.namespace.is_empty() {
+                nested.namespace.push('.');
+            }
+            nested.namespace.push_str(&namespace);
+        }
+        Ok(nested)
+    }
+
+    fn apply(
+        &self,
+        descriptor: &mut OperationDescriptor,
+        plugin: &str,
+    ) -> Result<(), ExecutableBuildError> {
+        if !self.prefix.is_empty() {
+            let declared = &mut descriptor.http.path;
+            *declared = if declared == "/" {
+                self.prefix.clone()
+            } else {
+                format!("{}{declared}", self.prefix)
+            };
+        }
+        if !self.namespace.is_empty() {
+            let namespaced = format!("{}.{}", self.namespace, descriptor.contract.id.as_str());
+            descriptor.contract.id = OperationId::new(namespaced).map_err(|error| {
+                ExecutableBuildError::InvalidIdNamespace {
+                    plugin: plugin.to_owned(),
+                    namespace: error.value().to_owned(),
+                }
+            })?;
+            // The tool name is the identity an MCP host calls; two mounts of
+            // one module must stay two callable tools.
+            if let Some(tool) = &mut descriptor.contract.mcp {
+                tool.name = format!("{}_{}", self.namespace.replace(['.', '-'], "_"), tool.name);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_mount_prefix(prefix: &str) -> bool {
+    prefix.starts_with('/')
+        && !prefix.ends_with('/')
+        && !prefix.contains(['{', '}'])
+        && prefix.split('/').skip(1).all(|segment| !segment.is_empty())
 }
 
 fn valid_plugin_name(name: &str) -> bool {
