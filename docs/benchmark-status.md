@@ -4,11 +4,14 @@ An executable socket harness now lives in the separate
 `blazingly-benchmarks` repository. This keeps Axum's Tokio/Hyper stack, Actix
 Web, Node.js, and future Python dependencies out of the framework workspace.
 
-Current status: the `80,000` req/s acceptance gate is not met, and Actix Web is
-ahead of Blazingly on both throughput and tail latency. See
-"2026-07-27 competitor matrix, validated scenario" below. Everything between
-here and that section is a historical checkpoint or a transport
-microbenchmark, and none of it supersedes that result.
+Current status: the `80,000` req/s acceptance gate has no qualifying run yet.
+The qualifying 2026-07-27 matrix measured 65,650 req/s behind Actix Web; a
+2026-08-03 single-sample checkpoint taken after the routing/pool/wire/json
+optimization wave crossed the gate at 92,140 req/s ahead of Actix Web, but a
+single noisy-host sample earns nothing under the measurement contract. The
+idle-host, multi-sample, interleaved rerun is the outstanding gate-closer.
+Everything between here and those sections is a historical checkpoint or a
+transport microbenchmark.
 
 The first Windows development checkpoint compared one-worker typed JSON over
 real HTTP/1 sockets with 128 persistent connections for 10 seconds. One
@@ -73,12 +76,42 @@ is not presented as a universal per-request or latency improvement. All values
 are local engineering diagnostics, not publishable cross-platform claims. Raw
 evidence and the exact comparison table live in the benchmark repository.
 
+## 2026-08-03 single-sample checkpoint after the optimization wave
+
+One 5-second pipeline-client sample per framework (depth 1 — one request in
+flight per connection), four workers, 128 connections, on the same Windows 11
+loopback host. Background CPU varied between 10% and 27% across launches, and
+one sample is not a median, so this is a development checkpoint, not a
+result: it does not supersede the 2026-07-27 matrix below and earns no claim
+under the acceptance gates. What it records is the direction after the
+routing, blocking-pool, wire, and json changes landed:
+
+| Framework | Requests/second (1 sample) | p50 | p99 | p99.9 |
+| --- | ---: | ---: | ---: | ---: |
+| Blazingly | 92,140 | 1.266ms | 4.330ms | 7.698ms |
+| Actix Web | 88,742 | 1.396ms | 4.080ms | 7.475ms |
+| Axum | 71,373 | 1.639ms | 4.585ms | 6.266ms |
+| Bun | 33,375 | 3.667ms | 6.399ms | 8.178ms |
+| Fastify | 14,159 | 7.438ms | 33.609ms | 46.778ms |
+
+Read plainly: the sample crossed the 80,000 req/s gate and finished ahead of
+Actix Web on throughput and p50, and the p99.9 gap to Actix Web closed from
+3.16x to about even — but a 3.8% lead from one noisy sample is far inside the
+10%/no-overlap bar this document sets for any ranking claim, Actix Web's
+launch happened under the worst background load of the run, and Axum leads
+both tail percentiles. The gate-closing measurement remains the idle-host,
+multi-sample, interleaved rerun.
+
+The same day's in-process layer profile (1,000,000 iterations per layer):
+httparse 116.1 ns, static router 52.5 ns, handler plus typed serialization
+271.6 ns, compiled executor 429.0 ns, full borrowed HTTP dispatch 993.5 ns —
+about 1.0M dispatches per second per core before sockets.
+
 ## 2026-07-27 competitor matrix, validated scenario
 
-This is the current headline result and it supersedes every throughput claim
-above for the validated scenario. Four server workers, 128 connections, one
-request in flight per connection, on the same Windows 11 loopback host. The
-host was not idle. Medians of the sampled runs:
+This was the previous headline result. Four server workers, 128 connections,
+one request in flight per connection, on the same Windows 11 loopback host.
+The host was not idle. Medians of the sampled runs:
 
 | Framework | Requests/second (median) | p50 | p99 | p99.9 |
 | --- | ---: | ---: | ---: | ---: |
