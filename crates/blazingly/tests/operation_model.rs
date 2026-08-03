@@ -476,6 +476,14 @@ fn macros_and_explicit_routes_create_one_operation_graph() {
         openapi["paths"]["/users"]["post"]["responses"]["409"]["description"],
         "A user with this email already exists."
     );
+    assert_eq!(
+        openapi["paths"]["/users"]["post"]["responses"]["422"]["x-blazingly-automatic"], true,
+        "an operation whose body is decoded documents the rejection it can return"
+    );
+    assert!(
+        openapi["paths"]["/health"]["get"]["responses"]["422"].is_null(),
+        "an operation that decodes no input cannot be rejected before it runs"
+    );
 
     let mcp = blazingly::mcp::to_value(app);
     assert_eq!(mcp["tools"][0]["name"], "create_user");

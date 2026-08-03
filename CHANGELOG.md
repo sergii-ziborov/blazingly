@@ -12,7 +12,38 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- The rules a value type declares now reach the item schema when that type is
+  used inside a collection. `#[api_model] #[max_length(20)] struct Tag(String);`
+  used as `tags: Vec<Tag>` published items as a bare `{"type": "string"}` in
+  `/openapi.json`, in MCP tool schemas, and in the generated Markdown, while the
+  validator rejected an over-long element at `tags[0]`. The document said less
+  than the code enforced, which is the drift the projection exists to prevent.
+  The same gap dropped an enumeration's variants, so a generated sample for
+  `Vec<Language>` was a payload the server refused.
+
+### Added
+
+- Operations whose input is decoded now document the `422` they can return
+  before the handler runs, the way the runtime already answers. The response
+  carries the rejection envelope, the closed set of codes that operation's own
+  inputs can produce, and the `violations` array naming the field path and code
+  of each broken rule. An operation that only streams bytes documents no `422`,
+  and an operation that declares its own `422` keeps it. The projected response
+  is marked `x-blazingly-automatic` so a reader can tell it from a declared one.
+- `blazingly::item_constraint_rules` and `blazingly::ITEM_RULE_PREFIX`, the
+  channel a field uses to record the contract of its collection's items.
+
+### Changed
+
+- A field holding a collection of a value type now records that type's rules in
+  its own rule list, under an `items.` prefix. A compatibility report comparing
+  a contract captured before this release against one captured after will list
+  each of those as an added custom validator, which the analysis classifies as
+  a breaking input change. Nothing a client may send has actually narrowed: the
+  validator always enforced these rules, and only the record of them is new.
+  Recapture the baseline contract when upgrading.
 
 ## [0.1.1] - 2026-07-29
 

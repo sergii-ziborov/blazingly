@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-contract",
  "blazingly-core",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-contract",
  "blazingly-json",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-database"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-executor",
  "futures-lite",
@@ -199,18 +199,18 @@ dependencies = [
 
 [[package]]
 name = "blazingly-deploy"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "blazingly-di"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-contract",
 ]
 
 [[package]]
 name = "blazingly-docs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-deploy",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-executor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blazingly-core",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-executor",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-executor",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-mcp-stdio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-executor",
  "blazingly-json",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-middleware"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-http",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-executor",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-observability"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "blazingly-core",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-openapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-json",
@@ -348,14 +348,14 @@ dependencies = [
 
 [[package]]
 name = "blazingly-queue"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-lite",
 ]
 
 [[package]]
 name = "blazingly-realtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blazingly-core",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-security"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blazingly-core",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-templates"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-executor",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-validation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-core",
  "blazingly-json",
@@ -511,7 +511,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cargo-blazingly"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blazingly-docs",
  "blazingly-json",

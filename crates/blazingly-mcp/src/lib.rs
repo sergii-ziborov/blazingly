@@ -493,8 +493,40 @@ fn widen_with_null(schema: &mut Value) {
     }
 }
 
+/// Applies a rule the field recorded on behalf of its collection's items.
+///
+/// An agent calling a tool has to know the bound on each element, not only on
+/// the list, so the item contract goes through the same projection the field
+/// itself uses instead of surfacing as an opaque validator string.
+/// Returns `false` when there is no item schema to describe, leaving the rule
+/// to the caller so it is recorded rather than lost.
+fn apply_item_validation(schema: &mut Value, encoded: &str) -> bool {
+    let Some(items) = schema.get_mut("items").filter(|items| items.is_object()) else {
+        return false;
+    };
+    let rule = match encoded.split_once('=') {
+        Some(("min_length", value)) => value.parse().ok().map(ValidationRule::MinLength),
+        Some(("max_length", value)) => value.parse().ok().map(ValidationRule::MaxLength),
+        Some(("email", "true")) => Some(ValidationRule::Email),
+        _ => None,
+    };
+    let rule = rule.unwrap_or_else(|| ValidationRule::Custom(encoded.to_owned()));
+    apply_validation(items, std::slice::from_ref(&rule));
+    true
+}
+
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
     for rule in validation {
+        // An item rule describes the collection's elements, so it is projected
+        // onto the item subschema instead of onto the array itself. A field
+        // with no items to describe falls through, so the rule is still
+        // recorded rather than disappearing from the tool schema.
+        if let ValidationRule::Custom(encoded) = rule
+            && let Some(item_rule) = encoded.strip_prefix(blazingly_core::ITEM_RULE_PREFIX)
+            && apply_item_validation(schema, item_rule)
+        {
+            continue;
+        }
         match rule {
             ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
             ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
@@ -594,6 +626,80 @@ mod tests {
         assert_eq!(
             discovery["tools"][0]["x-blazingly"]["confirmation"],
             "required"
+        );
+    }
+
+    /// An agent has to read the bound on each element, not only on the list.
+    ///
+    /// A tool schema that omits the item contract invites a call the server
+    /// then rejects, so a rule scoped to the items lands on the item schema
+    /// rather than beside the array or in the opaque validator list.
+    #[test]
+    fn an_item_bundle_reaches_the_item_schema_a_tool_publishes() {
+        let tags = TypeDescriptor {
+            rust_name: "Vec<Tag>".to_owned(),
+            schema: SchemaKind::Array(Box::new(SchemaKind::String)),
+            model: None,
+            items: Some(Box::new(TypeDescriptor::scalar("Tag", SchemaKind::String))),
+        };
+        let model = ModelDescriptor::new(
+            "CreatePost",
+            vec![FieldDescriptor::new(
+                "tags",
+                true,
+                tags,
+                vec![
+                    ValidationRule::Custom("max_items=5".to_owned()),
+                    ValidationRule::Custom("items.min_length=1".to_owned()),
+                    ValidationRule::Custom("items.max_length=20".to_owned()),
+                    ValidationRule::Custom("items.enum=news|sport".to_owned()),
+                ],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/posts",
+            "posts.create",
+            "Create a post",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .expect("operation should be valid")
+        .with_mcp_tool(
+            McpToolDescriptor::new("create_post", "Create one post"),
+            AgentPolicy {
+                risk: OperationRisk::Write,
+                confirmation: Confirmation::Never,
+                idempotent: false,
+            },
+        );
+        let app = App::new()
+            .route(operation)
+            .build()
+            .expect("application should be valid");
+
+        let discovery = super::to_value(&app);
+        let tags = &discovery["tools"][0]["inputSchema"]["properties"]["tags"];
+
+        assert_eq!(tags["maxItems"], blazingly_json::json!(5));
+        assert_eq!(
+            tags["items"]["minLength"],
+            blazingly_json::json!(1),
+            "an item bound belongs to the item schema: {tags}"
+        );
+        assert_eq!(tags["items"]["maxLength"], blazingly_json::json!(20));
+        assert_eq!(
+            tags["items"]["enum"],
+            blazingly_json::json!(["news", "sport"])
+        );
+        assert!(
+            tags["maxLength"].is_null(),
+            "an item bound must not be read as a bound on the list: {tags}"
+        );
+        assert!(
+            tags["x-blazingly-validators"].is_null()
+                && tags["items"]["x-blazingly-validators"].is_null(),
+            "a recovered item rule must not also appear as an opaque validator: {tags}"
         );
     }
 

@@ -898,6 +898,42 @@ pub fn merge_validation_errors(
     }
 }
 
+/// Marks a rule that describes a collection's items rather than the field.
+///
+/// The frozen contract format has one rule list per field and no place to hang
+/// an item contract, so an item rule travels in the `keyword=value` channel
+/// already used for constraints, under this prefix.
+pub const ITEM_RULE_PREFIX: &str = "items.";
+
+/// Re-scopes a value type's declared rules onto the items of a collection.
+///
+/// A `Vec<Tag>` field must not adopt `Tag`'s bounds as its own: `max_length`
+/// read off the field would bound the list, not each tag. Recording them under
+/// [`ITEM_RULE_PREFIX`] keeps the field's own contract intact while giving a
+/// schema projection the item contract the validator already enforces.
+///
+/// A rule that names the field rather than the value — a wire alias, a
+/// nested-model marker — does not travel. A validator's identity does: the
+/// validator runs on each element, and a reader has to be told so.
+#[must_use]
+pub fn item_constraint_rules(declared: &[ValidationRule]) -> Vec<ValidationRule> {
+    declared
+        .iter()
+        .filter_map(|rule| {
+            let encoded = match rule {
+                ValidationRule::MinLength(value) => format!("min_length={value}"),
+                ValidationRule::MaxLength(value) => format!("max_length={value}"),
+                ValidationRule::Email => "email=true".to_owned(),
+                ValidationRule::Custom(encoded) => encoded.clone(),
+                ValidationRule::Alias(_) | ValidationRule::Nested => return None,
+            };
+            Some(ValidationRule::Custom(format!(
+                "{ITEM_RULE_PREFIX}{encoded}"
+            )))
+        })
+        .collect()
+}
+
 /// Records a field validator's violations under the field it was declared on.
 ///
 /// A field validator is handed the value alone and cannot see the public name
@@ -2851,6 +2887,39 @@ mod tests {
         let mut reported = ValidationErrors::new();
         reported.push("published_at", "too_far_ahead", "too far ahead");
         assert_eq!(violations("published_at", &reported), ["published_at"]);
+    }
+
+    /// A value type's bundle re-scopes onto the items it actually bounds.
+    #[test]
+    fn a_bundle_re_scoped_onto_items_keeps_only_what_describes_the_value() {
+        use crate::ValidationRule;
+
+        let declared = [
+            ValidationRule::MinLength(1),
+            ValidationRule::MaxLength(20),
+            ValidationRule::Email,
+            ValidationRule::Custom("pattern=^[a-z]+$".to_owned()),
+            ValidationRule::Custom("enum=news|sport".to_owned()),
+            // The validator runs on each element, so its identity travels.
+            ValidationRule::Custom("check_slug".to_owned()),
+            // A wire alias and a nested marker name the field, not the value
+            // inside the list.
+            ValidationRule::Alias("labels".to_owned()),
+            ValidationRule::Nested,
+        ];
+
+        assert_eq!(
+            super::item_constraint_rules(&declared),
+            [
+                ValidationRule::Custom("items.min_length=1".to_owned()),
+                ValidationRule::Custom("items.max_length=20".to_owned()),
+                ValidationRule::Custom("items.email=true".to_owned()),
+                ValidationRule::Custom("items.pattern=^[a-z]+$".to_owned()),
+                ValidationRule::Custom("items.enum=news|sport".to_owned()),
+                ValidationRule::Custom("items.check_slug".to_owned()),
+            ]
+        );
+        assert!(super::item_constraint_rules(&[]).is_empty());
     }
 
     #[test]

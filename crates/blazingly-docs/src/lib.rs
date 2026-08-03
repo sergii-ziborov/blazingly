@@ -749,6 +749,30 @@ const fn input_source_name(source: InputSource) -> &'static str {
     }
 }
 
+/// The prose a `keyword=value` rule reads as.
+///
+/// A declarative constraint reads better as its own keyword than as an opaque
+/// validator name, and the same keywords describe a field and a collection's
+/// items alike, so both scopes share one reading.
+fn describe_encoded_rule(encoded: &str) -> String {
+    if let Some(metadata) = FieldMetadata::parse(encoded) {
+        return describe_metadata(&metadata);
+    }
+    // The length and format rules are native contract variants at field level,
+    // so they only ever arrive encoded when they describe a collection's items.
+    match encoded.split_once('=') {
+        Some(("min_length", value)) => return format!("min length {value}"),
+        Some(("max_length", value)) => return format!("max length {value}"),
+        Some(("email", "true")) => return "email".to_owned(),
+        _ => {}
+    }
+    #[cfg(feature = "validation")]
+    if let Some(constraint) = blazingly_validation::Constraint::parse(encoded) {
+        return constraint.to_string();
+    }
+    format!("validator `{encoded}`")
+}
+
 /// Renders a recovered default, nullability marker, or enumeration as prose.
 fn describe_metadata(metadata: &FieldMetadata) -> String {
     match metadata {
@@ -785,21 +809,14 @@ fn write_model(output: &mut String, model: &ModelDescriptor) {
                     let _ = write!(output, ", alias `{alias}`");
                 }
                 ValidationRule::Custom(validator) => {
-                    // A declarative constraint reads better as its own keyword
-                    // than as an opaque validator name.
-                    if let Some(metadata) = FieldMetadata::parse(validator) {
-                        let _ = write!(output, ", {}", describe_metadata(&metadata));
-                        continue;
-                    }
-                    #[cfg(feature = "validation")]
-                    let rendered = blazingly_validation::Constraint::parse(validator)
-                        .map(|constraint| constraint.to_string());
-                    #[cfg(not(feature = "validation"))]
-                    let rendered: Option<String> = None;
-                    let _ = match rendered {
-                        Some(constraint) => write!(output, ", {constraint}"),
-                        None => write!(output, ", validator `{validator}`"),
-                    };
+                    // A rule recorded on behalf of a collection's items bounds
+                    // each element rather than the list, and says so.
+                    let (scope, encoded) =
+                        match validator.strip_prefix(blazingly_core::ITEM_RULE_PREFIX) {
+                            Some(item_rule) => ("each item ", item_rule),
+                            None => ("", validator.as_str()),
+                        };
+                    let _ = write!(output, ", {scope}{}", describe_encoded_rule(encoded));
                 }
                 ValidationRule::Nested => output.push_str(", nested validation"),
             }
@@ -1025,6 +1042,55 @@ mod tests {
                 .unwrap()
                 .contains("\"draft\""),
             "a declared default belongs in the sample request"
+        );
+    }
+
+    /// A bound on each element reads as one, not as a bound on the list.
+    #[test]
+    fn an_item_bundle_reads_as_a_rule_about_each_element() {
+        let model = ModelDescriptor::new(
+            "RenameBatch",
+            vec![FieldDescriptor::new(
+                "titles",
+                true,
+                TypeDescriptor::scalar(
+                    "Vec<Title>",
+                    SchemaKind::Array(Box::new(SchemaKind::String)),
+                ),
+                vec![
+                    ValidationRule::Custom("min_items=1".to_owned()),
+                    ValidationRule::Custom("items.min_length=8".to_owned()),
+                    ValidationRule::Custom("items.enum=news|sport".to_owned()),
+                ],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/titles",
+            "articles.rename",
+            "Rename articles",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::api_markdown(&app);
+        assert!(
+            document.contains("each item min length 8"),
+            "an item bound says which scope it bounds: {document}"
+        );
+        assert!(
+            document.contains("each item one of `news`, `sport`"),
+            "{document}"
+        );
+        assert!(
+            document.contains("min_items=1") || document.contains("min items 1"),
+            "{document}"
+        );
+        assert!(
+            !document.contains("validator `items."),
+            "a recovered item rule must not read as an opaque validator: {document}"
         );
     }
 }

@@ -235,7 +235,7 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
 
 #[allow(clippy::too_many_lines)]
 fn operation_value(operation: &OperationDescriptor, components: &Map<String, Value>) -> Value {
-    let responses = operation
+    let mut responses = operation
         .contract
         .responses
         .iter()
@@ -280,6 +280,14 @@ fn operation_value(operation: &OperationDescriptor, components: &Map<String, Val
             (response.status.to_string(), value)
         })
         .collect::<Map<_, _>>();
+    if let Some(codes) = rejection_codes(operation)
+        && !responses.contains_key(REJECTION_STATUS)
+    {
+        responses.insert(
+            REJECTION_STATUS.to_owned(),
+            rejection_response(&codes, components),
+        );
+    }
 
     let mut value = json!({
         "operationId": operation.contract.id.as_str(),
@@ -360,6 +368,129 @@ fn operation_value(operation: &OperationDescriptor, components: &Map<String, Val
     }
 
     value
+}
+
+/// The status every input rejection is reported under.
+const REJECTION_STATUS: &str = "422";
+
+/// Every code a rejection can carry, in the order a reader most wants them.
+///
+/// `validation_error` leads because it is the failure a well-formed request
+/// still meets, and the sample payload is derived from the first entry.
+const REJECTION_CODES: [&str; 6] = [
+    "validation_error",
+    "missing_input",
+    "invalid_json",
+    "invalid_input",
+    "invalid_multipart",
+    "invalid_file_count",
+];
+
+/// The codes an input from this source can be rejected with.
+///
+/// This mirrors the executor: a value is decoded, then validated, and each step
+/// answers with its own code. Bytes that reach the handler untouched have
+/// neither step, so a stream can produce none of them.
+fn source_rejection_codes(source: InputSource) -> &'static [&'static str] {
+    match source {
+        InputSource::Json => &["validation_error", "invalid_json"],
+        InputSource::Path
+        | InputSource::Query
+        | InputSource::Header
+        | InputSource::Cookie
+        | InputSource::Form => &["validation_error", "invalid_input"],
+        InputSource::Multipart => &["validation_error", "invalid_multipart", "invalid_input"],
+        // An upload is read out of the same multipart document, then counted.
+        // It is never validated against rules, and the decode that answers
+        // `invalid_input` is reachable only from structured arguments.
+        InputSource::File => &["invalid_multipart", "invalid_file_count"],
+        InputSource::Stream => &[],
+    }
+}
+
+/// The stable codes an operation's own inputs can be rejected with.
+///
+/// Returns `None` when nothing about the request is decoded, so an operation
+/// that only streams bytes is not given a failure it cannot produce. The set is
+/// closed and derived from the operation's own inputs: a body that is not JSON
+/// cannot fail as `invalid_json`, and an operation with nothing required cannot
+/// report `missing_input`.
+fn rejection_codes(operation: &OperationDescriptor) -> Option<Vec<&'static str>> {
+    let mut reachable = BTreeSet::new();
+    for input in &operation.contract.inputs {
+        let codes = source_rejection_codes(input.source);
+        if codes.is_empty() {
+            continue;
+        }
+        reachable.extend(codes);
+        // Only a value read out of the request one key at a time can be found
+        // missing. A JSON body is decoded whole and fails as `invalid_json`, a
+        // model is assembled from whichever of its fields arrived and fails on
+        // the field, and an upload reports its own absence by count.
+        if !matches!(input.source, InputSource::Json | InputSource::File)
+            && input.ty.model.is_none()
+            && (input.required || input.source == InputSource::Path)
+        {
+            reachable.insert("missing_input");
+        }
+    }
+    if reachable.is_empty() {
+        return None;
+    }
+    Some(
+        REJECTION_CODES
+            .into_iter()
+            .filter(|code| reachable.contains(code))
+            .collect(),
+    )
+}
+
+/// The rejection envelope the runtime returns before the handler is reached.
+///
+/// This response is projected from the framework's own input handling rather
+/// than declared by the operation, which `x-blazingly-automatic` records. The
+/// `violations` array is the shape a rule failure reports, one entry per broken
+/// rule, each naming the field path that broke it.
+fn rejection_response(codes: &[&str], components: &Map<String, Value>) -> Value {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "error": {
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "enum": codes },
+                    "message": { "type": "string" },
+                    "details": {
+                        "type": "object",
+                        "properties": {
+                            "violations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "field": { "type": "string" },
+                                        "code": { "type": "string" },
+                                        "message": { "type": "string" }
+                                    },
+                                    "required": ["field", "code", "message"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        }
+                    }
+                },
+                "required": ["code", "message"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["error"],
+        "additionalProperties": false
+    });
+    json!({
+        "description": "The request was rejected before the handler ran: an input could not be decoded, or failed the rules the operation declares.",
+        "content": { "application/json": media_type_value(schema, components) },
+        "x-blazingly-automatic": true
+    })
 }
 
 /// The section a browser UI groups this operation under.
@@ -934,8 +1065,41 @@ fn widen_with_null(schema: &mut Value) {
     }
 }
 
+/// Applies a rule the field recorded on behalf of its collection's items.
+///
+/// The item contract is carried in the same `keyword=value` channel as every
+/// other constraint, so decoding it back into a rule lets the item subschema go
+/// through the projection the field itself uses — formats, enumerations, and
+/// the opaque-validator fallback included.
+/// Returns `false` when there is no item schema to describe, leaving the rule
+/// to the caller so it is recorded rather than lost.
+fn apply_item_validation(schema: &mut Value, encoded: &str) -> bool {
+    let Some(items) = schema.get_mut("items").filter(|items| items.is_object()) else {
+        return false;
+    };
+    let rule = match encoded.split_once('=') {
+        Some(("min_length", value)) => value.parse().ok().map(ValidationRule::MinLength),
+        Some(("max_length", value)) => value.parse().ok().map(ValidationRule::MaxLength),
+        Some(("email", "true")) => Some(ValidationRule::Email),
+        _ => None,
+    };
+    let rule = rule.unwrap_or_else(|| ValidationRule::Custom(encoded.to_owned()));
+    apply_validation(items, std::slice::from_ref(&rule));
+    true
+}
+
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
     for rule in validation {
+        // An item rule describes the collection's elements, so it is projected
+        // onto the item subschema instead of onto the array itself. A field
+        // with no items to describe falls through, so the rule is still
+        // recorded rather than disappearing from the document.
+        if let ValidationRule::Custom(encoded) = rule
+            && let Some(item_rule) = encoded.strip_prefix(blazingly_core::ITEM_RULE_PREFIX)
+            && apply_item_validation(schema, item_rule)
+        {
+            continue;
+        }
         match rule {
             ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
             ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
@@ -1364,6 +1528,270 @@ mod tests {
                 ["status"],
             "draft",
             "a declared default is the most useful sample value"
+        );
+    }
+
+    /// A collection of a value type carries the item's bundle, not the list's.
+    ///
+    /// The rules a value type declares are recorded against the field that uses
+    /// it, because the contract has one rule list per field. Projecting them
+    /// onto the array itself would publish `maxLength` for a list, so the ones
+    /// scoped to the item have to land on the item schema.
+    #[test]
+    fn a_value_types_bundle_is_projected_onto_the_items_of_a_collection() {
+        let tags = TypeDescriptor {
+            rust_name: "Vec<Tag>".to_owned(),
+            schema: SchemaKind::Array(Box::new(SchemaKind::String)),
+            model: None,
+            items: Some(Box::new(TypeDescriptor::scalar("Tag", SchemaKind::String))),
+        };
+        let model = ModelDescriptor::new(
+            "CreatePost",
+            vec![FieldDescriptor::new(
+                "tags",
+                true,
+                tags,
+                vec![
+                    ValidationRule::Custom("max_items=5".to_owned()),
+                    ValidationRule::Custom("items.min_length=1".to_owned()),
+                    ValidationRule::Custom("items.max_length=20".to_owned()),
+                    ValidationRule::Custom("items.pattern=^[a-z]+$".to_owned()),
+                    ValidationRule::Custom("items.enum=news|sport".to_owned()),
+                ],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/posts",
+            "posts.create",
+            "Create a post",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+        let tags = &document["components"]["schemas"]["CreatePost"]["properties"]["tags"];
+
+        assert_eq!(tags["maxItems"], 5, "the list keeps its own bound");
+        assert_eq!(
+            tags["items"]["minLength"], 1,
+            "an item bound belongs to the item schema: {tags}"
+        );
+        assert_eq!(tags["items"]["maxLength"], 20);
+        assert_eq!(tags["items"]["pattern"], "^[a-z]+$");
+        assert_eq!(tags["items"]["enum"][0], "news");
+        assert!(
+            tags["minLength"].is_null() && tags["maxLength"].is_null(),
+            "an item bound must not be read as a bound on the list: {tags}"
+        );
+        assert!(
+            tags["x-blazingly-validators"].is_null()
+                && tags["items"]["x-blazingly-validators"].is_null(),
+            "a recovered item rule must not also appear as an opaque validator: {tags}"
+        );
+    }
+
+    /// An item rule on a field that is not a collection has nothing to bound.
+    ///
+    /// The macro cannot produce this, but a descriptor read off the wire can.
+    /// The rule must not become the field's own bound, and must not vanish
+    /// either: it is recorded verbatim so the document still says what the
+    /// contract carried.
+    #[test]
+    fn an_item_rule_without_an_item_schema_is_recorded_rather_than_misapplied() {
+        let model = ModelDescriptor::new(
+            "Odd",
+            vec![FieldDescriptor::new(
+                "name",
+                true,
+                TypeDescriptor::scalar("String", SchemaKind::String),
+                vec![ValidationRule::Custom("items.max_length=20".to_owned())],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/odd",
+            "odd.create",
+            "Create",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let name = &super::to_value(&app)["components"]["schemas"]["Odd"]["properties"]["name"];
+        assert!(
+            name["maxLength"].is_null(),
+            "a bound meant for items must not become the field's own: {name}"
+        );
+        assert_eq!(
+            name["x-blazingly-validators"][0], "items.max_length=20",
+            "a rule with nothing to describe is still recorded: {name}"
+        );
+    }
+
+    /// The rejection the runtime returns before a handler runs is documented.
+    #[test]
+    fn an_operation_that_decodes_input_documents_the_rejection_it_can_return() {
+        let decoding = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            None,
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap()
+        .with_inputs(vec![InputDescriptor::new(
+            "body",
+            InputSource::Json,
+            true,
+            TypeDescriptor::model(create_user_model()),
+        )]);
+        let streaming = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/uploads",
+            "uploads.create",
+            "Upload bytes",
+            None,
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap()
+        .with_inputs(vec![InputDescriptor::new(
+            "body",
+            InputSource::Stream,
+            true,
+            TypeDescriptor::scalar("StreamingBody", SchemaKind::Binary),
+        )]);
+        let app = App::new().route(decoding).route(streaming).build().unwrap();
+
+        let document = super::to_value(&app);
+        let rejection = &document["paths"]["/users"]["post"]["responses"]["422"];
+        assert_eq!(rejection["x-blazingly-automatic"], true);
+
+        let schema = &rejection["content"]["application/json"]["schema"];
+        let codes = schema["properties"]["error"]["properties"]["code"]["enum"]
+            .as_array()
+            .expect("a rejection carries a closed set of codes");
+        assert!(codes.contains(&blazingly_json::json!("validation_error")));
+        assert!(
+            codes.contains(&blazingly_json::json!("invalid_json")),
+            "a JSON body can fail to decode: {codes:?}"
+        );
+        assert!(
+            !codes.contains(&blazingly_json::json!("invalid_input")),
+            "an operation with only a JSON body cannot fail another source: {codes:?}"
+        );
+        assert_eq!(
+            rejection["content"]["application/json"]["example"]["error"]["code"],
+            "validation_error",
+            "the sample shows the rejection the rules produce"
+        );
+
+        assert!(
+            document["paths"]["/uploads"]["post"]["responses"]["422"].is_null(),
+            "bytes that are never decoded cannot fail a rule the operation declares"
+        );
+    }
+
+    /// Each source is documented with the codes that source actually produces.
+    ///
+    /// The runtime answers a failed input differently depending on how it read
+    /// it, so a code that source cannot reach must not appear in the closed set
+    /// the document publishes.
+    #[test]
+    fn a_rejection_names_the_codes_the_inputs_it_has_can_produce() {
+        let codes = |source: InputSource, ty: TypeDescriptor, path: &str, id: &str| {
+            let operation = OperationDescriptor::new(
+                HttpMethod::Post,
+                path,
+                id,
+                "Accept input",
+                None,
+                vec![ResponseDescriptor::success(201, None)],
+            )
+            .unwrap()
+            .with_inputs(vec![InputDescriptor::new("body", source, true, ty)]);
+            let app = App::new().route(operation).build().unwrap();
+            super::to_value(&app)["paths"][path]["post"]["responses"]["422"]["content"]
+                ["application/json"]["schema"]["properties"]["error"]["properties"]["code"]["enum"]
+                .as_array()
+                .map(|codes| {
+                    codes
+                        .iter()
+                        .filter_map(|code| code.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+        };
+        let model = || TypeDescriptor::model(create_user_model());
+        let scalar = || TypeDescriptor::scalar("String", SchemaKind::String);
+
+        assert_eq!(
+            codes(InputSource::Json, model(), "/users", "users.create"),
+            Some(vec![
+                "validation_error".to_owned(),
+                "invalid_json".to_owned(),
+            ]),
+            "a body decoded whole reports a missing body as invalid JSON"
+        );
+        assert_eq!(
+            codes(InputSource::Multipart, model(), "/parts", "parts.create"),
+            Some(vec![
+                "validation_error".to_owned(),
+                "invalid_input".to_owned(),
+                "invalid_multipart".to_owned(),
+            ]),
+            "a model is assembled from the fields that arrived, never found missing"
+        );
+        assert_eq!(
+            codes(InputSource::File, model(), "/files", "files.create"),
+            Some(vec![
+                "invalid_multipart".to_owned(),
+                "invalid_file_count".to_owned(),
+            ]),
+            "an upload is read out of a multipart document, then counted"
+        );
+        assert_eq!(
+            codes(InputSource::Query, scalar(), "/search", "search.run"),
+            Some(vec![
+                "validation_error".to_owned(),
+                "missing_input".to_owned(),
+                "invalid_input".to_owned(),
+            ]),
+            "a value read one key at a time is the one that can be found missing"
+        );
+    }
+
+    /// A declared rejection is the operation's, not the projection's.
+    #[test]
+    fn a_declared_rejection_is_not_replaced_by_the_projected_one() {
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/users",
+            "users.create",
+            "Create a user",
+            None,
+            vec![
+                ResponseDescriptor::success(201, None),
+                ResponseDescriptor::error(422, "unprocessable", "Cannot be processed.", None),
+            ],
+        )
+        .unwrap()
+        .with_inputs(vec![InputDescriptor::new(
+            "body",
+            InputSource::Json,
+            true,
+            TypeDescriptor::model(create_user_model()),
+        )]);
+        let app = App::new().route(operation).build().unwrap();
+
+        let rejection = &super::to_value(&app)["paths"]["/users"]["post"]["responses"]["422"];
+        assert_eq!(rejection["x-blazingly-error-code"], "unprocessable");
+        assert!(
+            rejection["x-blazingly-automatic"].is_null(),
+            "a declared response keeps its own description and schema"
         );
     }
 

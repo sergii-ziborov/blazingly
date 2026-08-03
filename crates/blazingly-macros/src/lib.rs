@@ -2681,20 +2681,31 @@ fn nested_rule_descriptor(
 
 /// Copies a declared value type's rules into the field that uses it.
 ///
-/// Only a scalar-shaped field inherits: a `Vec<Title>` field would otherwise
-/// claim the item's bounds as its own.
+/// Only a scalar-shaped field inherits them as its own: a `Vec<Title>` field
+/// would otherwise claim the item's bounds as the list's. A collection instead
+/// records them as an item contract, which is what the validator enforces and
+/// what a schema projection has to put on the item subschema.
 fn inherited_rule_descriptor(
     validation_type: &Type,
     shape: FieldShape,
 ) -> proc_macro2::TokenStream {
-    if shape != FieldShape::Other {
-        return quote!();
-    }
-    quote! {
-        rules.extend(
-            (&__BlazinglyKind::<#validation_type>(::core::marker::PhantomData))
-                .__blazingly_declared_rules(),
-        );
+    match shape {
+        FieldShape::Other => quote! {
+            rules.extend(
+                (&__BlazinglyKind::<#validation_type>(::core::marker::PhantomData))
+                    .__blazingly_declared_rules(),
+            );
+        },
+        FieldShape::Collection => {
+            let item_type = model_probe_type(validation_type, shape);
+            quote! {
+                rules.extend(::blazingly::item_constraint_rules(
+                    &(&__BlazinglyKind::<#item_type>(::core::marker::PhantomData))
+                        .__blazingly_declared_rules(),
+                ));
+            }
+        }
+        FieldShape::Text | FieldShape::Integer | FieldShape::Float => quote!(),
     }
 }
 
@@ -4364,6 +4375,28 @@ mod tests {
             .to_string();
         assert!(expansion.contains("ValidationRule :: MinLength (8usize)"));
         assert!(expansion.contains("min_length"));
+    }
+
+    /// A collection records the item's bundle without adopting it as its own.
+    ///
+    /// `Vec<Title>` must not report `Title`'s `max_length` as a bound on the
+    /// list, but the bundle still has to reach the descriptor, or a schema
+    /// projection has nothing to put on the item schema.
+    #[test]
+    fn a_collection_records_its_items_bundle_separately_from_its_own_bounds() {
+        let expansion =
+            expand_default("struct Batch { titles: Vec<Title> }").expect("a collection expands");
+        assert!(
+            expansion.contains("item_constraint_rules"),
+            "a collection carries the item bundle into the descriptor: {expansion}"
+        );
+
+        let scalar = expand_default("struct One { title: Title }").expect("a scalar field expands");
+        assert!(
+            !scalar.contains("item_constraint_rules"),
+            "a scalar field inherits the bundle as its own, unscoped"
+        );
+        assert!(scalar.contains("__blazingly_declared_rules"));
     }
 
     #[test]

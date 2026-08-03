@@ -319,6 +319,17 @@ operation model the handlers use — the validation rules above appear as
 appears as the `404` response of `tasks.read`. It is not hand-written and cannot
 drift from the code.
 
+That applies to rules a reusable value type declares, too. A `Vec<Tag>` field
+publishes `Tag`'s own bounds on the item schema rather than on the array, which
+is the scope the validator enforces them at and the scope a client has to
+satisfy.
+
+Every operation whose input is decoded also documents the `422` it can return
+before the handler runs, without declaring it: the rejection envelope, the codes
+that operation's inputs can produce, and the `violations` array naming the field
+path and the rule that broke. It is marked `x-blazingly-automatic`, so a reader
+can tell it apart from a response the operation declared itself.
+
 Two commands print the same information without a browser:
 
 ```console
