@@ -2321,6 +2321,27 @@ where
         }
         None
     }
+
+    fn method(&self) -> Option<HttpMethod> {
+        Some(self.request.method())
+    }
+
+    fn path(&self) -> Option<&str> {
+        let target = self.request.target();
+        Some(target.split('?').next().unwrap_or(target))
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.request.peer_addr()
+    }
+
+    fn scheme(&self) -> Option<&str> {
+        Some(self.connection_info().scheme())
+    }
+
+    fn host(&self) -> Option<&str> {
+        self.connection_info().host()
+    }
 }
 
 fn body_source(descriptor: &OperationDescriptor) -> Option<InputSource> {

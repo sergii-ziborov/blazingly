@@ -3,11 +3,11 @@
 use base64::Engine;
 use blazingly_core::{
     Accepted, ApiError, ApiModel, ApiSchema, App, AppDefinition, Background, BackgroundTask,
-    BodyStreamError, Cookie, Created, File, Form, Header, HttpUpgrade, InputSource, Json,
-    MAX_MULTIPART_HEADER_BYTES, MAX_MULTIPART_PARTS, Multipart, MultipartError, MultipartStream,
-    NoContent, OperationDescriptor, OperationFailure, OperationId, Path, PreparedJson, Query,
-    ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor, Status,
-    StreamingBody, TypeDescriptor, UploadFile, UploadSlots, WithHeaders, find_bytes,
+    BodyStreamError, Cookie, Created, File, Form, Header, HttpMethod, HttpUpgrade, InputSource,
+    Json, MAX_MULTIPART_HEADER_BYTES, MAX_MULTIPART_PARTS, Multipart, MultipartError,
+    MultipartStream, NoContent, OperationDescriptor, OperationFailure, OperationId, Path,
+    PreparedJson, Query, ResponseBuildError, ResponseHeader, SchemaKind, SecuritySchemeDescriptor,
+    Status, StreamingBody, TypeDescriptor, UploadFile, UploadSlots, WithHeaders, find_bytes,
     multipart_boundary, multipart_part_headers,
 };
 pub use blazingly_di::DependencyError;
@@ -705,6 +705,35 @@ pub trait HttpRequestParts {
     fn extension(&self, _type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
         None
     }
+
+    /// The request method, when the adapter exposes raw request parts.
+    ///
+    /// Every accessor in this family defaults to `None` so existing adapters
+    /// keep compiling; the first-party HTTP adapter forwards each one borrowed
+    /// from its receive buffer.
+    fn method(&self) -> Option<HttpMethod> {
+        None
+    }
+
+    /// The request path, without the query string.
+    fn path(&self) -> Option<&str> {
+        None
+    }
+
+    /// Address of the direct network peer, when known by the adapter.
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
+    /// Effective transport scheme, after any trusted proxy normalization.
+    fn scheme(&self) -> Option<&str> {
+        None
+    }
+
+    /// Effective request host, after any trusted proxy normalization.
+    fn host(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Pull-based request body with adapter-enforced transport limits.
@@ -963,6 +992,57 @@ impl<T: FromInvocation> FromInvocation for Extract<T> {
         required: bool,
     ) -> Result<Self, InputRejection> {
         T::from_invocation(input, name, required).map(Self)
+    }
+}
+
+/// An owned snapshot of the raw request parts, taken before the handler runs.
+///
+/// The parts are read borrowed from the adapter's receive buffer through
+/// [`HttpRequestParts`] and copied once here, because an async handler's
+/// future outlives the borrow. `scheme` and `host` are the effective values
+/// after any trusted proxy middleware, matching what `ConnectionInfo` reports.
+///
+/// The snapshot is HTTP's: extracting it on a transport that carries no
+/// request line — an MCP tool call — rejects deterministically with
+/// `transport_mismatch` instead of inventing values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestParts {
+    pub method: HttpMethod,
+    pub path: String,
+    pub scheme: Option<String>,
+    pub host: Option<String>,
+    pub peer_addr: Option<std::net::SocketAddr>,
+}
+
+impl FromInvocation for RequestParts {
+    fn from_invocation(
+        input: &InvocationInput<'_>,
+        _name: &str,
+        _required: bool,
+    ) -> Result<Self, InputRejection> {
+        let InvocationInput::Http(request) = input else {
+            return Err(InputRejection::new(
+                400,
+                "transport_mismatch",
+                "this operation reads HTTP request parts, which the invoking \
+                 transport does not carry",
+            ));
+        };
+        let (Some(method), Some(path)) = (request.method(), request.path()) else {
+            return Err(InputRejection::new(
+                500,
+                "request_parts_unavailable",
+                "the HTTP adapter serving this request does not expose raw \
+                 request parts",
+            ));
+        };
+        Ok(Self {
+            method,
+            path: path.to_owned(),
+            scheme: request.scheme().map(str::to_owned),
+            host: request.host().map(str::to_owned),
+            peer_addr: request.peer_addr(),
+        })
     }
 }
 

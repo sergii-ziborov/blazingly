@@ -8,6 +8,15 @@ struct VersionView {
     version: String,
 }
 
+#[api_model]
+#[derive(Clone, Debug)]
+struct PartsView {
+    method: String,
+    path: String,
+    scheme: String,
+    host: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ClientVersion(String);
 
@@ -31,8 +40,18 @@ fn version(Extract(version): Extract<ClientVersion>) -> Json<VersionView> {
     Json(VersionView { version: version.0 })
 }
 
+#[get("/parts", id = "custom.parts", summary = "Read the raw request parts")]
+fn parts(Extract(parts): Extract<RequestParts>) -> Json<PartsView> {
+    Json(PartsView {
+        method: parts.method.as_str().to_owned(),
+        path: parts.path,
+        scheme: parts.scheme.unwrap_or_default(),
+        host: parts.host,
+    })
+}
+
 fn application() -> ExecutableApp {
-    ExecutableApp::new(routes![version]).expect("custom extractor operation compiles")
+    ExecutableApp::new(routes![version, parts]).expect("custom extractor operation compiles")
 }
 
 #[test]
@@ -84,4 +103,51 @@ fn a_custom_extractor_rejection_stays_stable() {
             .expect("custom extractor rejection is JSON")["error"]["code"],
         "missing_input"
     );
+}
+
+#[test]
+fn request_parts_snapshot_the_line_the_adapter_received() {
+    let executable = application();
+    let response = future::block_on(
+        TestApp::new(&executable)
+            .call(Request::get("/parts?tail=ignored").header("host", "api.example")),
+    );
+
+    assert_eq!(response.status(), 200);
+    let body = response
+        .json::<blazingly::json::Value>()
+        .expect("parts response is JSON");
+    assert_eq!(body["method"], "GET");
+    assert_eq!(body["path"], "/parts", "the query string is not the path");
+    assert_eq!(body["scheme"], "http");
+    assert_eq!(body["host"], "api.example");
+
+    let operation = executable
+        .definition()
+        .operations()
+        .iter()
+        .find(|operation| operation.contract.id.as_str() == "custom.parts")
+        .expect("operation is registered")
+        .clone();
+    assert!(
+        operation.contract.inputs.is_empty(),
+        "a raw-parts snapshot is not a documented input"
+    );
+}
+
+/// The parts are HTTP's; a tool call carries no request line to snapshot.
+#[test]
+fn request_parts_reject_a_transport_without_a_request_line() {
+    let arguments = blazingly::json::json!({ "anything": true });
+    let rejection =
+        RequestParts::from_invocation(&InvocationInput::Arguments(&arguments), "parts", true)
+            .expect_err("an MCP-style invocation carries no request parts");
+
+    let blazingly::ExecutionOutcome::Rejected { status, code, .. } =
+        rejection.into_execution_outcome()
+    else {
+        panic!("a rejection renders as a rejected outcome");
+    };
+    assert_eq!(status, 400);
+    assert_eq!(code, "transport_mismatch");
 }
