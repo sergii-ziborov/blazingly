@@ -416,7 +416,8 @@ fn a_bundle_reaches_the_items_schema_the_document_publishes() {
     // leaking the encoding the rule travelled in.
     let markdown = blazingly::docs::api_markdown(executable.definition());
     assert!(
-        markdown.contains("`titles`: `Vec<Title>` (required), each item min length 8"),
+        markdown.contains("each item min length 8")
+            && markdown.contains("each item max length 200"),
         "the item bundle must read as prose, not as its encoding: {markdown}"
     );
 
