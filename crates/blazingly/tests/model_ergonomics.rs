@@ -385,6 +385,87 @@ fn a_bundle_reaches_the_items_of_a_collection() {
     );
 }
 
+/// The document has to publish the bound the request above was rejected by.
+///
+/// The bundle belongs to the item, not to the list: reading `min_length` off
+/// the field would say the list needs eight entries, which is neither what the
+/// validator enforces nor what the client has to satisfy.
+#[test]
+fn a_bundle_reaches_the_items_schema_the_document_publishes() {
+    let executable = app();
+    let document = blazingly::openapi::to_value(executable.definition());
+    let titles = &document["components"]["schemas"]["RenameBatch"]["properties"]["titles"];
+
+    assert_eq!(
+        titles["items"]["minLength"],
+        json!(8),
+        "the item bundle must reach the item schema: {titles}"
+    );
+    assert_eq!(titles["items"]["maxLength"], json!(200));
+    assert_eq!(
+        titles["minItems"],
+        json!(1),
+        "the list keeps the bound declared on the field"
+    );
+    assert!(
+        titles["minLength"].is_null() && titles["maxLength"].is_null(),
+        "an item bound must not be read as a bound on the list: {titles}"
+    );
+
+    // The prose bundle reads as a bound on each element too, rather than
+    // leaking the encoding the rule travelled in.
+    let markdown = blazingly::docs::api_markdown(executable.definition());
+    assert!(
+        markdown.contains("`titles`: `Vec<Title>` (required), each item min length 8"),
+        "the item bundle must read as prose, not as its encoding: {markdown}"
+    );
+
+    // The same rule, enforced and published: the item the runtime refuses is
+    // the item the published schema refuses.
+    let rejected = future::block_on(
+        TestApp::new(&executable).call(
+            Request::post("/titles")
+                .json(&json!({ "titles": ["tiny"] }))
+                .expect("fixture should serialize"),
+        ),
+    );
+    assert_eq!(rejected.status(), 422);
+    assert_eq!(
+        violations(&rejected.json::<Value>().expect("a JSON response")),
+        [("titles[0]".to_owned(), "min_length".to_owned())]
+    );
+}
+
+/// A rejection the runtime can return is a response the document declares.
+#[test]
+fn the_rejection_every_decoded_input_can_produce_is_documented() {
+    let document = blazingly::openapi::to_value(app().definition());
+    let rejection = &document["paths"]["/titles"]["post"]["responses"]["422"];
+
+    assert!(
+        !rejection.is_null(),
+        "an operation that decodes a body documents the rejection it can return"
+    );
+    let schema = &rejection["content"]["application/json"]["schema"];
+    let codes = schema["properties"]["error"]["properties"]["code"]["enum"]
+        .as_array()
+        .expect("the codes a rejection can carry are a closed set");
+    assert!(
+        codes.contains(&json!("validation_error")),
+        "the code the runtime reports must be documented: {codes:?}"
+    );
+
+    let violation = &schema["properties"]["error"]["properties"]["details"]["properties"]["violations"]
+        ["items"];
+    assert_eq!(violation["properties"]["field"]["type"], "string");
+    assert_eq!(violation["properties"]["code"]["type"], "string");
+    assert_eq!(
+        rejection["x-blazingly-automatic"],
+        json!(true),
+        "a response the framework projects is marked as one it was not declared"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Enumerations.
 // ---------------------------------------------------------------------------

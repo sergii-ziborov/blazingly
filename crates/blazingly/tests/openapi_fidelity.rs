@@ -97,15 +97,22 @@ fn the_documented_422_is_the_envelope_the_service_actually_returns() {
     let document = document(&executable);
 
     let documented = &document["paths"]["/notes"]["post"]["responses"]["422"];
-    assert_eq!(documented["x-blazingly-error-code"], "validation_error");
-    let schema = &documented["content"]["application/json"]["schema"];
     assert_eq!(
-        schema["properties"]["error"]["properties"]["code"]["const"],
-        "validation_error"
+        documented["x-blazingly-automatic"],
+        json!(true),
+        "the projected rejection is marked as one the operation did not declare"
+    );
+    let schema = &documented["content"]["application/json"]["schema"];
+    let codes = schema["properties"]["error"]["properties"]["code"]["enum"]
+        .as_array()
+        .expect("the rejection carries a closed set of codes");
+    assert!(
+        codes.contains(&json!("validation_error")),
+        "the code the runtime returns below must be documented: {codes:?}"
     );
     assert!(
         document["paths"]["/health"]["get"]["responses"]["422"].is_null(),
-        "an operation with no validated input does not claim a 422"
+        "an operation that decodes no input does not claim a 422"
     );
 
     let rejected = future::block_on(

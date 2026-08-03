@@ -2691,7 +2691,8 @@ fn nested_rule_descriptor(
 /// Copies a declared value type's rules into the field that uses it.
 ///
 /// Only a scalar-shaped field inherits: a `Vec<Title>` field would otherwise
-/// claim the item's bounds as its own.
+/// claim the item's bounds as its own. A collection needs no copy at all — the
+/// item's `TypeDescriptor` carries the rules the type itself declared.
 fn inherited_rule_descriptor(
     validation_type: &Type,
     shape: FieldShape,

@@ -14,12 +14,13 @@ pinned submodule revision is recorded as a single entry.
 
 ### Changed
 
-- Advanced the portable contract format to v1.3 so value-type constraints are
-  retained on `TypeDescriptor`, including collection items and nested values,
-  and participate in fingerprints and compatibility reports.
-- OpenAPI projection now carries those recursive type constraints and derives
-  the framework's structured `422 validation_error` response for operations
-  with validated inputs without replacing an explicitly declared `422`.
+- Advanced the portable contract format to v1.3 (`blazingly-contract` 0.4.0):
+  value-type constraints are retained on `TypeDescriptor`, including collection
+  items and nested values, and participate in fingerprints and compatibility
+  reports. Every fingerprint moves with the format version, so recorded
+  baselines must be recaptured when upgrading; in exchange, tightening an
+  item's own bounds is now reported at the item path instead of as an opaque
+  custom-validator change.
 - Reworked compiled routing around a static-path table, compact method slots,
   a parameter trie with allocation-free backtracking for small captures, and a
   cheaper path hasher. `404`/`405` resolution and sorted `Allow` construction
@@ -43,10 +44,28 @@ pinned submodule revision is recorded as a single entry.
   from response encoding, adds reusable prepared headers, and removes
   quadratic inline-header insertion during parsing.
 
+### Added
+
+- Operations whose input is decoded now document the `422` they can return
+  before the handler runs, the way the runtime already answers. The response
+  carries the rejection envelope, the closed set of codes that operation's own
+  inputs can produce — derived per input source from the executor's actual
+  behaviour, so a JSON body can fail as `invalid_json` even with no declared
+  rule — and the `violations` array naming the field path and code of each
+  broken rule. An operation that only streams bytes documents no `422`, and an
+  operation that declares its own `422` keeps it. The projected response is
+  marked `x-blazingly-automatic` so a reader can tell it from a declared one.
+
 ### Fixed
 
-- Preserved declared validation constraints through nested OpenAPI schemas and
-  kept the documented `422` envelope aligned with the runtime rejection shape.
+- The rules a value type declares now reach the item schema wherever the type
+  appears: `#[api_model] #[max_length(20)] struct Tag(String);` used as
+  `tags: Vec<Tag>` published items as a bare `{"type": "string"}` in
+  `/openapi.json`, in MCP tool schemas, and in the generated Markdown, while
+  the validator rejected an over-long element at `tags[0]`. The bounds now
+  survive as collection items, behind `Option`, and at any nesting depth. The
+  same gap dropped an enumeration's variants, so a generated sample for
+  `Vec<Language>` was a payload the server refused.
 - Kept blocking workers available after panicking jobs and ensured pool drop
   wakes workers so queued work drains before shutdown.
 - Avoided a nested database scheduling deadlock when database work is invoked

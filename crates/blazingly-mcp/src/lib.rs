@@ -397,19 +397,26 @@ const fn input_source_name(source: InputSource) -> &'static str {
     }
 }
 
+/// Projects one type, including the rules the type itself declares.
+///
+/// The recursion is what carries a value type's bounds into a `Vec<Tag>` item
+/// and into every deeper nesting: the item is a descriptor of its own, so it is
+/// projected by the same code that projects a bare field of that type.
 fn schema_value(descriptor: &TypeDescriptor) -> Value {
-    if let Some(model) = &descriptor.model {
-        return model_schema(model);
-    }
-
-    let mut value = match (&descriptor.schema, &descriptor.items) {
-        (SchemaKind::Array(_), Some(items)) => {
-            json!({ "type": "array", "items": schema_value(items) })
-        }
-        _ => schema_kind_value(&descriptor.schema),
+    let mut value = if let Some(model) = &descriptor.model {
+        model_schema(model)
+    } else {
+        let mut value = match (&descriptor.schema, &descriptor.items) {
+            (SchemaKind::Array(_), Some(items)) => {
+                json!({ "type": "array", "items": schema_value(items) })
+            }
+            _ => schema_kind_value(&descriptor.schema),
+        };
+        apply_known_string_format(&mut value, &descriptor.rust_name);
+        value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
+        value
     };
-    apply_known_string_format(&mut value, &descriptor.rust_name);
-    value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
+    apply_validation(&mut value, &descriptor.constraints);
     value
 }
 
@@ -504,17 +511,7 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
             ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
             ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
             ValidationRule::Email => schema["format"] = json!("email"),
-            ValidationRule::Alias(alias) => {
-                let aliases = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-aliases")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                aliases
-                    .as_array_mut()
-                    .expect("alias extension must be an array")
-                    .push(Value::String(alias.clone()));
-            }
+            ValidationRule::Alias(alias) => push_extension(schema, "x-blazingly-aliases", alias),
             ValidationRule::Custom(validator) => {
                 // Declarative constraints are encoded as `keyword=value` inside
                 // `Custom`; project the ones that map to a JSON Schema keyword
@@ -528,20 +525,30 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
                     constraint.apply_json_schema(schema);
                     continue;
                 }
-                let validators = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-validators")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                validators
-                    .as_array_mut()
-                    .expect("validator extension must be an array")
-                    .push(Value::String(validator.clone()));
+                push_extension(schema, "x-blazingly-validators", validator);
             }
             ValidationRule::Nested => {
                 schema["x-blazingly-nested-validation"] = Value::Bool(true);
             }
         }
+    }
+}
+
+/// Appends one name to a document extension array, at most once.
+///
+/// A field declared with a value type is projected twice — once from the type's
+/// own constraints, once from the rules the field inherited from it — and a
+/// keyword that overwrites is idempotent where an array is not.
+fn push_extension(schema: &mut Value, keyword: &str, name: &str) {
+    let names = schema
+        .as_object_mut()
+        .expect("validation schema must be an object")
+        .entry(keyword)
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("a document extension list must be an array");
+    if !names.iter().any(|declared| declared.as_str() == Some(name)) {
+        names.push(Value::String(name.to_owned()));
     }
 }
 
@@ -599,6 +606,85 @@ mod tests {
         assert_eq!(
             discovery["tools"][0]["x-blazingly"]["confirmation"],
             "required"
+        );
+    }
+
+    /// An agent has to read the bound on each element, not only on the list.
+    ///
+    /// A tool schema that omits the item contract invites a call the server
+    /// then rejects, so a rule scoped to the items lands on the item schema
+    /// rather than beside the array or in the opaque validator list.
+    #[test]
+    fn an_item_bundle_reaches_the_item_schema_a_tool_publishes() {
+        let tag = TypeDescriptor::scalar("Tag", SchemaKind::String).with_constraints(vec![
+            ValidationRule::MinLength(1),
+            ValidationRule::MaxLength(20),
+            ValidationRule::Custom("enum=news|sport".to_owned()),
+        ]);
+        let tags = TypeDescriptor {
+            rust_name: "Vec<Tag>".to_owned(),
+            schema: SchemaKind::Array(Box::new(SchemaKind::String)),
+            model: None,
+            items: Some(Box::new(tag)),
+            constraints: Vec::new(),
+        };
+        let model = ModelDescriptor::new(
+            "CreatePost",
+            vec![FieldDescriptor::new(
+                "tags",
+                true,
+                tags,
+                vec![ValidationRule::Custom("max_items=5".to_owned())],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/posts",
+            "posts.create",
+            "Create a post",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .expect("operation should be valid")
+        .with_mcp_tool(
+            McpToolDescriptor::new("create_post", "Create one post"),
+            AgentPolicy {
+                risk: OperationRisk::Write,
+                confirmation: Confirmation::Never,
+                idempotent: false,
+            },
+        );
+        let app = App::new()
+            .route(operation)
+            .build()
+            .expect("application should be valid");
+
+        let discovery = super::to_value(&app);
+        let tags = &discovery["tools"][0]["inputSchema"]["properties"]["tags"];
+
+        // `max_items` travels in the `Custom` channel, which only the
+        // constraint reader turned on by `validation` can decode.
+        #[cfg(feature = "validation")]
+        assert_eq!(tags["maxItems"], blazingly_json::json!(5));
+        assert_eq!(
+            tags["items"]["minLength"],
+            blazingly_json::json!(1),
+            "an item bound belongs to the item schema: {tags}"
+        );
+        assert_eq!(tags["items"]["maxLength"], blazingly_json::json!(20));
+        assert_eq!(
+            tags["items"]["enum"],
+            blazingly_json::json!(["news", "sport"])
+        );
+        assert!(
+            tags["maxLength"].is_null(),
+            "an item bound must not be read as a bound on the list: {tags}"
+        );
+        #[cfg(feature = "validation")]
+        assert!(
+            tags["x-blazingly-validators"].is_null()
+                && tags["items"]["x-blazingly-validators"].is_null(),
+            "a recovered item rule must not also appear as an opaque validator: {tags}"
         );
     }
 

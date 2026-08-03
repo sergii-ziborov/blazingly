@@ -749,6 +749,22 @@ const fn input_source_name(source: InputSource) -> &'static str {
     }
 }
 
+/// The prose a `keyword=value` rule reads as.
+///
+/// A declarative constraint reads better as its own keyword than as an opaque
+/// validator name, and the same keywords describe a field and a collection's
+/// items alike, so both scopes share one reading.
+fn describe_encoded_rule(encoded: &str) -> String {
+    if let Some(metadata) = FieldMetadata::parse(encoded) {
+        return describe_metadata(&metadata);
+    }
+    #[cfg(feature = "validation")]
+    if let Some(constraint) = blazingly_validation::Constraint::parse(encoded) {
+        return constraint.to_string();
+    }
+    format!("validator `{encoded}`")
+}
+
 /// Renders a recovered default, nullability marker, or enumeration as prose.
 fn describe_metadata(metadata: &FieldMetadata) -> String {
     match metadata {
@@ -773,40 +789,34 @@ fn write_model(output: &mut String, model: &ModelDescriptor) {
             field.name, field.ty.rust_name
         );
         for rule in &field.validation {
-            match rule {
-                ValidationRule::MinLength(value) => {
-                    let _ = write!(output, ", min length {value}");
-                }
-                ValidationRule::MaxLength(value) => {
-                    let _ = write!(output, ", max length {value}");
-                }
-                ValidationRule::Email => output.push_str(", email"),
-                ValidationRule::Alias(alias) => {
-                    let _ = write!(output, ", alias `{alias}`");
-                }
-                ValidationRule::Custom(validator) => {
-                    // A declarative constraint reads better as its own keyword
-                    // than as an opaque validator name.
-                    if let Some(metadata) = FieldMetadata::parse(validator) {
-                        let _ = write!(output, ", {}", describe_metadata(&metadata));
-                        continue;
-                    }
-                    #[cfg(feature = "validation")]
-                    let rendered = blazingly_validation::Constraint::parse(validator)
-                        .map(|constraint| constraint.to_string());
-                    #[cfg(not(feature = "validation"))]
-                    let rendered: Option<String> = None;
-                    let _ = match rendered {
-                        Some(constraint) => write!(output, ", {constraint}"),
-                        None => write!(output, ", validator `{validator}`"),
-                    };
-                }
-                ValidationRule::Nested => output.push_str(", nested validation"),
+            let _ = write!(output, ", {}", describe_rule(rule));
+        }
+        // The rules a value type declares for a collection's elements ride on
+        // the item descriptor, one level of scope per level of nesting.
+        let mut scope = String::new();
+        let mut items = field.ty.items.as_deref();
+        while let Some(item) = items {
+            scope.push_str("each item ");
+            for rule in &item.constraints {
+                let _ = write!(output, ", {scope}{}", describe_rule(rule));
             }
+            items = item.items.as_deref();
         }
         output.push('\n');
     }
     output.push('\n');
+}
+
+/// One recorded rule as prose, whichever contract variant carries it.
+fn describe_rule(rule: &ValidationRule) -> String {
+    match rule {
+        ValidationRule::MinLength(value) => format!("min length {value}"),
+        ValidationRule::MaxLength(value) => format!("max length {value}"),
+        ValidationRule::Email => "email".to_owned(),
+        ValidationRule::Alias(alias) => format!("alias `{alias}`"),
+        ValidationRule::Custom(validator) => describe_encoded_rule(validator),
+        ValidationRule::Nested => "nested validation".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -1025,6 +1035,59 @@ mod tests {
                 .unwrap()
                 .contains("\"draft\""),
             "a declared default belongs in the sample request"
+        );
+    }
+
+    /// A bound on each element reads as one, not as a bound on the list.
+    #[test]
+    fn an_item_bundle_reads_as_a_rule_about_each_element() {
+        let title = TypeDescriptor::scalar("Title", SchemaKind::String).with_constraints(vec![
+            ValidationRule::MinLength(8),
+            ValidationRule::Custom("enum=news|sport".to_owned()),
+        ]);
+        let titles = TypeDescriptor {
+            rust_name: "Vec<Title>".to_owned(),
+            schema: SchemaKind::Array(Box::new(SchemaKind::String)),
+            model: None,
+            items: Some(Box::new(title)),
+            constraints: Vec::new(),
+        };
+        let model = ModelDescriptor::new(
+            "RenameBatch",
+            vec![FieldDescriptor::new(
+                "titles",
+                true,
+                titles,
+                vec![ValidationRule::Custom("min_items=1".to_owned())],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/titles",
+            "articles.rename",
+            "Rename articles",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::api_markdown(&app);
+        assert!(
+            document.contains("each item min length 8"),
+            "an item bound says which scope it bounds: {document}"
+        );
+        assert!(
+            document.contains("each item one of `news`, `sport`"),
+            "{document}"
+        );
+        assert!(
+            document.contains("min_items=1") || document.contains("min items 1"),
+            "{document}"
+        );
+        assert!(
+            !document.contains("validator `items."),
+            "a recovered item rule must not read as an opaque validator: {document}"
         );
     }
 }

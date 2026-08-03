@@ -94,10 +94,7 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
 
     let mut security = contract.security.iter().collect::<Vec<_>>();
     security.sort_by(|left, right| left.scheme.cmp(&right.scheme));
-    let security = security
-        .into_iter()
-        .map(security_value)
-        .collect::<Vec<_>>();
+    let security = security.into_iter().map(security_value).collect::<Vec<_>>();
 
     let mut responses = contract.responses.iter().collect::<Vec<_>>();
     responses.sort_by(|left, right| {
@@ -116,16 +113,14 @@ fn operation_value(operation: &OperationDescriptor) -> Value {
         .map(response_value)
         .collect::<Vec<_>>();
 
-    let (exposed, tool_name, output_exposure) = contract.mcp.as_ref().map_or(
-        (false, None, None),
-        |tool| {
+    let (exposed, tool_name, output_exposure) =
+        contract.mcp.as_ref().map_or((false, None, None), |tool| {
             (
                 true,
                 Some(tool.name.as_str()),
                 Some(output_exposure_name(tool.expose_output)),
             )
-        },
-    );
+        });
 
     json!({
         "id": contract.id.as_str(),
@@ -358,8 +353,10 @@ mod tests {
             DependencyDescriptor::new("Repository"),
             DependencyDescriptor::new("Clock"),
         ])
-        .with_security(vec![SecurityRequirement::new("operator")
-            .with_scopes(vec!["write".to_owned(), "read".to_owned()])])
+        .with_security(vec![
+            SecurityRequirement::new("operator")
+                .with_scopes(vec!["write".to_owned(), "read".to_owned()]),
+        ])
         .with_mcp_tool(
             McpToolDescriptor::new("rotate_admin", "must-not-appear")
                 .with_output_exposure(OutputExposure::SummaryOnly),
