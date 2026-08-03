@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
 use blazingly_core::{
-    AppDefinition, FieldMetadata, InputDescriptor, InputSource, ModelDescriptor,
-    OperationDescriptor, SchemaKind, SecurityLocation, SecuritySchemeDescriptor,
-    SecuritySchemeKind, TypeDescriptor, ValidationRule,
+    AppDefinition, InputDescriptor, InputSource, ModelDescriptor, OperationDescriptor, SchemaKind,
+    SecurityLocation, SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationRule,
 };
 use blazingly_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -876,58 +875,38 @@ fn request_media_type(source: InputSource) -> &'static str {
     }
 }
 
-/// Projects one type, including the rules the type itself declares.
+/// The format decisions that make the shared projection an `OpenAPI` one.
 ///
-/// The recursion is what carries a value type's bounds into a `Vec<Tag>` item
-/// and into every deeper nesting: the item is a descriptor of its own, so it is
-/// projected by the same code that projects a bare field of that type.
-fn schema_value(descriptor: &TypeDescriptor) -> Value {
-    let mut value = if let Some(model) = &descriptor.model {
+/// A model appears as a `$ref` into `#/components/schemas` — the component
+/// itself is written once by [`collect_model`] — and raw bytes are spelled
+/// `format: "binary"`. Declarative constraints that predate a contract
+/// variant are decoded by the optional constraint reader.
+struct OpenApiDialect;
+
+impl blazingly_core::schema::SchemaDialect for OpenApiDialect {
+    fn model_node(&self, descriptor: &TypeDescriptor, model: &ModelDescriptor) -> Value {
         json!({
             "$ref": format!("#/components/schemas/{}", model.name),
             "x-rust-type": descriptor.rust_name
         })
-    } else {
-        let mut value = match (&descriptor.schema, &descriptor.items) {
-            (SchemaKind::Array(_), Some(items)) => {
-                json!({ "type": "array", "items": schema_value(items) })
-            }
-            _ => schema_kind_value(&descriptor.schema),
-        };
-        apply_known_string_format(&mut value, &descriptor.rust_name);
-        value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
-        value
-    };
-    apply_validation(&mut value, &descriptor.constraints);
-    value
-}
-
-fn apply_known_string_format(schema: &mut Value, rust_name: &str) {
-    let format = match rust_name {
-        "Uuid" => "uuid",
-        "Url" => "uri",
-        "IpAddress" => "ip",
-        "Date" => "date",
-        "DateTime" => "date-time",
-        "Decimal" => "decimal",
-        _ => return,
-    };
-    schema["format"] = Value::String(format.to_owned());
-}
-
-fn schema_kind_value(schema: &SchemaKind) -> Value {
-    match schema {
-        SchemaKind::String => json!({ "type": "string" }),
-        SchemaKind::Binary => json!({ "type": "string", "format": "binary" }),
-        SchemaKind::Integer => json!({ "type": "integer" }),
-        SchemaKind::Number => json!({ "type": "number" }),
-        SchemaKind::Boolean => json!({ "type": "boolean" }),
-        SchemaKind::Array(item) => {
-            json!({ "type": "array", "items": schema_kind_value(item) })
-        }
-        SchemaKind::Object => json!({ "type": "object" }),
-        SchemaKind::Any => json!({}),
     }
+
+    fn binary_node(&self) -> Value {
+        json!({ "type": "string", "format": "binary" })
+    }
+
+    #[cfg(feature = "validation")]
+    fn project_custom_validator(&self, schema: &mut Value, validator: &str) -> bool {
+        let Some(constraint) = blazingly_validation::Constraint::parse(validator) else {
+            return false;
+        };
+        constraint.apply_json_schema(schema);
+        true
+    }
+}
+
+fn schema_value(descriptor: &TypeDescriptor) -> Value {
+    blazingly_core::schema::schema_value(&OpenApiDialect, descriptor)
 }
 
 fn collect_model(descriptor: &TypeDescriptor, schemas: &mut Map<String, Value>) {
@@ -1015,113 +994,11 @@ fn security_scheme_value(scheme: &SecuritySchemeDescriptor) -> Value {
 }
 
 fn model_schema(model: &ModelDescriptor) -> Value {
-    let mut properties = Map::new();
-    let mut required = Vec::new();
-
-    for field in &model.fields {
-        let mut schema = schema_value(&field.ty);
-        apply_validation(&mut schema, &field.validation);
-        properties.insert(field.name.clone(), schema);
-        if field.required {
-            required.push(field.name.clone());
-        }
-    }
-
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    })
-}
-
-/// Projects a recovered default, enumeration, or nullability marker.
-///
-/// `OpenAPI` 3.1 follows JSON Schema 2020-12, which dropped the `nullable`
-/// keyword: a value that also accepts `null` widens its own `type` into a union
-/// instead, and a reference is wrapped in an `anyOf` because a `$ref` node has
-/// no type of its own to widen.
-fn apply_field_metadata(schema: &mut Value, metadata: &FieldMetadata) {
-    match metadata {
-        FieldMetadata::Default(value) => schema["default"] = value.clone(),
-        FieldMetadata::Enumeration(values) => {
-            schema["enum"] = Value::Array(
-                values
-                    .iter()
-                    .map(|value| Value::String(value.clone()))
-                    .collect(),
-            );
-        }
-        FieldMetadata::Nullable => widen_with_null(schema),
-    }
-}
-
-fn widen_with_null(schema: &mut Value) {
-    let Some(declared) = schema.as_object().map(|object| object.get("type").cloned()) else {
-        return;
-    };
-    match declared {
-        Some(Value::String(name)) => schema["type"] = json!([name, "null"]),
-        Some(Value::Array(mut names)) => {
-            if !names.iter().any(|name| name.as_str() == Some("null")) {
-                names.push(Value::String("null".to_owned()));
-                schema["type"] = Value::Array(names);
-            }
-        }
-        Some(_) | None => {
-            if schema.get("$ref").is_some() {
-                let referenced = std::mem::replace(schema, Value::Null);
-                *schema = json!({ "anyOf": [referenced, { "type": "null" }] });
-            }
-        }
-    }
+    blazingly_core::schema::model_schema(&OpenApiDialect, model)
 }
 
 fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
-    for rule in validation {
-        match rule {
-            ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
-            ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
-            ValidationRule::Email => schema["format"] = json!("email"),
-            ValidationRule::Alias(alias) => push_extension(schema, "x-blazingly-aliases", alias),
-            ValidationRule::Custom(validator) => {
-                // Declarative constraints are encoded as `keyword=value` inside
-                // `Custom`; project the ones that map to a JSON Schema keyword
-                // instead of leaving them as opaque validator strings.
-                if let Some(metadata) = FieldMetadata::parse(validator) {
-                    apply_field_metadata(schema, &metadata);
-                    continue;
-                }
-                #[cfg(feature = "validation")]
-                if let Some(constraint) = blazingly_validation::Constraint::parse(validator) {
-                    constraint.apply_json_schema(schema);
-                    continue;
-                }
-                push_extension(schema, "x-blazingly-validators", validator);
-            }
-            ValidationRule::Nested => {
-                schema["x-blazingly-nested-validation"] = Value::Bool(true);
-            }
-        }
-    }
-}
-
-/// Appends one name to a document extension array, at most once.
-///
-/// A field declared with a value type is projected twice — once from the type's
-/// own constraints, once from the rules the field inherited from it — and a
-/// keyword that overwrites is idempotent where an array is not.
-fn push_extension(schema: &mut Value, keyword: &str, name: &str) {
-    let names = schema
-        .as_object_mut()
-        .expect("validation schema must be an object")
-        .entry(keyword)
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .expect("a document extension list must be an array");
-    if !names.iter().any(|declared| declared.as_str() == Some(name)) {
-        names.push(Value::String(name.to_owned()));
-    }
+    blazingly_core::schema::apply_validation(&OpenApiDialect, schema, validation);
 }
 
 #[cfg(test)]

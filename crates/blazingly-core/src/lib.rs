@@ -19,6 +19,10 @@ pub use blazingly_contract::{
     SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor, ValidationErrors, ValidationRule,
 };
 
+/// Shared plumbing for the first-party schema projections, not stable API.
+#[doc(hidden)]
+pub mod schema;
+
 // ---------------------------------------------------------------------------
 // Response body sizing
 // ---------------------------------------------------------------------------
