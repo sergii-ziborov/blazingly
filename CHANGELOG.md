@@ -12,8 +12,24 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
+### Added
+
+- `Plugin::mount("/v1")` and `Plugin::with_id_namespace("v1")`: a module
+  written once mounts under two path prefixes without restating a handler.
+  Prefixes and namespaces nest, identities and MCP tool names stay distinct
+  per mount, and malformed or colliding mounts fail at build time.
+- `Extract<RequestParts>`: an owned snapshot of the raw request line and
+  connection — method, path, effective scheme and host, peer address — taken
+  before the handler runs. `HttpRequestParts` gained the matching borrowed
+  accessors (defaulted, so existing adapters keep compiling), and a transport
+  without a request line rejects with `400 transport_mismatch`.
+
 ### Changed
 
+- The `OpenAPI` and MCP schema projections now share one traversal in
+  `blazingly-core`'s hidden `schema` module, parameterised by a small dialect
+  trait; both generated documents are unchanged. The duplication had let the
+  two documents drift twice.
 - Advanced the portable contract format to v1.3 (`blazingly-contract` 0.4.0):
   value-type constraints are retained on `TypeDescriptor`, including collection
   items and nested values, and participate in fingerprints and compatibility
