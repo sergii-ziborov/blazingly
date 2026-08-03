@@ -18,6 +18,7 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::str::Utf8Error;
@@ -1776,11 +1777,112 @@ fn openapi_response(asset: OpenApiAssetResponse) -> Response {
     response
 }
 
+/// Every [`HttpMethod`] variant, in `Ord` order.
+///
+/// The `Allow` header of a 405 is rendered by walking this table low bit
+/// first, so the order is what makes that list sorted; it must stay in sync
+/// with the `HttpMethod` declaration order and with [`method_index`].
+const METHODS: [HttpMethod; METHOD_COUNT] = [
+    HttpMethod::Get,
+    HttpMethod::Head,
+    HttpMethod::Post,
+    HttpMethod::Put,
+    HttpMethod::Patch,
+    HttpMethod::Delete,
+    HttpMethod::Options,
+    HttpMethod::Trace,
+    HttpMethod::Connect,
+];
+
+const METHOD_COUNT: usize = 9;
+
+const fn method_index(method: HttpMethod) -> usize {
+    match method {
+        HttpMethod::Get => 0,
+        HttpMethod::Head => 1,
+        HttpMethod::Post => 2,
+        HttpMethod::Put => 3,
+        HttpMethod::Patch => 4,
+        HttpMethod::Delete => 5,
+        HttpMethod::Options => 6,
+        HttpMethod::Trace => 7,
+        HttpMethod::Connect => 8,
+    }
+}
+
+const PATH_HASH_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// `FxHash`-style mixer for route paths and their segments.
+///
+/// The router hashes a path on every request; `SipHash` key setup and its
+/// per-byte round dominated that probe. This consumes eight bytes per
+/// multiply, and is hand-rolled because the workspace ships no hasher
+/// dependency. It is not collision-resistant and must never be used on
+/// attacker-chosen keys that are stored — the tables here are built once from
+/// the operation graph and only probed at runtime.
+#[derive(Default)]
+struct PathHasher {
+    hash: u64,
+}
+
+impl PathHasher {
+    fn mix(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(PATH_HASH_SEED);
+    }
+}
+
+impl Hasher for PathHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut word = [0_u8; 8];
+        let mut index = 0;
+        while index + 8 <= bytes.len() {
+            word.copy_from_slice(&bytes[index..index + 8]);
+            self.mix(u64::from_le_bytes(word));
+            index += 8;
+        }
+        let tail = &bytes[index..];
+        if !tail.is_empty() {
+            word = [0; 8];
+            word[..tail.len()].copy_from_slice(tail);
+            self.mix(u64::from_le_bytes(word));
+        }
+        // Zero padding makes "a" and "a\0" hash alike without this.
+        self.mix(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type PathMap<Value> = HashMap<Box<str>, Value, BuildHasherDefault<PathHasher>>;
+
+/// One static path segment and the trie node it leads to.
+struct StaticChild {
+    head: u8,
+    node: usize,
+    segment: Box<str>,
+}
+
 #[derive(Default)]
 struct RouteNode {
-    static_children: HashMap<String, usize>,
+    /// Only parameterized routes reach the trie, so these sets are tiny; a
+    /// scan filtered by the first segment byte beats hashing every segment.
+    static_children: Vec<StaticChild>,
     parameter_child: Option<usize>,
-    endpoints: BTreeMap<HttpMethod, CompiledEndpoint>,
+    /// Bit [`method_index`] set when `endpoints[method_index]` is bound.
+    methods: u16,
+    endpoints: [usize; METHOD_COUNT],
+}
+
+impl RouteNode {
+    fn static_child(&self, segment: &str) -> Option<usize> {
+        let head = head_byte(segment);
+        self.static_children
+            .iter()
+            .find(|child| child.head == head && &*child.segment == segment)
+            .map(|child| child.node)
+    }
 }
 
 #[derive(Clone)]
@@ -1790,10 +1892,28 @@ struct CompiledEndpoint {
     body_source: Option<InputSource>,
 }
 
+/// What one static path resolves to, for every method at once.
+///
+/// Holding the whole method row behind a single key is what lets a miss
+/// decide 404 versus 405 without a second hash: the probe that failed to find
+/// the requested method already reported which methods the path does answer.
+#[derive(Default)]
+struct StaticSlot {
+    /// Bit [`method_index`] set when `endpoints[method_index]` is bound.
+    methods: u16,
+    endpoints: [usize; METHOD_COUNT],
+}
+
 /// A runtime-neutral router compiled once from the operation graph.
 pub struct Router {
     nodes: Vec<RouteNode>,
-    static_routes: HashMap<HttpMethod, HashMap<String, CompiledEndpoint>>,
+    /// Endpoints reached through either table; both hold slots into this.
+    endpoints: Vec<CompiledEndpoint>,
+    static_routes: PathMap<StaticSlot>,
+    /// Rejection filter over `(second path byte, path length)` for every
+    /// static path. A path whose bit is clear cannot be static, so dynamic
+    /// requests skip the static probe outright.
+    static_filter: [u64; 2],
 }
 
 impl Router {
@@ -1801,7 +1921,9 @@ impl Router {
     pub fn new(app: &ExecutableApp) -> Self {
         let mut router = Self {
             nodes: vec![RouteNode::default()],
-            static_routes: HashMap::new(),
+            endpoints: Vec::new(),
+            static_routes: PathMap::default(),
+            static_filter: [0; 2],
         };
         for descriptor in app.definition().operations() {
             let Some(operation_index) = app.operation_index(&descriptor.contract.id) else {
@@ -1821,39 +1943,48 @@ impl Router {
                 .collect(),
             body_source: body_source(descriptor),
         };
+        let method = method_index(descriptor.http.method);
         if endpoint.parameter_names.is_empty() {
-            self.static_routes
-                .entry(descriptor.http.method)
-                .or_default()
-                .insert(descriptor.http.path.clone(), endpoint);
+            let path = descriptor.http.path.as_str();
+            let (word, bit) = static_filter_slot(path);
+            self.static_filter[word] |= bit;
+            let slot = self.endpoints.len();
+            self.endpoints.push(endpoint);
+            let entry = self.static_routes.entry(path.into()).or_default();
+            entry.endpoints[method] = slot;
+            entry.methods |= 1_u16 << method;
             return;
         }
 
         let mut node_index = 0;
         for segment in route_segments(&descriptor.http.path) {
-            if path_parameter_name(segment).is_some() {
-                node_index = if let Some(child) = self.nodes[node_index].parameter_child {
+            node_index = if path_parameter_name(segment).is_some() {
+                if let Some(child) = self.nodes[node_index].parameter_child {
                     child
                 } else {
                     let child = self.nodes.len();
                     self.nodes.push(RouteNode::default());
                     self.nodes[node_index].parameter_child = Some(child);
                     child
-                };
-            } else if let Some(child) = self.nodes[node_index].static_children.get(segment) {
-                node_index = *child;
+                }
+            } else if let Some(child) = self.nodes[node_index].static_child(segment) {
+                child
             } else {
                 let child = self.nodes.len();
                 self.nodes.push(RouteNode::default());
-                self.nodes[node_index]
-                    .static_children
-                    .insert(segment.to_owned(), child);
-                node_index = child;
-            }
+                self.nodes[node_index].static_children.push(StaticChild {
+                    head: head_byte(segment),
+                    node: child,
+                    segment: segment.into(),
+                });
+                child
+            };
         }
-        self.nodes[node_index]
-            .endpoints
-            .insert(descriptor.http.method, endpoint);
+        let slot = self.endpoints.len();
+        self.endpoints.push(endpoint);
+        let node = &mut self.nodes[node_index];
+        node.endpoints[method] = slot;
+        node.methods |= 1_u16 << method;
     }
 
     /// Resolves an HTTP method and path to a direct executable operation slot.
@@ -1867,10 +1998,16 @@ impl Router {
         method: HttpMethod,
         path: &'path str,
     ) -> Result<RouteMatch<'router, 'path>, RouteError> {
-        if let Some(endpoint) = self
-            .static_routes
-            .get(&method)
-            .and_then(|routes| routes.get(path))
+        let method = method_index(method);
+        let (word, bit) = static_filter_slot(path);
+        let slot = if self.static_filter[word] & bit == 0 {
+            None
+        } else {
+            self.static_routes.get(path)
+        };
+        if let Some(slot) = slot
+            && slot.methods & (1_u16 << method) != 0
+            && let Some(endpoint) = self.endpoints.get(slot.endpoints[method])
         {
             return Ok(RouteMatch {
                 endpoint,
@@ -1878,81 +2015,128 @@ impl Router {
             });
         }
 
-        if let Some((endpoint, captures)) =
-            self.find_dynamic(0, route_segments(path), method, CapturedSegments::new())
-        {
+        let mut captures = CapturedSegments::new();
+        let mut other_methods = false;
+        if let Some(endpoint) = self.walk(
+            0,
+            Some(trim_leading_slash(path)),
+            method,
+            &mut captures,
+            &mut other_methods,
+        ) {
             return Ok(RouteMatch { endpoint, captures });
         }
 
-        let mut allowed = self
-            .static_routes
-            .iter()
-            .filter_map(|(allowed_method, routes)| {
-                routes.contains_key(path).then_some(*allowed_method)
-            })
-            .collect::<Vec<_>>();
-        self.collect_dynamic_methods(0, route_segments(path), &mut allowed);
-        allowed.sort_unstable();
-        allowed.dedup();
-        if allowed.is_empty() {
-            Err(RouteError::NotFound)
-        } else {
-            Err(RouteError::MethodNotAllowed { allowed })
+        let static_methods = slot.map_or(0, |slot| slot.methods);
+        if static_methods == 0 && !other_methods {
+            return Err(RouteError::NotFound);
         }
+        Err(RouteError::MethodNotAllowed {
+            allowed: self.allowed_methods(path, static_methods),
+        })
     }
 
-    fn find_dynamic<'router, 'path, I>(
+    /// Walks the parameter trie for `method`, recording in `other_methods`
+    /// whether the path exists under a method that was not asked for. That one
+    /// bit is what lets a 404 answer without a second walk.
+    ///
+    /// `captures` is a stack: a parameter descent pushes and pops on failure,
+    /// so backtracking never copies it.
+    fn walk<'router, 'path>(
         &'router self,
         node_index: usize,
-        mut segments: I,
-        method: HttpMethod,
-        captures: CapturedSegments<'path>,
-    ) -> Option<(&'router CompiledEndpoint, CapturedSegments<'path>)>
-    where
-        I: Iterator<Item = &'path str> + Clone,
-    {
-        let Some(segment) = segments.next() else {
-            return self.nodes[node_index]
-                .endpoints
-                .get(&method)
-                .map(|endpoint| (endpoint, captures));
+        rest: Option<&'path str>,
+        method: usize,
+        captures: &mut CapturedSegments<'path>,
+        other_methods: &mut bool,
+    ) -> Option<&'router CompiledEndpoint> {
+        let node = &self.nodes[node_index];
+        let Some(rest) = rest else {
+            if node.methods & (1_u16 << method) == 0 {
+                *other_methods |= node.methods != 0;
+                return None;
+            }
+            return self.endpoints.get(node.endpoints[method]);
         };
+        let (segment, tail) = split_segment(rest);
 
-        if let Some(child) = self.nodes[node_index].static_children.get(segment)
-            && let Some(found) =
-                self.find_dynamic(*child, segments.clone(), method, captures.clone())
+        if let Some(child) = node.static_child(segment)
+            && let Some(found) = self.walk(child, tail, method, captures, other_methods)
         {
             return Some(found);
         }
-        let child = self.nodes[node_index].parameter_child?;
-        let mut captures = captures;
+        let child = node.parameter_child?;
         captures.push(segment);
-        self.find_dynamic(child, segments, method, captures)
+        if let Some(found) = self.walk(child, tail, method, captures, other_methods) {
+            return Some(found);
+        }
+        captures.pop();
+        None
     }
 
-    fn collect_dynamic_methods<'path, I>(
-        &self,
-        node_index: usize,
-        mut segments: I,
-        methods: &mut Vec<HttpMethod>,
-    ) where
-        I: Iterator<Item = &'path str> + Clone,
-    {
-        let Some(segment) = segments.next() else {
-            methods.extend(self.nodes[node_index].endpoints.keys().copied());
+    /// Renders the sorted `Allow` list of a 405. Only reached when a 405 is
+    /// actually returned, never on the 404 path.
+    fn allowed_methods(&self, path: &str, static_methods: u16) -> Vec<HttpMethod> {
+        let mut methods = static_methods;
+        self.collect_methods(0, Some(trim_leading_slash(path)), &mut methods);
+        METHODS
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| methods & (1_u16 << index) != 0)
+            .map(|(_, method)| *method)
+            .collect()
+    }
+
+    fn collect_methods(&self, node_index: usize, rest: Option<&str>, methods: &mut u16) {
+        let node = &self.nodes[node_index];
+        let Some(rest) = rest else {
+            *methods |= node.methods;
             return;
         };
-        if let Some(child) = self.nodes[node_index].static_children.get(segment) {
-            self.collect_dynamic_methods(*child, segments.clone(), methods);
+        let (segment, tail) = split_segment(rest);
+        if let Some(child) = node.static_child(segment) {
+            self.collect_methods(child, tail, methods);
         }
-        if let Some(child) = self.nodes[node_index].parameter_child {
-            self.collect_dynamic_methods(child, segments, methods);
+        if let Some(child) = node.parameter_child {
+            self.collect_methods(child, tail, methods);
         }
     }
 }
 
 fn route_segments(path: &str) -> std::str::Split<'_, char> {
-    path.strip_prefix('/').unwrap_or(path).split('/')
+    trim_leading_slash(path).split('/')
+}
+
+fn trim_leading_slash(path: &str) -> &str {
+    path.strip_prefix('/').unwrap_or(path)
+}
+
+/// Splits the leading segment off a slash-separated remainder. `None` as the
+/// tail means the segment just taken was the last one.
+fn split_segment(rest: &str) -> (&str, Option<&str>) {
+    match rest.as_bytes().iter().position(|byte| *byte == b'/') {
+        Some(index) => (&rest[..index], Some(&rest[index + 1..])),
+        None => (rest, None),
+    }
+}
+
+/// First byte of a segment, NUL standing in for the empty segment. Only a
+/// prefilter for the child scan; the full comparison still decides.
+const fn head_byte(segment: &str) -> u8 {
+    match segment.as_bytes().first() {
+        Some(byte) => *byte,
+        None => 0,
+    }
+}
+
+/// Word and bit of the static-path rejection filter. Every path starts with
+/// `/`, so the second byte is what discriminates; the length separates the
+/// rest. Collisions only cost a wasted probe, but a set bit must never be
+/// missed, so the same function fills the filter at build time.
+fn static_filter_slot(path: &str) -> (usize, u64) {
+    let byte = path.as_bytes().get(1).copied().unwrap_or(0);
+    let slot = (usize::from(byte).wrapping_mul(3) ^ path.len()) & 127;
+    (slot >> 6, 1_u64 << (slot & 63))
 }
 
 /// A router miss that distinguishes an unknown path from a wrong method.
@@ -1997,8 +2181,12 @@ impl RouteMatch<'_, '_> {
 
 const INLINE_PATH_PARAMETERS: usize = 8;
 
+/// A capture stack. `Empty` is not just `Inline` with zero length: a static
+/// match constructs one per request and must not pay for zeroing the inline
+/// array it will never write.
 #[derive(Clone)]
 enum CapturedSegments<'path> {
+    Empty,
     Inline {
         values: [Option<&'path str>; INLINE_PATH_PARAMETERS],
         len: usize,
@@ -2008,14 +2196,16 @@ enum CapturedSegments<'path> {
 
 impl<'path> CapturedSegments<'path> {
     const fn new() -> Self {
-        Self::Inline {
-            values: [None; INLINE_PATH_PARAMETERS],
-            len: 0,
-        }
+        Self::Empty
     }
 
     fn push(&mut self, value: &'path str) {
         match self {
+            Self::Empty => {
+                let mut values = [None; INLINE_PATH_PARAMETERS];
+                values[0] = Some(value);
+                *self = Self::Inline { values, len: 1 };
+            }
             Self::Inline { values, len } if *len < INLINE_PATH_PARAMETERS => {
                 values[*len] = Some(value);
                 *len += 1;
@@ -2032,10 +2222,22 @@ impl<'path> CapturedSegments<'path> {
         }
     }
 
+    /// Undoes the most recent [`Self::push`], so a failed parameter descent
+    /// can backtrack without the caller having cloned the stack.
+    fn pop(&mut self) {
+        match self {
+            Self::Empty => {}
+            Self::Inline { len, .. } => *len = len.saturating_sub(1),
+            Self::Heap(values) => {
+                values.pop();
+            }
+        }
+    }
+
     fn get(&self, index: usize) -> Option<&'path str> {
         match self {
             Self::Inline { values, len } if index < *len => values[index],
-            Self::Inline { .. } => None,
+            Self::Empty | Self::Inline { .. } => None,
             Self::Heap(values) => values.get(index).copied(),
         }
     }
@@ -2592,12 +2794,13 @@ impl ResponseHeaders {
 mod tests {
     use super::{
         BackgroundTasks, ConnectionInfo, HttpApp, HttpError, HttpErrorHandler, HttpErrorSource,
-        HttpMiddleware, HttpRequestContext, MiddlewareScope, Request, Response, TestApp,
+        HttpMiddleware, HttpRequestContext, MiddlewareScope, Request, Response, RouteError, Router,
+        TestApp,
     };
     use blazingly_core::{
-        HttpMethod, OperationDescriptor, OperationFailure, PreparedJson, ResponseDescriptor,
-        SecurityLocation, SecurityRequirement, SecuritySchemeDescriptor, SecuritySchemeKind,
-        TypeDescriptor,
+        HttpMethod, InputDescriptor, InputSource, OperationDescriptor, OperationFailure,
+        PreparedJson, ResponseDescriptor, SecurityLocation, SecurityRequirement,
+        SecuritySchemeDescriptor, SecuritySchemeKind, TypeDescriptor,
     };
     use blazingly_executor::{
         ExecutableApp, ExecutableOperation, ExecutionOutcome, Extension, FromInvocation,
@@ -3287,5 +3490,238 @@ mod tests {
         assert_eq!(body["scheme"], "https");
         assert_eq!(body["host"], "api.example");
         assert_eq!(body["clientIp"], "198.51.100.7");
+    }
+
+    fn router_operation(method: HttpMethod, path: &str, id: &str) -> ExecutableOperation {
+        let inputs = path
+            .split('/')
+            .filter_map(|segment| {
+                segment
+                    .strip_prefix('{')
+                    .and_then(|segment| segment.strip_suffix('}'))
+            })
+            .map(|name| {
+                InputDescriptor::new(name, InputSource::Path, true, TypeDescriptor::new("String"))
+            })
+            .collect::<Vec<_>>();
+        let descriptor = OperationDescriptor::new(
+            method,
+            path,
+            id,
+            "Router fixture",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .expect("test operation id should be valid")
+        .with_inputs(inputs);
+        ExecutableOperation::typed(descriptor, |_| {
+            Ok(Box::pin(async move {
+                ExecutionOutcome::Success {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: None,
+                    background: Vec::new(),
+                }
+            }) as OperationFuture)
+        })
+    }
+
+    fn router(routes: &[(HttpMethod, &str)]) -> Router {
+        let operations = routes
+            .iter()
+            .enumerate()
+            .map(|(index, (method, path))| {
+                router_operation(*method, path, &format!("router.op{index}"))
+            })
+            .collect::<Vec<_>>();
+        let app = ExecutableApp::new(operations).expect("router fixture compiles");
+        Router::new(&app)
+    }
+
+    fn allowed(router: &Router, method: HttpMethod, path: &str) -> Vec<HttpMethod> {
+        match router.recognize(method, path) {
+            Err(RouteError::MethodNotAllowed { allowed }) => allowed,
+            other => panic!("{method:?} {path} should be a 405, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// The 405 `Allow` list is rendered by walking the method table low bit
+    /// first, so its order is the enum's `Ord`, not alphabetical.
+    #[test]
+    fn the_method_table_matches_the_http_method_order() {
+        let mut sorted = super::METHODS;
+        sorted.sort_unstable();
+        assert_eq!(sorted, super::METHODS);
+        for (index, method) in super::METHODS.into_iter().enumerate() {
+            assert_eq!(super::method_index(method), index);
+        }
+    }
+
+    #[test]
+    fn a_static_path_outranks_a_parameter_of_the_same_shape() {
+        let router = router(&[
+            (HttpMethod::Get, "/items"),
+            (HttpMethod::Post, "/items"),
+            (HttpMethod::Get, "/items/latest"),
+            (HttpMethod::Put, "/items/latest"),
+            (HttpMethod::Get, "/items/{id}"),
+            (HttpMethod::Delete, "/items/{id}"),
+        ]);
+
+        let statically = router
+            .recognize(HttpMethod::Get, "/items/latest")
+            .expect("static route");
+        assert_eq!(statically.path_parameter("id"), None);
+
+        // No static DELETE for that path, so the walk falls through to the
+        // parameter route and captures the segment the static table matched.
+        let dynamically = router
+            .recognize(HttpMethod::Delete, "/items/latest")
+            .expect("parameter route");
+        assert_eq!(
+            dynamically.path_parameter("id").as_deref(),
+            Some("latest"),
+            "the static probe must not consume the segment"
+        );
+    }
+
+    #[test]
+    fn an_allow_list_unions_static_and_parameter_routes_in_enum_order() {
+        let router = router(&[
+            (HttpMethod::Get, "/items"),
+            (HttpMethod::Post, "/items"),
+            (HttpMethod::Get, "/items/latest"),
+            (HttpMethod::Put, "/items/latest"),
+            (HttpMethod::Get, "/items/{id}"),
+            (HttpMethod::Delete, "/items/{id}"),
+        ]);
+
+        assert_eq!(
+            allowed(&router, HttpMethod::Patch, "/items"),
+            vec![HttpMethod::Get, HttpMethod::Post]
+        );
+        assert_eq!(
+            allowed(&router, HttpMethod::Post, "/items/latest"),
+            vec![HttpMethod::Get, HttpMethod::Put, HttpMethod::Delete],
+            "PUT precedes DELETE in the enum even though it follows alphabetically"
+        );
+        assert_eq!(
+            allowed(&router, HttpMethod::Post, "/items/7"),
+            vec![HttpMethod::Get, HttpMethod::Delete]
+        );
+    }
+
+    #[test]
+    fn an_unknown_path_is_a_miss_rather_than_a_wrong_method() {
+        let router = router(&[
+            (HttpMethod::Get, "/items"),
+            (HttpMethod::Get, "/items/{id}/tags/{tag}"),
+        ]);
+
+        for path in ["/nope", "/items/7/tags", "/items/7/tags/x/y", "/", ""] {
+            assert_eq!(
+                router.recognize(HttpMethod::Get, path).err(),
+                Some(RouteError::NotFound),
+                "{path} should not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_static_descent_backtracks_into_the_parameter_child() {
+        let router = router(&[
+            (HttpMethod::Get, "/a/{p}/x"),
+            (HttpMethod::Post, "/a/{p}/x"),
+            (HttpMethod::Get, "/a/b/y"),
+        ]);
+
+        // `b` matches the static child, which dead-ends at `x`; the walk has to
+        // unwind and take the parameter child with the same segment.
+        let matched = router
+            .recognize(HttpMethod::Get, "/a/b/x")
+            .expect("parameter route after backtracking");
+        assert_eq!(matched.path_parameter("p").as_deref(), Some("b"));
+
+        let statically = router
+            .recognize(HttpMethod::Get, "/a/b/y")
+            .expect("static branch");
+        assert_eq!(statically.path_parameter("p"), None);
+
+        assert_eq!(
+            router.recognize(HttpMethod::Get, "/a/c/y").err(),
+            Some(RouteError::NotFound)
+        );
+        assert_eq!(
+            allowed(&router, HttpMethod::Delete, "/a/b/x"),
+            vec![HttpMethod::Get, HttpMethod::Post]
+        );
+    }
+
+    #[test]
+    fn captures_survive_a_deep_backtrack() {
+        let router = router(&[
+            (HttpMethod::Get, "/{one}/{two}/{three}/leaf"),
+            (HttpMethod::Get, "/a/b/c/other"),
+        ]);
+
+        let matched = router
+            .recognize(HttpMethod::Get, "/a/b/c/leaf")
+            .expect("parameter route");
+        assert_eq!(matched.path_parameter("one").as_deref(), Some("a"));
+        assert_eq!(matched.path_parameter("two").as_deref(), Some("b"));
+        assert_eq!(matched.path_parameter("three").as_deref(), Some("c"));
+        assert_eq!(matched.path_parameter("four"), None);
+    }
+
+    #[test]
+    fn a_captured_segment_is_percent_decoded() {
+        let router = router(&[(HttpMethod::Get, "/files/{name}")]);
+
+        let matched = router
+            .recognize(HttpMethod::Get, "/files/a%20b%2Fc")
+            .expect("parameter route");
+        assert_eq!(matched.path_parameter("name").as_deref(), Some("a b/c"));
+
+        let plus = router
+            .recognize(HttpMethod::Get, "/files/a+b")
+            .expect("parameter route");
+        assert_eq!(
+            plus.path_parameter("name").as_deref(),
+            Some("a+b"),
+            "a path segment is not form encoded"
+        );
+
+        let invalid = router
+            .recognize(HttpMethod::Get, "/files/a%2")
+            .expect("parameter route");
+        assert_eq!(invalid.path_parameter("name"), None);
+    }
+
+    #[test]
+    fn empty_segments_are_matched_literally() {
+        let router = router(&[(HttpMethod::Get, "/files/{name}/meta")]);
+
+        let matched = router
+            .recognize(HttpMethod::Get, "/files//meta")
+            .expect("empty segments are still segments");
+        assert_eq!(matched.path_parameter("name").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn every_method_reaches_its_own_static_slot() {
+        let bindings = super::METHODS
+            .into_iter()
+            .map(|method| (method, "/one"))
+            .collect::<Vec<_>>();
+        let router = router(&bindings);
+
+        let mut seen = Vec::new();
+        for method in super::METHODS {
+            let matched = router.recognize(method, "/one").expect("static route");
+            seen.push(matched.operation_index());
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), super::METHOD_COUNT, "slots must not alias");
     }
 }

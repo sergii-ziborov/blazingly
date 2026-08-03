@@ -12,7 +12,45 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Advanced the portable contract format to v1.3 so value-type constraints are
+  retained on `TypeDescriptor`, including collection items and nested values,
+  and participate in fingerprints and compatibility reports.
+- OpenAPI projection now carries those recursive type constraints and derives
+  the framework's structured `422 validation_error` response for operations
+  with validated inputs without replacing an explicitly declared `422`.
+- Reworked compiled routing around a static-path table, compact method slots,
+  a parameter trie with allocation-free backtracking for small captures, and a
+  cheaper path hasher. `404`/`405` resolution and sorted `Allow` construction
+  share the compiled route data.
+- Synchronous dependency chains now use the synchronous compiled-provider path
+  and cache whether a chain requires async fallback, avoiding ready-future
+  allocation on subsequent synchronous resolutions.
+- Reworked the bounded blocking pool's worker wake/park and shutdown paths,
+  preserved workers after a task panic, and exposed worker-context detection so
+  nested blocking work can avoid resubmitting behind itself.
+- Added synchronous database `run_sync` and `transaction_sync` entry points;
+  async database calls already running on a blocking-pool worker execute inline
+  with the same error and rollback classification instead of risking a
+  saturated-pool self-deadlock.
+- `cargo blazingly new` now generates a dependency on the crates.io framework
+  version matching the installed CLI, while `--framework-path` retains the
+  local-checkout workflow and the scaffold documents the opt-in Git form.
+- Advanced `blazingly-json` to the parser revision that jumps between string
+  escapes instead of scanning decoded strings byte by byte.
+- Advanced `blazingly-wire` to the revision that removes formatting machinery
+  from response encoding, adds reusable prepared headers, and removes
+  quadratic inline-header insertion during parsing.
+
+### Fixed
+
+- Preserved declared validation constraints through nested OpenAPI schemas and
+  kept the documented `422` envelope aligned with the runtime rejection shape.
+- Kept blocking workers available after panicking jobs and ensured pool drop
+  wakes workers so queued work drains before shutdown.
+- Avoided a nested database scheduling deadlock when database work is invoked
+  from a saturated blocking pool.
 
 ## [0.1.1] - 2026-07-29
 

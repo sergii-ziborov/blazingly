@@ -1244,10 +1244,11 @@ fn set_remote_parent(_span: &tracing::Span, _trace: &TraceContext) {}
 /// Resident set size of this process, in bytes.
 ///
 /// Linux reads `/proc/self/status`; Windows reads the working set through
-/// `GetProcessMemoryInfo`. Returns `None` on every other platform — macOS
-/// would need mach `task_info`, unverified here — and the
-/// `process_resident_memory_bytes` family is simply absent from a scrape where
-/// this returns `None`.
+/// `GetProcessMemoryInfo`; macOS reads the resident size through Mach
+/// `task_info`. The platform APIs on Windows and macOS are accessed through the
+/// safe `memory-stats` wrapper because this workspace forbids unsafe code.
+/// Returns `None` on unsupported platforms or when the platform query fails,
+/// and the `process_resident_memory_bytes` family is then absent from a scrape.
 #[must_use]
 pub fn process_resident_memory_bytes() -> Option<u64> {
     platform_resident_memory_bytes()
@@ -1256,10 +1257,11 @@ pub fn process_resident_memory_bytes() -> Option<u64> {
 /// Total user plus system CPU time consumed by this process.
 ///
 /// Exposed as `process_cpu_seconds_total`. Linux reads `/proc/self/stat`;
-/// Windows reads `GetProcessTimes`. Returns `None` on every other platform,
-/// for the same reason as [`process_resident_memory_bytes`]. A [`Duration`] is
-/// returned rather than seconds so the platform resolution — centiseconds
-/// under procfs, 100 ns under Windows — survives exactly.
+/// Windows reads `GetProcessTimes`; macOS reads `CLOCK_PROCESS_CPUTIME_ID`.
+/// The latter two APIs are accessed through the safe `cpu-time` wrapper.
+/// Returns `None` on unsupported platforms or when the platform query fails.
+/// A [`Duration`] is returned rather than seconds so each platform's native
+/// resolution survives exactly.
 #[must_use]
 pub fn process_cpu_time() -> Option<Duration> {
     platform_cpu_time()
@@ -1273,14 +1275,19 @@ fn platform_resident_memory_bytes() -> Option<u64> {
         .map(|kib| kib * 1024)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn platform_resident_memory_bytes() -> Option<u64> {
-    memory_stats::memory_stats().and_then(|stats| u64::try_from(stats.physical_mem).ok())
+    memory_stats::memory_stats().and_then(|stats| resident_memory_bytes(stats.physical_mem))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_resident_memory_bytes() -> Option<u64> {
     None
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn resident_memory_bytes(physical_memory_bytes: usize) -> Option<u64> {
+    u64::try_from(physical_memory_bytes).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -1288,14 +1295,14 @@ fn platform_cpu_time() -> Option<Duration> {
     process_cpu_ticks().map(|ticks| Duration::from_millis(ticks * (1_000 / PROC_USER_HZ)))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn platform_cpu_time() -> Option<Duration> {
     cpu_time::ProcessTime::try_now()
         .ok()
         .map(|time| time.as_duration())
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_cpu_time() -> Option<Duration> {
     None
 }
@@ -2057,10 +2064,9 @@ mod tests {
         assert_eq!(parse_stat_cpu_ticks("42 (server) S 1 2 3"), None);
         assert_eq!(parse_stat_cpu_ticks("no parenthesis here"), None);
 
-        // Both readers agree on availability: procfs answers on Linux, the
-        // process information APIs answer on Windows, and neither family is
-        // exposed anywhere else.
-        let supported = cfg!(any(target_os = "linux", windows));
+        // Both readers agree on availability: procfs answers on Linux, while
+        // the safe process-information wrappers answer on Windows and macOS.
+        let supported = cfg!(any(target_os = "linux", target_os = "macos", windows));
         assert_eq!(process_resident_memory_bytes().is_some(), supported);
         assert_eq!(process_cpu_time().is_some(), supported);
         if cfg!(target_os = "linux")
@@ -2069,6 +2075,16 @@ mod tests {
             assert_eq!(cpu.subsec_millis() % 10, 0, "procfs resolution is 10ms");
         }
         assert_valid_exposition(&Metrics::new().prometheus());
+    }
+
+    #[test]
+    fn resident_memory_byte_conversion_is_checked_and_portable() {
+        assert_eq!(resident_memory_bytes(0), Some(0));
+        assert_eq!(resident_memory_bytes(14_528), Some(14_528));
+        assert_eq!(
+            resident_memory_bytes(usize::MAX),
+            u64::try_from(usize::MAX).ok()
+        );
     }
 
     #[cfg(windows)]
@@ -2088,6 +2104,32 @@ mod tests {
         }
         let cpu = process_cpu_time().expect("GetProcessTimes answers");
         assert!(cpu > Duration::ZERO);
+
+        let text = Metrics::new().prometheus();
+        assert!(text.contains("process_resident_memory_bytes "));
+        assert!(text.contains("process_cpu_seconds_total "));
+        assert_valid_exposition(&text);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_metrics_are_live_and_plausible() {
+        let rss = process_resident_memory_bytes().expect("Mach task_info answers");
+        assert!(rss > 1 << 20, "test process RSS at or under 1 MiB: {rss}");
+        assert!(rss < 1 << 40, "test process RSS at or over 1 TiB: {rss}");
+
+        let before = process_cpu_time().expect("CLOCK_PROCESS_CPUTIME_ID answers");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut after = before;
+        let mut spin = 0_u64;
+        while after <= before && std::time::Instant::now() < deadline {
+            for _ in 0..10_000 {
+                spin = spin.wrapping_add(1);
+                std::hint::black_box(spin);
+            }
+            after = process_cpu_time().expect("CLOCK_PROCESS_CPUTIME_ID keeps answering");
+        }
+        assert!(after > before, "process CPU time did not advance");
 
         let text = Metrics::new().prometheus();
         assert!(text.contains("process_resident_memory_bytes "));

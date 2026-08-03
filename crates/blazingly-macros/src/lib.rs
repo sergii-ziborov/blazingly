@@ -308,6 +308,7 @@ enum OperationInputKind {
     Stream,
     WebSocket,
     Extension,
+    Extract,
     Dependency,
     DirectDependency,
 }
@@ -1457,6 +1458,11 @@ fn value_model_tokens(
                     descriptor.rust_name = ::std::string::String::from(
                         stringify!(#model_name)
                     );
+                    // Carried on the type, not only inherited by the field that
+                    // uses it: a `Vec<#model_name>` item has no field name.
+                    descriptor.constraints.extend(
+                        <Self as ::blazingly::ApiConstrained>::constraint_rules(),
+                    );
                     descriptor
                 }
 
@@ -1637,6 +1643,9 @@ fn enum_model_tokens(
                     ::blazingly::TypeDescriptor::scalar(
                         stringify!(#model_name),
                         ::blazingly::SchemaKind::String,
+                    )
+                    .with_constraints(
+                        <Self as ::blazingly::ApiConstrained>::constraint_rules(),
                     )
                 }
             }
@@ -3729,6 +3738,7 @@ impl OperationInputKind {
             (Self::Multipart, "Multipart"),
             (Self::File, "File"),
             (Self::Extension, "Extension"),
+            (Self::Extract, "Extract"),
             (Self::Dependency, "Depends"),
         ]
         .into_iter()
@@ -3746,7 +3756,11 @@ impl OperationInputKind {
             Self::Multipart => Some(quote!(::blazingly::InputSource::Multipart)),
             Self::File => Some(quote!(::blazingly::InputSource::File)),
             Self::Stream => Some(quote!(::blazingly::InputSource::Stream)),
-            Self::WebSocket | Self::Extension | Self::Dependency | Self::DirectDependency => None,
+            Self::WebSocket
+            | Self::Extension
+            | Self::Extract
+            | Self::Dependency
+            | Self::DirectDependency => None,
         }
     }
 

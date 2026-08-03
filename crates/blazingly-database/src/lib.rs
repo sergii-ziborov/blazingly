@@ -8,7 +8,7 @@
 //! `PostgreSQL`, and cloud SDK code never enters this crate. Work reaches the
 //! driver through Blazingly's bounded blocking pool instead of an HTTP worker.
 
-use blazingly_executor::{BlockingError, run_blocking};
+use blazingly_executor::{BlockingError, on_blocking_worker, run_blocking};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -148,6 +148,9 @@ where
     /// Acquires a connection and runs synchronous database work on the
     /// framework's bounded blocking pool.
     ///
+    /// A caller that is already running on a blocking-pool worker runs the
+    /// operation inline instead, on the worker it already occupies.
+    ///
     /// # Errors
     ///
     /// Returns pool acquisition, query, saturation, or worker failures.
@@ -160,14 +163,67 @@ where
         Output: Send + 'static,
         QueryError: std::error::Error + Send + Sync + 'static,
     {
+        if on_blocking_worker() {
+            return run_inline(move || self.run_sync(operation));
+        }
         let pool = Arc::clone(&self.pool);
         let timeout = self.acquire_timeout;
-        run_blocking(move || {
-            let mut connection = acquire_connection(pool.as_ref(), timeout)?;
-            operation(&mut connection).map_err(|error| operation_error(pool.as_ref(), error))
-        })
-        .await?
+        run_blocking(move || run_on(pool.as_ref(), timeout, operation)).await?
     }
+
+    /// Acquires a connection and runs synchronous database work on the calling
+    /// thread.
+    ///
+    /// This is the seam adapters use when they are already on a thread that may
+    /// block: a blocking-pool worker, or a dedicated driver thread they own.
+    /// Unlike [`Self::run`] it neither queues nor isolates panics, so a
+    /// panicking operation unwinds into the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns pool acquisition or query failures.
+    pub fn run_sync<Operation, Output, QueryError>(
+        &self,
+        operation: Operation,
+    ) -> Result<Output, DatabaseError>
+    where
+        Operation: FnOnce(&mut Pool::Connection) -> Result<Output, QueryError>,
+        QueryError: std::error::Error + Send + Sync + 'static,
+    {
+        run_on(self.pool.as_ref(), self.acquire_timeout, operation)
+    }
+}
+
+/// Runs work that is already holding a blocking-pool worker.
+///
+/// Invariant: the caller is on a pool worker, so this thread is one the pool
+/// has already admitted. Running inline therefore adds no queue depth and
+/// cannot push the pool above `workers` concurrent jobs, which is why it is
+/// exempt from the bounded queue's admission check. Re-submitting instead would
+/// be the unsafe choice: a worker awaiting its own re-submission deadlocks a
+/// saturated pool. The operation must not itself wait on another pool
+/// submission's completion.
+fn run_inline<Output>(
+    job: impl FnOnce() -> Result<Output, DatabaseError>,
+) -> Result<Output, DatabaseError> {
+    match catch_unwind(AssertUnwindSafe(job)) {
+        Ok(result) => result,
+        Err(_) => Err(DatabaseError::from(BlockingError::Panicked)),
+    }
+}
+
+fn run_on<Pool, Operation, Output, QueryError>(
+    pool: &Pool,
+    timeout: Option<Duration>,
+    operation: Operation,
+) -> Result<Output, DatabaseError>
+where
+    Pool: ConnectionPool,
+    Operation: FnOnce(&mut Pool::Connection) -> Result<Output, QueryError>,
+    QueryError: std::error::Error + Send + Sync + 'static,
+{
+    let mut connection = acquire_connection(pool, timeout)?;
+    operation(&mut connection).map_err(|error| operation_error(pool, error))
 }
 
 impl<Pool> Database<Pool>
@@ -181,6 +237,9 @@ where
     /// The transaction is committed when `operation` returns `Ok` and rolled
     /// back when it returns `Err` or panics. A panic is reported as a
     /// [`TransactionPanic`] source instead of unwinding into the pool worker.
+    ///
+    /// A caller that is already running on a blocking-pool worker runs the
+    /// transaction inline instead, on the worker it already occupies.
     ///
     /// # Errors
     ///
@@ -197,29 +256,66 @@ where
         Output: Send + 'static,
         QueryError: std::error::Error + Send + Sync + 'static,
     {
+        if on_blocking_worker() {
+            return run_inline(move || self.transaction_sync(options, operation));
+        }
         let pool = Arc::clone(&self.pool);
         let timeout = self.acquire_timeout;
-        run_blocking(move || {
-            let mut connection = acquire_connection(pool.as_ref(), timeout)?;
-            connection
-                .begin(options)
-                .map_err(|error| operation_error(pool.as_ref(), error))?;
-            match catch_unwind(AssertUnwindSafe(|| operation(&mut connection))) {
-                Ok(Ok(output)) => connection
-                    .commit()
-                    .map(|()| output)
-                    .map_err(|error| operation_error(pool.as_ref(), error)),
-                Ok(Err(error)) => {
-                    let rollback = connection.rollback();
-                    Err(rolled_back_error(pool.as_ref(), error, rollback))
-                }
-                Err(_) => {
-                    let rollback = connection.rollback();
-                    Err(rolled_back_error(pool.as_ref(), TransactionPanic, rollback))
-                }
-            }
-        })
-        .await?
+        run_blocking(move || transaction_on(pool.as_ref(), timeout, options, operation)).await?
+    }
+
+    /// Runs synchronous work inside one transaction on the calling thread.
+    ///
+    /// Commit, rollback, and panic handling match [`Self::transaction`]; only
+    /// the scheduling differs. See [`Self::run_sync`] for when to reach for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns pool acquisition, transaction control, or operation failures. A
+    /// rollback that fails after the operation failed is reported as a
+    /// [`RollbackFailure`] source under the operation's class.
+    pub fn transaction_sync<Operation, Output, QueryError>(
+        &self,
+        options: TransactionOptions,
+        operation: Operation,
+    ) -> Result<Output, DatabaseError>
+    where
+        Operation: FnOnce(&mut Pool::Connection) -> Result<Output, QueryError>,
+        QueryError: std::error::Error + Send + Sync + 'static,
+    {
+        transaction_on(self.pool.as_ref(), self.acquire_timeout, options, operation)
+    }
+}
+
+fn transaction_on<Pool, Operation, Output, QueryError>(
+    pool: &Pool,
+    timeout: Option<Duration>,
+    options: TransactionOptions,
+    operation: Operation,
+) -> Result<Output, DatabaseError>
+where
+    Pool: ConnectionPool,
+    Pool::Connection: Transactional,
+    Operation: FnOnce(&mut Pool::Connection) -> Result<Output, QueryError>,
+    QueryError: std::error::Error + Send + Sync + 'static,
+{
+    let mut connection = acquire_connection(pool, timeout)?;
+    connection
+        .begin(options)
+        .map_err(|error| operation_error(pool, error))?;
+    match catch_unwind(AssertUnwindSafe(|| operation(&mut connection))) {
+        Ok(Ok(output)) => connection
+            .commit()
+            .map(|()| output)
+            .map_err(|error| operation_error(pool, error)),
+        Ok(Err(error)) => {
+            let rollback = connection.rollback();
+            Err(rolled_back_error(pool, error, rollback))
+        }
+        Err(_) => {
+            let rollback = connection.rollback();
+            Err(rolled_back_error(pool, TransactionPanic, rollback))
+        }
     }
 }
 
@@ -237,7 +333,7 @@ where
     pub async fn migrate(&self, set: MigrationSet) -> Result<MigrationReport, DatabaseError> {
         let pool = Arc::clone(&self.pool);
         let timeout = self.acquire_timeout;
-        run_blocking(move || {
+        let job = move || {
             let mut connection = acquire_connection(pool.as_ref(), timeout)?;
             let applied = read_ledger(pool.as_ref(), &mut connection, &set)?;
             let mut report = MigrationReport {
@@ -252,8 +348,11 @@ where
                 report.current_version = Some(migration.version);
             }
             Ok(report)
-        })
-        .await?
+        };
+        if on_blocking_worker() {
+            return run_inline(job);
+        }
+        run_blocking(job).await?
     }
 
     /// Verifies the ledger matches `set` without applying anything.
@@ -266,7 +365,7 @@ where
     pub async fn verify_migrations(&self, set: MigrationSet) -> Result<(), DatabaseError> {
         let pool = Arc::clone(&self.pool);
         let timeout = self.acquire_timeout;
-        run_blocking(move || {
+        let job = move || {
             let mut connection = acquire_connection(pool.as_ref(), timeout)?;
             let applied = read_ledger(pool.as_ref(), &mut connection, &set)?;
             let pending = set.pending(applied.last().map(|record| record.version));
@@ -279,8 +378,11 @@ where
                 )),
                 None => Ok(()),
             }
-        })
-        .await?
+        };
+        if on_blocking_worker() {
+            return run_inline(job);
+        }
+        run_blocking(job).await?
     }
 }
 
@@ -1245,6 +1347,85 @@ mod tests {
         assert_eq!(set.pending(Some(1)).len(), 1);
         assert_eq!(set.pending(Some(2)).len(), 0);
         assert_eq!(set.latest_version(), Some(2));
+    }
+
+    /// Work reaching the pool from a pool worker runs on that worker.
+    ///
+    /// Re-submitting instead is what deadlocks a saturated pool: the worker
+    /// would await a job that needs a worker to be free. The thread identity is
+    /// the observable proof that no second hop happened.
+    #[test]
+    fn work_submitted_from_a_pool_worker_runs_inline() {
+        let database = Database::new(Pool);
+        let (worker, ran_on, value) = futures_lite::future::block_on(run_blocking(move || {
+            let worker = std::thread::current().id();
+            let (value, ran_on) = futures_lite::future::block_on(database.run(|connection| {
+                *connection += 2;
+                Ok::<_, Infallible>((*connection, std::thread::current().id()))
+            }))
+            .expect("inline database operation");
+            (worker, ran_on, value)
+        }))
+        .expect("outer blocking job");
+        assert_eq!(
+            worker, ran_on,
+            "the operation must not hop to a second worker"
+        );
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn an_inline_panic_is_still_reported_as_a_blocking_failure() {
+        let database = Database::new(Pool);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let error = futures_lite::future::block_on(run_blocking(move || {
+            futures_lite::future::block_on(
+                database.run(|_| -> Result<(), Infallible> { panic!("operation panic") }),
+            )
+            .expect_err("the panic is reported, not unwound into the worker")
+        }))
+        .expect("outer blocking job");
+        std::panic::set_hook(previous);
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert_eq!(
+            error.downcast_ref::<BlockingError>(),
+            Some(&BlockingError::Panicked)
+        );
+    }
+
+    #[test]
+    fn the_sync_entry_points_run_on_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let database = Database::new(Pool);
+        let (value, ran_on) = database
+            .run_sync(|connection| {
+                *connection += 2;
+                Ok::<_, Infallible>((*connection, std::thread::current().id()))
+            })
+            .expect("synchronous operation");
+        assert_eq!(value, 42);
+        assert_eq!(ran_on, caller);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transactional = Database::new(DriverPool {
+            events: Arc::clone(&events),
+            fail_rollback: false,
+        });
+        let value = transactional
+            .transaction_sync(TransactionOptions::new(), |connection| {
+                connection.value += 2;
+                Ok::<_, DriverError>(connection.value)
+            })
+            .expect("synchronous transaction");
+        assert_eq!(value, 42);
+        assert_eq!(
+            recorded(&events),
+            vec![
+                "begin Adapter read_only=false".to_owned(),
+                "commit".to_owned(),
+            ]
+        );
     }
 
     #[test]

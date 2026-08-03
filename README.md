@@ -10,6 +10,9 @@ OpenAPI.
 
 Mesh and Cloudflare execution are future products outside the current
 repository scope. See [the architecture boundary](docs/architecture.md).
+Competitive API gaps, platform experiments, and the evidence required before
+making performance or efficiency claims are tracked in the
+[competitive and platform roadmap](docs/competitive-roadmap.md).
 
 The product target is explicit: a fast router alone is 2/10; FastAPI-style
 ergonomics plus OpenAPI is 7/10; Blazingly reaches 8.5/10 only when native MCP
@@ -316,7 +319,13 @@ The generated starter has two Kubernetes exposure modes over the same native
 server and autoscaled pod set. See [deployment modes](docs/deployment.md).
 
 The first socket-level development baseline and the remaining acceptance gates
-are recorded in [benchmark status](docs/benchmark-status.md).
+are recorded in [benchmark status](docs/benchmark-status.md). In the latest
+matched validated-operation result, Blazingly was ahead of Axum and behind
+Actix Web on one busy Windows loopback host; this is not a framework-wide speed
+ranking. Energy efficiency is likewise a target, not a current result:
+requests-per-watt or server-replacement claims require matched hardware,
+whole-system power, latency, error-rate, and sustained-load evidence defined in
+the [competitive roadmap](docs/competitive-roadmap.md).
 
 ## Repositories
 

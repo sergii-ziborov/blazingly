@@ -51,7 +51,7 @@ categories = [
 publish = true
 
 [workspace.dependencies]
-blazingly-contract = { version = "0.3.0", path = "crates/blazingly-contract" }
+blazingly-contract = { version = "0.4.0", path = "crates/blazingly-contract" }
 blazingly-core = { version = "0.1.0", path = "crates/blazingly-core" }
 blazingly-database = { version = "0.1.0", path = "crates/blazingly-database" }
 blazingly-deploy = { version = "0.1.0", path = "crates/blazingly-deploy" }

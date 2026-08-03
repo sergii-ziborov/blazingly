@@ -19,16 +19,19 @@ use blazingly_json::{Value, json};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Poll, Waker};
+use std::thread::Thread;
 
 pub type OperationFuture = Pin<Box<dyn Future<Output = ExecutionOutcome> + 'static>>;
 const INLINE_DEPENDENCY_SLOTS: usize = 8;
@@ -129,10 +132,146 @@ impl Default for BlockingPoolConfig {
     }
 }
 
+thread_local! {
+    static ON_BLOCKING_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Reports whether the calling thread is a blocking-pool worker.
+///
+/// Callers already on a worker own that thread for the duration of their job,
+/// so they can run further synchronous work inline instead of queueing it
+/// behind themselves.
+#[must_use]
+pub fn on_blocking_worker() -> bool {
+    ON_BLOCKING_WORKER.with(Cell::get)
+}
+
+/// Workers parked on the shared injector, and the handles used to wake them.
+struct ParkedWorkers {
+    threads: Vec<Option<Thread>>,
+    idle: Vec<usize>,
+}
+
+/// A worker parks outside every lock this type owns: `receiver` is held only
+/// for a non-blocking `try_recv`, and `parked` only while a worker registers or
+/// a submitter claims one. Submission therefore never waits behind a sleeping
+/// worker.
+struct BlockingShared {
+    receiver: Mutex<Receiver<BlockingJob>>,
+    parked: Mutex<ParkedWorkers>,
+    idle: AtomicUsize,
+}
+
+impl BlockingShared {
+    fn parked(&self) -> MutexGuard<'_, ParkedWorkers> {
+        self.parked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn take_job(&self) -> Result<BlockingJob, TryRecvError> {
+        self.receiver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_recv()
+    }
+
+    /// Hands one queued job to one sleeping worker.
+    ///
+    /// The `SeqCst` pair with [`Self::register`] is load-bearing: a worker
+    /// registers before its second `try_recv`, so a submitter that reads zero
+    /// idle workers has already enqueued the job that recheck will find.
+    fn wake_one(&self) {
+        if self.idle.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let thread = {
+            let mut parked = self.parked();
+            let index = parked.idle.pop();
+            self.idle.store(parked.idle.len(), Ordering::SeqCst);
+            index.and_then(|index| parked.threads[index].clone())
+        };
+        if let Some(thread) = thread {
+            thread.unpark();
+        }
+    }
+
+    fn wake_all(&self) {
+        let threads: Vec<Thread> = {
+            let mut parked = self.parked();
+            parked.idle.clear();
+            self.idle.store(0, Ordering::SeqCst);
+            parked.threads.iter().flatten().cloned().collect()
+        };
+        for thread in threads {
+            thread.unpark();
+        }
+    }
+
+    fn register(&self, index: usize) {
+        let mut parked = self.parked();
+        if !parked.idle.contains(&index) {
+            parked.idle.push(index);
+        }
+        self.idle.store(parked.idle.len(), Ordering::SeqCst);
+    }
+
+    fn unregister(&self, index: usize) {
+        let mut parked = self.parked();
+        if let Some(position) = parked.idle.iter().rposition(|&at| at == index) {
+            parked.idle.swap_remove(position);
+            self.idle.store(parked.idle.len(), Ordering::SeqCst);
+        }
+    }
+
+    fn run_worker(&self, index: usize) {
+        ON_BLOCKING_WORKER.with(|worker| worker.set(true));
+        self.parked().threads[index] = Some(std::thread::current());
+        loop {
+            match self.take_job() {
+                Ok(job) => {
+                    // A job that unwinds must not cost the pool a worker.
+                    drop(catch_unwind(AssertUnwindSafe(job)));
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => {}
+            }
+            self.register(index);
+            match self.take_job() {
+                Ok(job) => {
+                    self.unregister(index);
+                    drop(catch_unwind(AssertUnwindSafe(job)));
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.unregister(index);
+                    return;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            std::thread::park();
+            self.unregister(index);
+        }
+    }
+}
+
+struct PoolHandle {
+    sender: Option<SyncSender<BlockingJob>>,
+    shared: Arc<BlockingShared>,
+}
+
+impl Drop for PoolHandle {
+    fn drop(&mut self) {
+        // Disconnect first so a woken worker drains the queue and then observes
+        // the shutdown instead of parking again.
+        drop(self.sender.take());
+        self.shared.wake_all();
+    }
+}
+
 /// A bounded process-wide pool used only by explicitly synchronous handlers.
 #[derive(Clone)]
 pub struct BlockingPool {
-    sender: SyncSender<BlockingJob>,
+    handle: Arc<PoolHandle>,
 }
 
 impl BlockingPool {
@@ -143,34 +282,44 @@ impl BlockingPool {
     /// Returns an OS error when a worker thread cannot be started.
     pub fn new(config: BlockingPoolConfig) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<BlockingJob>(config.queue_capacity.get());
-        let receiver = Arc::new(Mutex::new(receiver));
-        for index in 0..config.workers.get() {
-            let receiver = Arc::clone(&receiver);
-            std::thread::Builder::new()
+        let workers = config.workers.get();
+        let shared = Arc::new(BlockingShared {
+            receiver: Mutex::new(receiver),
+            parked: Mutex::new(ParkedWorkers {
+                threads: vec![None; workers],
+                idle: Vec::with_capacity(workers),
+            }),
+            idle: AtomicUsize::new(0),
+        });
+        for index in 0..workers {
+            let worker = Arc::clone(&shared);
+            let spawned = std::thread::Builder::new()
                 .name(format!("blazingly-blocking-{index}"))
-                .spawn(move || {
-                    loop {
-                        let job = {
-                            let Ok(receiver) = receiver.lock() else {
-                                return;
-                            };
-                            receiver.recv()
-                        };
-                        let Ok(job) = job else {
-                            return;
-                        };
-                        job();
-                    }
-                })?;
+                .spawn(move || worker.run_worker(index));
+            if let Err(error) = spawned {
+                drop(sender);
+                shared.wake_all();
+                return Err(error);
+            }
         }
-        Ok(Self { sender })
+        Ok(Self {
+            handle: Arc::new(PoolHandle {
+                sender: Some(sender),
+                shared,
+            }),
+        })
     }
 
     fn submit(&self, job: BlockingJob) -> Result<(), BlockingError> {
-        self.sender.try_send(job).map_err(|error| match error {
+        let Some(sender) = self.handle.sender.as_ref() else {
+            return Err(BlockingError::Unavailable);
+        };
+        sender.try_send(job).map_err(|error| match error {
             TrySendError::Full(_) => BlockingError::Saturated,
             TrySendError::Disconnected(_) => BlockingError::Unavailable,
-        })
+        })?;
+        self.handle.shared.wake_one();
+        Ok(())
     }
 }
 
@@ -231,10 +380,7 @@ impl<T> Future for BlockingFuture<T> {
     type Output = Result<T, BlockingError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(result) = state.result.take() {
             return Poll::Ready(result);
         }
@@ -266,14 +412,24 @@ where
     };
     let job_state = Arc::clone(&state);
     let job = Box::new(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
-            .map_err(|_| BlockingError::Panicked);
+        let result = catch_unwind(AssertUnwindSafe(task)).map_err(|_| BlockingError::Panicked);
         complete_blocking(&job_state, result);
     });
     if let Err(error) = pool.submit(job) {
         complete_blocking(&state, Err(error));
     }
     future
+}
+
+fn complete_blocking<T>(state: &Arc<Mutex<BlockingState<T>>>, result: Result<T, BlockingError>) {
+    let waker = {
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.result = Some(result);
+        state.waker.take()
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
 }
 
 fn global_blocking_pool() -> Result<&'static BlockingPool, BlockingError> {
@@ -284,19 +440,6 @@ fn global_blocking_pool() -> Result<&'static BlockingPool, BlockingError> {
         BlockingPool::new(BlockingPoolConfig::default()).map_err(|_| BlockingError::Unavailable)?;
     let _ = GLOBAL_BLOCKING_POOL.set(pool);
     GLOBAL_BLOCKING_POOL.get().ok_or(BlockingError::Unavailable)
-}
-
-fn complete_blocking<T>(state: &Arc<Mutex<BlockingState<T>>>, result: Result<T, BlockingError>) {
-    let waker = {
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.result = Some(result);
-        state.waker.take()
-    };
-    if let Some(waker) = waker {
-        waker.wake();
-    }
 }
 
 #[must_use]
@@ -801,6 +944,26 @@ pub trait FromInvocation: Sized {
         name: &str,
         required: bool,
     ) -> Result<Self, InputRejection>;
+}
+
+/// Explicitly asks the operation macro to extract `T` from the invocation.
+///
+/// Bare handler argument types remain compiled dependency-injection requests;
+/// wrapping a downstream [`FromInvocation`] implementation in `Extract<T>`
+/// removes that ambiguity without teaching the macro about every application's
+/// extractor type. The wrapper delegates extraction verbatim, including a
+/// custom extractor's transport-specific rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Extract<T>(pub T);
+
+impl<T: FromInvocation> FromInvocation for Extract<T> {
+    fn from_invocation(
+        input: &InvocationInput<'_>,
+        name: &str,
+        required: bool,
+    ) -> Result<Self, InputRejection> {
+        T::from_invocation(input, name, required).map(Self)
+    }
 }
 
 /// Typed request-local value installed by transport middleware.
@@ -1695,11 +1858,26 @@ impl CompiledHooks {
     }
 }
 
+/// `blazingly-di` compiles a provider's runner as either sync or async and
+/// exposes no predicate for which. `CompiledProvider::run_sync` reports this
+/// code for an async runner *without* invoking the factory, so it doubles as a
+/// side-effect-free probe; the classification is cached because the runner kind
+/// is fixed at compile time.
+const ASYNC_RUNNER_CODE: &str = "async_singleton_provider";
+const CHAIN_UNKNOWN: u8 = 0;
+const CHAIN_SYNC: u8 = 1;
+const CHAIN_ASYNC: u8 = 2;
+
+fn is_async_runner(error: &DependencyError) -> bool {
+    matches!(error, DependencyError::Internal { code, .. } if *code == ASYNC_RUNNER_CODE)
+}
+
 #[derive(Clone)]
 struct CompiledOperationDependencies {
     singletons: Rc<Vec<Option<DependencyValue>>>,
     request_providers: Vec<CompiledProvider>,
     handler_slots: Vec<DependencySlot>,
+    sync_chain: Cell<u8>,
 }
 
 impl CompiledOperationDependencies {
@@ -1708,12 +1886,45 @@ impl CompiledOperationDependencies {
             singletons: Rc::new(Vec::new()),
             request_providers: Vec::new(),
             handler_slots: Vec::new(),
+            sync_chain: Cell::new(CHAIN_UNKNOWN),
         }
     }
 
+    /// Resolves the request-scoped chain, driving it synchronously whenever
+    /// every provider in it is synchronous.
+    ///
+    /// `CompiledProvider::run` boxes a ready future per provider, which is pure
+    /// overhead for a chain that never suspends. The first resolve probes with
+    /// `run_sync` and remembers the answer; an async provider anywhere in the
+    /// chain sends every later resolve straight back to the awaiting path.
     async fn resolve(&self) -> Result<RequestDependencyValues, DependencyError> {
         let mut requests = RequestDependencyValues::new(self.request_providers.len());
+        if self.sync_chain.get() == CHAIN_ASYNC {
+            return self.resolve_from(requests, 0).await;
+        }
         for (index, provider) in self.request_providers.iter().enumerate() {
+            match provider.run_sync(&self.singletons, requests.as_slice()) {
+                Ok(value) => requests.set(index, value)?,
+                Err(error) if is_async_runner(&error) => {
+                    self.sync_chain.set(CHAIN_ASYNC);
+                    return self.resolve_from(requests, index).await;
+                }
+                Err(error) => {
+                    self.finalize_prefix(&requests, index).await?;
+                    return Err(error);
+                }
+            }
+        }
+        self.sync_chain.set(CHAIN_SYNC);
+        Ok(requests)
+    }
+
+    async fn resolve_from(
+        &self,
+        mut requests: RequestDependencyValues,
+        start: usize,
+    ) -> Result<RequestDependencyValues, DependencyError> {
+        for (index, provider) in self.request_providers.iter().enumerate().skip(start) {
             let value = match provider.run(&self.singletons, requests.as_slice()).await {
                 Ok(value) => value,
                 Err(error) => {
@@ -2747,6 +2958,7 @@ fn compile_operation_dependencies(
         singletons,
         request_providers,
         handler_slots,
+        sync_chain: Cell::new(CHAIN_UNKNOWN),
     })
 }
 
@@ -3803,5 +4015,203 @@ mod tests {
             })
             .expect_err("a token outside its extraction resolves to nothing");
         assert!(error.contains("no longer available"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod blocking_pool_tests {
+    use super::{
+        BlockingError, BlockingPool, BlockingPoolConfig, CHAIN_ASYNC, CHAIN_SYNC, CHAIN_UNKNOWN,
+        CompiledOperationDependencies, DependencyError, Depends, Provider, on_blocking_worker,
+    };
+    use blazingly_di::DependencySlot;
+    use std::cell::Cell;
+    use std::num::NonZeroUsize;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    fn pool(workers: usize, capacity: usize) -> BlockingPool {
+        BlockingPool::new(BlockingPoolConfig::new(
+            NonZeroUsize::new(workers).expect("non-zero workers"),
+            NonZeroUsize::new(capacity).expect("non-zero capacity"),
+        ))
+        .expect("a local pool starts")
+    }
+
+    /// The bound counts queued jobs, not jobs a worker already owns.
+    ///
+    /// This is the same contract `crates/blazingly/tests/blocking_pool.rs`
+    /// pins process-wide; here it is checked against a pool the test owns, so
+    /// the shape of the queue can change without the assertion moving.
+    #[test]
+    fn a_full_queue_is_rejected_rather_than_queued_forever() {
+        let pool = pool(1, 1);
+        let (release, blocked) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel::<()>();
+        pool.submit(Box::new(move || {
+            started.send(()).expect("signal the worker started");
+            blocked.recv().expect("hold the only worker");
+        }))
+        .expect("the first job reaches the worker");
+        running.recv().expect("the worker picked the job up");
+
+        pool.submit(Box::new(|| {}))
+            .expect("the one queue slot accepts the second job");
+        assert_eq!(
+            pool.submit(Box::new(|| {})),
+            Err(BlockingError::Saturated),
+            "the worker and its one queued slot are occupied"
+        );
+        release.send(()).expect("release the worker");
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_cost_the_pool_its_only_worker() {
+        let pool = pool(1, 4);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        pool.submit(Box::new(|| panic!("job panic")))
+            .expect("the panicking job is scheduled");
+        let (done, finished) = mpsc::channel::<()>();
+        pool.submit(Box::new(move || done.send(()).expect("report completion")))
+            .expect("the next job is scheduled");
+        let outcome = finished.recv_timeout(Duration::from_secs(5));
+        std::panic::set_hook(previous);
+        outcome.expect("the worker survived the panic and ran the next job");
+    }
+
+    #[test]
+    fn dropping_the_last_handle_drains_the_queue_and_stops_the_workers() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (done, finished) = mpsc::channel::<()>();
+        {
+            let pool = pool(2, 8);
+            let clone = pool.clone();
+            for _ in 0..4 {
+                let ran = Arc::clone(&ran);
+                let done = done.clone();
+                clone
+                    .submit(Box::new(move || {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        done.send(()).expect("report completion");
+                    }))
+                    .expect("queued before shutdown");
+            }
+            drop(clone);
+        }
+        drop(done);
+        for _ in 0..4 {
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every queued job still ran");
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn only_pool_workers_report_themselves_as_workers() {
+        assert!(!on_blocking_worker(), "the test thread is not a worker");
+        let pool = pool(1, 1);
+        let (report, observed) = mpsc::channel::<(bool, bool)>();
+        pool.submit(Box::new(move || {
+            let named = std::thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("blazingly-blocking-"));
+            report
+                .send((on_blocking_worker(), named))
+                .expect("report from the worker");
+        }))
+        .expect("the probe is scheduled");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the worker reported"),
+            (true, true)
+        );
+    }
+
+    struct Config(u32);
+    struct Client(u32);
+
+    fn plan(providers: Vec<blazingly_di::CompiledProvider>) -> CompiledOperationDependencies {
+        CompiledOperationDependencies {
+            singletons: Rc::new(Vec::new()),
+            request_providers: providers,
+            handler_slots: Vec::new(),
+            sync_chain: Cell::new(CHAIN_UNKNOWN),
+        }
+    }
+
+    #[test]
+    fn an_all_sync_chain_resolves_without_awaiting_and_stays_classified() {
+        let plan = plan(vec![
+            Provider::request(|| Config(7))
+                .compile(&[])
+                .expect("config compiles"),
+            Provider::request(|config: Depends<Config>| Client(config.into_inner().0 + 1))
+                .compile(&[DependencySlot::Request(0)])
+                .expect("client compiles"),
+        ]);
+        for _ in 0..2 {
+            let values = futures_lite::future::block_on(plan.resolve()).expect("chain resolves");
+            let client = values.as_slice()[1]
+                .as_ref()
+                .expect("client slot")
+                .downcast_ref::<Client>()
+                .expect("client type");
+            assert_eq!(client.0, 8);
+        }
+        assert_eq!(plan.sync_chain.get(), CHAIN_SYNC);
+    }
+
+    #[test]
+    fn a_chain_with_an_async_provider_falls_back_and_remembers_it() {
+        let plan = plan(vec![
+            Provider::request(|| Config(7))
+                .compile(&[])
+                .expect("config compiles"),
+            Provider::request_async(|config: Depends<Config>| async move {
+                Client(config.into_inner().0 + 2)
+            })
+            .compile(&[DependencySlot::Request(0)])
+            .expect("client compiles"),
+        ]);
+        for _ in 0..2 {
+            let values = futures_lite::future::block_on(plan.resolve()).expect("chain resolves");
+            let client = values.as_slice()[1]
+                .as_ref()
+                .expect("client slot")
+                .downcast_ref::<Client>()
+                .expect("client type");
+            assert_eq!(client.0, 9);
+        }
+        assert_eq!(plan.sync_chain.get(), CHAIN_ASYNC);
+    }
+
+    #[test]
+    fn a_synchronous_provider_failure_is_reported_rather_than_retried() {
+        let attempts = Rc::new(Cell::new(0_u32));
+        let counted = Rc::clone(&attempts);
+        let plan = plan(vec![
+            Provider::try_request(move || {
+                counted.set(counted.get() + 1);
+                Err::<Config, _>(DependencyError::internal("provider_failed", "no config"))
+            })
+            .compile(&[])
+            .expect("config compiles"),
+        ]);
+        let Err(error) = futures_lite::future::block_on(plan.resolve()) else {
+            panic!("a failing provider must not resolve");
+        };
+        assert!(matches!(
+            error,
+            DependencyError::Internal {
+                code: "provider_failed",
+                ..
+            }
+        ));
+        assert_eq!(attempts.get(), 1, "a failed sync provider must not re-run");
     }
 }

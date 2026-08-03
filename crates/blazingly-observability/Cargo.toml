@@ -53,10 +53,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ], optional = true }
 uuid.workspace = true
 
-# Process metrics. `unsafe_code` is forbidden workspace-wide, so the
-# `GetProcessTimes` and `GetProcessMemoryInfo` calls live in these two safe
-# wrappers instead of direct `windows-sys` FFI. Neither pulls in a runtime.
-[target.'cfg(windows)'.dependencies]
+# Process metrics. `unsafe_code` is forbidden workspace-wide, so the Windows
+# process APIs and macOS Mach/clock APIs live behind these safe wrappers instead
+# of direct FFI in Blazingly. Neither dependency pulls in an async runtime.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 cpu-time = "1"
 memory-stats = "1"
 

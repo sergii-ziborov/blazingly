@@ -235,7 +235,7 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
 
 #[allow(clippy::too_many_lines)]
 fn operation_value(operation: &OperationDescriptor, components: &Map<String, Value>) -> Value {
-    let responses = operation
+    let mut responses = operation
         .contract
         .responses
         .iter()
@@ -280,6 +280,20 @@ fn operation_value(operation: &OperationDescriptor, components: &Map<String, Val
             (response.status.to_string(), value)
         })
         .collect::<Map<_, _>>();
+
+    // Derived, never declared: an operation whose inputs carry a rule is
+    // rejected by the input pipeline before the handler runs, and an operation
+    // that declares its own 422 keeps the one it declared.
+    if operation
+        .contract
+        .inputs
+        .iter()
+        .any(|input| type_is_validated(&input.ty))
+    {
+        responses
+            .entry(VALIDATION_FAILURE_STATUS.to_owned())
+            .or_insert_with(|| validation_failure_response(components));
+    }
 
     let mut value = json!({
         "operationId": operation.contract.id.as_str(),
@@ -626,6 +640,88 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Status the input pipeline rejects a failed input validation with.
+const VALIDATION_FAILURE_STATUS: &str = "422";
+
+/// Error code `blazingly_executor` puts in the envelope for that rejection.
+const VALIDATION_FAILURE_CODE: &str = "validation_error";
+
+const VALIDATION_FAILURE_DESCRIPTION: &str = "One or more inputs failed validation.";
+
+/// Reports whether any value of this type can be rejected by a declared rule.
+///
+/// A rule reaches the type either as a value type's own constraints or as the
+/// validation of a model field, at any depth, so the whole descriptor tree is
+/// walked rather than only its root.
+fn type_is_validated(descriptor: &TypeDescriptor) -> bool {
+    if !descriptor.constraints.is_empty() {
+        return true;
+    }
+    if descriptor.items.as_deref().is_some_and(type_is_validated) {
+        return true;
+    }
+    descriptor.model.as_ref().is_some_and(|model| {
+        model
+            .fields
+            .iter()
+            .any(|field| !field.validation.is_empty() || type_is_validated(&field.ty))
+    })
+}
+
+/// The 422 an operation with validated inputs answers with.
+///
+/// Derived once here rather than declared per operation: the envelope is the
+/// one `blazingly_http` writes, and the sample comes from the same schema-driven
+/// generator every other body in the document uses.
+fn validation_failure_response(components: &Map<String, Value>) -> Value {
+    json!({
+        "description": VALIDATION_FAILURE_DESCRIPTION,
+        "content": {
+            "application/json": media_type_value(validation_failure_schema(), components)
+        },
+        "x-blazingly-error-code": VALIDATION_FAILURE_CODE
+    })
+}
+
+fn validation_failure_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "error": {
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "const": VALIDATION_FAILURE_CODE },
+                    "message": { "type": "string" },
+                    "details": {
+                        "type": "object",
+                        "properties": {
+                            "violations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "field": { "type": "string" },
+                                        "code": { "type": "string" },
+                                        "message": { "type": "string" }
+                                    },
+                                    "required": ["field", "code", "message"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["violations"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["code", "message", "details"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["error"],
+        "additionalProperties": false
+    })
+}
+
 fn error_schema(response: &blazingly_core::ResponseDescriptor) -> Value {
     let mut error_properties = json!({
         "code": {
@@ -740,22 +836,29 @@ fn request_media_type(source: InputSource) -> &'static str {
     }
 }
 
+/// Projects one type, including the rules the type itself declares.
+///
+/// The recursion is what carries a value type's bounds into a `Vec<Tag>` item
+/// and into every deeper nesting: the item is a descriptor of its own, so it is
+/// projected by the same code that projects a bare field of that type.
 fn schema_value(descriptor: &TypeDescriptor) -> Value {
-    if let Some(model) = &descriptor.model {
-        return json!({
+    let mut value = if let Some(model) = &descriptor.model {
+        json!({
             "$ref": format!("#/components/schemas/{}", model.name),
             "x-rust-type": descriptor.rust_name
-        });
-    }
-
-    let mut value = match (&descriptor.schema, &descriptor.items) {
-        (SchemaKind::Array(_), Some(items)) => {
-            json!({ "type": "array", "items": schema_value(items) })
-        }
-        _ => schema_kind_value(&descriptor.schema),
+        })
+    } else {
+        let mut value = match (&descriptor.schema, &descriptor.items) {
+            (SchemaKind::Array(_), Some(items)) => {
+                json!({ "type": "array", "items": schema_value(items) })
+            }
+            _ => schema_kind_value(&descriptor.schema),
+        };
+        apply_known_string_format(&mut value, &descriptor.rust_name);
+        value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
+        value
     };
-    apply_known_string_format(&mut value, &descriptor.rust_name);
-    value["x-rust-type"] = Value::String(descriptor.rust_name.clone());
+    apply_validation(&mut value, &descriptor.constraints);
     value
 }
 
@@ -940,17 +1043,7 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
             ValidationRule::MinLength(value) => schema["minLength"] = json!(value),
             ValidationRule::MaxLength(value) => schema["maxLength"] = json!(value),
             ValidationRule::Email => schema["format"] = json!("email"),
-            ValidationRule::Alias(alias) => {
-                let aliases = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-aliases")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                aliases
-                    .as_array_mut()
-                    .expect("alias extension must be an array")
-                    .push(Value::String(alias.clone()));
-            }
+            ValidationRule::Alias(alias) => push_extension(schema, "x-blazingly-aliases", alias),
             ValidationRule::Custom(validator) => {
                 // Declarative constraints are encoded as `keyword=value` inside
                 // `Custom`; project the ones that map to a JSON Schema keyword
@@ -964,20 +1057,30 @@ fn apply_validation(schema: &mut Value, validation: &[ValidationRule]) {
                     constraint.apply_json_schema(schema);
                     continue;
                 }
-                let validators = schema
-                    .as_object_mut()
-                    .expect("validation schema must be an object")
-                    .entry("x-blazingly-validators")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                validators
-                    .as_array_mut()
-                    .expect("validator extension must be an array")
-                    .push(Value::String(validator.clone()));
+                push_extension(schema, "x-blazingly-validators", validator);
             }
             ValidationRule::Nested => {
                 schema["x-blazingly-nested-validation"] = Value::Bool(true);
             }
         }
+    }
+}
+
+/// Appends one name to a document extension array, at most once.
+///
+/// A field declared with a value type is projected twice — once from the type's
+/// own constraints, once from the rules the field inherited from it — and a
+/// keyword that overwrites is idempotent where an array is not.
+fn push_extension(schema: &mut Value, keyword: &str, name: &str) {
+    let names = schema
+        .as_object_mut()
+        .expect("validation schema must be an object")
+        .entry(keyword)
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("a document extension list must be an array");
+    if !names.iter().any(|declared| declared.as_str() == Some(name)) {
+        names.push(Value::String(name.to_owned()));
     }
 }
 
@@ -1364,6 +1467,192 @@ mod tests {
                 ["status"],
             "draft",
             "a declared default is the most useful sample value"
+        );
+    }
+
+    /// `#[api_model] #[min_length(1)] #[max_length(20)] struct Tag(String);`
+    fn tag() -> TypeDescriptor {
+        TypeDescriptor::scalar("Tag", SchemaKind::String).with_constraints(vec![
+            ValidationRule::MinLength(1),
+            ValidationRule::MaxLength(20),
+        ])
+    }
+
+    fn collection_of(item: TypeDescriptor) -> TypeDescriptor {
+        TypeDescriptor {
+            rust_name: format!("Vec<{}>", item.rust_name),
+            schema: SchemaKind::Array(Box::new(item.schema.clone())),
+            model: None,
+            items: Some(Box::new(item)),
+            constraints: Vec::new(),
+        }
+    }
+
+    fn create_note_model() -> ModelDescriptor {
+        ModelDescriptor::new(
+            "CreateNote",
+            vec![
+                FieldDescriptor::new(
+                    "tags",
+                    true,
+                    collection_of(tag()),
+                    vec![ValidationRule::Custom("max_items=5".to_owned())],
+                ),
+                FieldDescriptor::new("primary", true, tag(), Vec::new()),
+                FieldDescriptor::new(
+                    "groups",
+                    true,
+                    collection_of(collection_of(tag())),
+                    Vec::new(),
+                ),
+            ],
+        )
+    }
+
+    fn note_operation() -> OperationDescriptor {
+        OperationDescriptor::new(
+            HttpMethod::Post,
+            "/notes",
+            "notes.create",
+            "Create a note",
+            Some(TypeDescriptor::model(create_note_model())),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_value_types_bounds_reach_every_place_the_type_appears() {
+        let app = App::new().route(note_operation()).build().unwrap();
+
+        let document = super::to_value(&app);
+        let properties = &document["components"]["schemas"]["CreateNote"]["properties"];
+
+        let item = &properties["tags"]["items"];
+        assert_eq!(item["x-rust-type"], "Tag");
+        assert_eq!(item["minLength"], 1, "a collection item keeps its bounds");
+        assert_eq!(item["maxLength"], 20);
+        // `max_items` travels in the `Custom` channel, which only the
+        // constraint reader turned on by `validation` can decode.
+        #[cfg(feature = "validation")]
+        assert_eq!(
+            properties["tags"]["maxItems"], 5,
+            "the field's own bound still describes the collection"
+        );
+
+        assert_eq!(properties["primary"]["minLength"], 1);
+        assert_eq!(properties["primary"]["maxLength"], 20);
+
+        let nested = &properties["groups"]["items"]["items"];
+        assert_eq!(nested["x-rust-type"], "Tag");
+        assert_eq!(nested["minLength"], 1, "nesting does not lose the bounds");
+        assert_eq!(nested["maxLength"], 20);
+    }
+
+    #[test]
+    fn an_inherited_rule_is_not_listed_twice() {
+        let validated = TypeDescriptor::scalar("Slug", SchemaKind::String)
+            .with_constraints(vec![ValidationRule::Custom("check_slug".to_owned())]);
+        let model = ModelDescriptor::new(
+            "Page",
+            vec![FieldDescriptor::new(
+                "slug",
+                true,
+                validated,
+                // What `#[api_model]` records on a field declared with the type.
+                vec![ValidationRule::Custom("check_slug".to_owned())],
+            )],
+        );
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/pages",
+            "pages.create",
+            "Create a page",
+            Some(TypeDescriptor::model(model)),
+            vec![ResponseDescriptor::success(201, None)],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+        assert_eq!(
+            document["components"]["schemas"]["Page"]["properties"]["slug"]["x-blazingly-validators"],
+            blazingly_json::json!(["check_slug"])
+        );
+    }
+
+    #[test]
+    fn an_operation_with_validated_inputs_documents_its_422() {
+        let unvalidated = OperationDescriptor::new(
+            HttpMethod::Get,
+            "/notes",
+            "notes.list",
+            "List notes",
+            None,
+            vec![ResponseDescriptor::success(200, None)],
+        )
+        .unwrap();
+        let app = App::new()
+            .route(note_operation())
+            .route(unvalidated)
+            .build()
+            .unwrap();
+
+        let document = super::to_value(&app);
+        let failure = &document["paths"]["/notes"]["post"]["responses"]["422"];
+
+        assert_eq!(failure["x-blazingly-error-code"], "validation_error");
+        let schema = &failure["content"]["application/json"]["schema"];
+        assert_eq!(
+            schema["properties"]["error"]["properties"]["code"]["const"],
+            "validation_error"
+        );
+        let violation = &schema["properties"]["error"]["properties"]["details"]["properties"]["violations"]
+            ["items"];
+        assert_eq!(violation["properties"]["field"]["type"], "string");
+        assert_eq!(violation["properties"]["code"]["type"], "string");
+        assert_eq!(violation["properties"]["message"]["type"], "string");
+        assert_eq!(
+            violation["required"],
+            blazingly_json::json!(["field", "code", "message"])
+        );
+        assert!(
+            !failure["content"]["application/json"]["example"]["error"]["details"]["violations"][0]
+                .is_null(),
+            "the envelope carries a sample violation"
+        );
+
+        assert!(
+            document["paths"]["/notes"]["get"]["responses"]["422"].is_null(),
+            "an operation with nothing to validate does not claim a 422"
+        );
+    }
+
+    #[test]
+    fn a_declared_422_is_not_replaced_by_the_derived_one() {
+        let operation = OperationDescriptor::new(
+            HttpMethod::Post,
+            "/notes",
+            "notes.create",
+            "Create a note",
+            Some(TypeDescriptor::model(create_note_model())),
+            vec![
+                ResponseDescriptor::success(201, None),
+                ResponseDescriptor::error(
+                    422,
+                    "unprocessable_note",
+                    "The note is not usable.",
+                    None,
+                ),
+            ],
+        )
+        .unwrap();
+        let app = App::new().route(operation).build().unwrap();
+
+        let document = super::to_value(&app);
+        assert_eq!(
+            document["paths"]["/notes"]["post"]["responses"]["422"]["x-blazingly-error-code"],
+            "unprocessable_note"
         );
     }
 

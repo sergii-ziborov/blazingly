@@ -11,7 +11,7 @@ pub use blazingly_di::*;
 pub use blazingly_docs as docs;
 pub use blazingly_executor::{
     BlockingError, BlockingFuture, BlockingPool, BlockingPoolConfig, CancellationToken,
-    ExecutableApp, ExecutableBuildError, ExecutableOperation, ExecutionOutcome, Extension,
+    ExecutableApp, ExecutableBuildError, ExecutableOperation, ExecutionOutcome, Extension, Extract,
     FromInvocation, HookContext, HookOutcome, HookOutcomeKind, HttpRequestParts, InputRejection,
     InvocationAbort, InvocationControl, InvocationInput, OperationFuture, OperationOutput, Plugin,
     ResolvedDependencies, TestOverrides, UploadBody, blocking_error_outcome,
@@ -120,12 +120,12 @@ pub mod prelude {
         Accepted, ApiModel, App, Background, BackgroundExt, BackgroundTask, BackgroundTaskError,
         BlockingError, BlockingPoolConfig, BodyStream, BodyStreamError, CancellationToken,
         CollectBodyError, Cookie, Created, DependencyError, Depends, ExecutableApp, Extension,
-        File, Form, Header, HookContext, HookOutcome, HookOutcomeKind, HttpApp, HttpMiddleware,
-        HttpRequestContext, InvocationAbort, InvocationControl, Json, Multipart, NoContent,
-        OperationDescriptor, OperationFailure, Path, Plugin, PreparedJson, Provider, Query,
-        Request, Response, ResponseDescriptor, ResponseExt, Router, Status, StreamingBody, TestApp,
-        TestOverrides, TypeDescriptor, UploadBody, UploadFile, WithHeaders, api_error, api_model,
-        connect, delete, get, head, install_global_blocking_pool, operation, options, patch, post,
-        provider, put, routes, security, trace,
+        Extract, File, Form, Header, HookContext, HookOutcome, HookOutcomeKind, HttpApp,
+        HttpMiddleware, HttpRequestContext, InvocationAbort, InvocationControl, Json, Multipart,
+        NoContent, OperationDescriptor, OperationFailure, Path, Plugin, PreparedJson, Provider,
+        Query, Request, Response, ResponseDescriptor, ResponseExt, Router, Status, StreamingBody,
+        TestApp, TestOverrides, TypeDescriptor, UploadBody, UploadFile, WithHeaders, api_error,
+        api_model, connect, delete, get, head, install_global_blocking_pool, operation, options,
+        patch, post, provider, put, routes, security, trace,
     };
 }

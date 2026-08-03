@@ -16,14 +16,10 @@ for people using it.
   `axum` are banned from the dependency graph at any depth by a CI job, so
   adding Blazingly does not add an async runtime you did not ask for.
 
-Blazingly is not on crates.io yet, so both the CLI and the dependency come from
-Git. Once the registry release lands, `--git` becomes a version requirement and
-nothing else in this guide changes.
-
 ## Install the CLI
 
 ```console
-cargo install --git https://github.com/sergii-ziborov/blazingly cargo-blazingly
+cargo install cargo-blazingly
 ```
 
 The framework repository uses submodules; Cargo checks them out itself, so there
@@ -47,10 +43,12 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-# Blazingly is unpublished; switch this Git dependency to a version
-# requirement once it is on crates.io.
-blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }
+blazingly = { version = "0.1.1", features = ["native"] }
 ```
+
+To track unreleased work on `main` instead, use
+`blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }`
+— Cargo checks the submodules out itself.
 
 `[workspace]` is deliberate: it stops the project from being adopted by a parent
 workspace if you generated it inside one.
@@ -369,7 +367,7 @@ To speak MCP over stdio — the transport MCP hosts launch as a subprocess — a
 the feature:
 
 ```toml
-blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native", "mcp-stdio"] }
+blazingly = { version = "0.1.1", features = ["native", "mcp-stdio"] }
 ```
 
 and branch in `main` before the server starts:

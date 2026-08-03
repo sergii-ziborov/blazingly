@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
 mod audit;
+mod control_plane;
 mod http;
 mod jsonrpc;
 mod registry;
 
 pub use audit::{AuditEvent, AuditOutcome, AuditSink, BoundedAuditLog};
+pub use control_plane::{
+    FRAMEWORK_MANIFEST_MIME_TYPE, FRAMEWORK_MANIFEST_SCHEMA, FRAMEWORK_MANIFEST_URI,
+    FrameworkManifest,
+};
 pub use http::{
     McpHttpMethod, StreamableHttpConfig, StreamableHttpRequest, StreamableHttpResponse,
     StreamableHttpServer,

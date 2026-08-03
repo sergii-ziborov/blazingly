@@ -16,11 +16,10 @@ cargo blazingly dev
 a `src/main.rs` with one `#[get]` handler and a `MulticoreServer`, and a
 `.gitignore`. It is the one command that works outside a Cargo workspace.
 
-While the framework is unpublished, the generated dependency is a Git
-dependency on the Blazingly repository with a comment to switch to a version
-requirement once published. `--framework-path <dir>` emits a path dependency
-on a local checkout instead; the flag accepts either the workspace root or the
-`blazingly` crate directory.
+The generated dependency is the crates.io release matching the CLI's own
+version, with a comment showing the Git form for tracking unreleased work.
+`--framework-path <dir>` emits a path dependency on a local checkout instead;
+the flag accepts either the workspace root or the `blazingly` crate directory.
 
 ## Contract introspection
 

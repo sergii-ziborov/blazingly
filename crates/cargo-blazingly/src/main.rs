@@ -56,7 +56,7 @@ a serving instance for the listen port.
 
 `new <name>` scaffolds Cargo.toml, src/main.rs, and .gitignore in ./<name>.
 With `--framework-path` the project uses a path dependency on that checkout;
-without it, a Git dependency on the Blazingly repository.
+without it, the crates.io release matching this CLI's version.
 
 Blazingly.toml:
     [app]
@@ -83,8 +83,17 @@ const EMIT_VARIABLE: &str = "BLAZINGLY_EMIT";
 const WORKERS_VARIABLE: &str = "BLAZINGLY_WORKERS";
 const EMIT_ADDRESS: &str = "127.0.0.1:0";
 const FRAMEWORK_GIT_URL: &str = "https://github.com/sergii-ziborov/blazingly";
-const GIT_DEPENDENCY_NOTE: &str = "# Blazingly is unpublished; switch this Git dependency to a version\n\
-                                   # requirement once it is on crates.io.\n";
+// A generated project pins the framework version this CLI was built against,
+// so `cargo install cargo-blazingly` and the project it scaffolds cannot
+// disagree.
+const FRAMEWORK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn registry_dependency_note() -> String {
+    format!(
+        "# To track unreleased work on `main` instead:\n\
+         # blazingly = {{ git = \"{FRAMEWORK_GIT_URL}\", features = [\"native\"] }}\n"
+    )
+}
 const STAGE_DIRECTORY: &str = "blazingly-dev";
 const STAGE_ATTEMPTS: u32 = 10;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -701,11 +710,11 @@ fn validate_package_name(name: &str) -> Result<(), CliError> {
 }
 
 /// The Cargo dependency expression for `blazingly`: a path dependency on a
-/// local checkout, or a Git dependency while the framework is unpublished.
+/// local checkout, or the registry release matching this CLI.
 fn framework_dependency(framework_path: Option<&Path>) -> Result<String, CliError> {
     let Some(path) = framework_path else {
         return Ok(format!(
-            "{{ git = \"{FRAMEWORK_GIT_URL}\", features = [\"native\"] }}"
+            "{{ version = \"{FRAMEWORK_VERSION}\", features = [\"native\"] }}"
         ));
     };
     let crate_directory = resolve_framework_crate(path)?;
@@ -744,15 +753,19 @@ fn toml_path_text(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-fn project_files(name: &str, dependency: &str, git_dependency: bool) -> BTreeMap<String, String> {
+fn project_files(
+    name: &str,
+    dependency: &str,
+    registry_dependency: bool,
+) -> BTreeMap<String, String> {
     let config = blazingly_docs::ScaffoldConfig::new(name)
         .with_dependency(dependency)
         .without_kubernetes();
     let mut files = blazingly_docs::scaffold(&config).into_files();
-    if git_dependency && let Some(cargo_toml) = files.get_mut("Cargo.toml") {
+    if registry_dependency && let Some(cargo_toml) = files.get_mut("Cargo.toml") {
         *cargo_toml = cargo_toml.replacen(
             "\nblazingly = ",
-            &format!("\n{GIT_DEPENDENCY_NOTE}blazingly = "),
+            &format!("\n{}blazingly = ", registry_dependency_note()),
             1,
         );
     }
@@ -1616,10 +1629,13 @@ mod tests {
     }
 
     #[test]
-    fn unpublished_framework_defaults_to_the_git_dependency() {
-        let dependency = framework_dependency(None).expect("git dependency");
-        assert!(dependency.contains(&format!("git = \"{FRAMEWORK_GIT_URL}\"")));
+    fn generated_projects_default_to_the_matching_registry_release() {
+        let dependency = framework_dependency(None).expect("registry dependency");
+        assert!(dependency.contains(&format!("version = \"{FRAMEWORK_VERSION}\"")));
         assert!(dependency.contains("features = [\"native\"]"));
+        // A CLI and the project it scaffolds must not disagree about the
+        // framework version.
+        assert_eq!(FRAMEWORK_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -1642,13 +1658,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_project_annotates_the_git_dependency() {
-        let git = framework_dependency(None).expect("git dependency");
-        let files = project_files("demo", &git, true);
+    fn generated_project_annotates_the_registry_dependency() {
+        let registry = framework_dependency(None).expect("registry dependency");
+        let files = project_files("demo", &registry, true);
         let cargo_toml = files.get("Cargo.toml").expect("manifest");
         assert!(cargo_toml.contains("name = \"demo\""));
-        assert!(cargo_toml.contains(GIT_DEPENDENCY_NOTE));
-        assert!(cargo_toml.contains(&format!("blazingly = {git}")));
+        assert!(cargo_toml.contains(&registry_dependency_note()));
+        assert!(cargo_toml.contains(FRAMEWORK_GIT_URL));
+        assert!(cargo_toml.contains(&format!("blazingly = {registry}")));
         assert!(
             files.get("src/main.rs").is_some_and(|main| {
                 main.contains("MulticoreServer") && main.contains("#[get(")
@@ -1665,7 +1682,7 @@ mod tests {
     fn path_projects_keep_the_dependency_unannotated() {
         let files = project_files("demo", "{ path = \"../blazingly\" }", false);
         let cargo_toml = files.get("Cargo.toml").expect("manifest");
-        assert!(!cargo_toml.contains(GIT_DEPENDENCY_NOTE));
+        assert!(!cargo_toml.contains(&registry_dependency_note()));
         assert!(cargo_toml.contains("blazingly = { path = \"../blazingly\" }"));
     }
 
