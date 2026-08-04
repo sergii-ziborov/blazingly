@@ -132,6 +132,24 @@ Web's numbers. Three samples per side earn no ranking claim under this
 document's rules; they set the next target: close the last fraction of a
 millisecond to Actix Web's tail on a properly idle host.
 
+**2026-08-04 late: the tail split at the socket write, in production code.**
+With `BLAZINGLY_NATIVE_STAGE_METRICS=1`, the native loop's own histograms
+over 786,432 keep-alive cycles (elevated priority, 116,760 req/s, client p99
+2.609ms / p99.9 3.795ms, 22% background) split each cycle at the flush:
+`service` — head parsed to response flushed, everything this framework does —
+measured p50 &le; 16us, p99 &le; 65us, p99.9 &le; 131us; `wait` — response
+flushed to the next head parsed, the peer's turnaround plus the kernel plus
+the wake back onto the worker — measured p50 &le; 524us, p99 &le; 2.1ms.
+Against a local pipeline client whose turnaround is microseconds, the wait
+side is the kernel and scheduler. That closes the attribution opened this
+morning with numbers at every level: the framework's share of a
+millisecond-scale tail is roughly a twentieth, and further tail work is
+driver, kernel, and scheduling work — worker priority (shipped), completion
+batching, and eventually io_uring-class submission on the platforms that
+offer it. The accept loop also now places each connection on the
+least-loaded worker rather than rotating blindly; on this symmetric workload
+it measured neutral, as designed — its value is skew robustness.
+
 **Same-day verdict via thread cycles.** Wall-clock percentiles on a shared
 host measure the Windows scheduler, so the audit also recorded
 `QueryThreadCycleTime` around 200,000 full dispatches — thread cycles do not
