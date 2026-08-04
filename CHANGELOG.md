@@ -27,6 +27,19 @@ pinned submodule revision is recorded as a single entry.
 
 ### Added
 
+- Request-aware providers: a `#[provider]` may now declare `Path<T>`,
+  `Query<T>`, `Header<T>`, and `Cookie<T>` arguments beside `Depends<T>`,
+  including async and transient providers. Each declared input folds into the
+  consuming operation's contract exactly once — the same header read by two
+  providers is decoded once, appears once in `OpenAPI` parameters, MCP tool
+  schemas, generated documentation, and fingerprints, and fails validation
+  with the same `422` envelope a handler-declared input produces, before any
+  provider runs. A test override replacing a provider bypasses its inputs
+  entirely; a singleton provider cannot declare request inputs, and one wire
+  input consumed at two different types fails the build. Dependency
+  resolution keeps its compiled numeric slots: inputs occupy pre-decoded
+  slots at the front of the request slice, and providers without inputs
+  compile exactly as before.
 - `MulticoreServer::with_worker_priority(WorkerPriority::Elevated)`: workers
   request elevated scheduling priority when they start, shortening the gap
   between an I/O completion arriving and the worker running again on a

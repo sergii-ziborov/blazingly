@@ -76,11 +76,23 @@ The first executable vertical slice now includes:
 - ready HS256 JWT, OAuth2 bearer-scope, signed session-cookie, and constant-time
   API-key verification, with typed `Extension<SecurityContext>` handler access;
 - Fastify-style nested `Plugin` scopes with downward-only provider inheritance
-  and local overrides;
+  and local overrides, plus `Plugin::mount("/v1")` and
+  `with_id_namespace("v1")` so one module serves under two prefixes with
+  distinct operation identities and MCP tool names;
 - compiled dependency injection with direct typed handler arguments or
   `Depends<T>`, `singleton`/`request`/`transient` lifetimes, build-time
   diagnostics, sync/async fallible providers, and sync/async reverse-order
   finalizers; typed factories can use `#[provider]`;
+- request-aware providers: a `#[provider]` also takes `Path`/`Query`/
+  `Header`/`Cookie` inputs beside `Depends<T>`, and each input folds into the
+  consuming operation's contract exactly once — deduplicated across
+  providers, validated with the same `422` envelope as a handler input, and
+  visible to OpenAPI, MCP, documentation, and fingerprints; test overrides
+  bypass a replaced provider's inputs;
+- explicit custom extraction with `Extract<T>` over public `FromInvocation`,
+  and `Extract<RequestParts>` for an owned snapshot of method, path,
+  effective scheme and host, and peer address, with deterministic
+  `transport_mismatch` rejection off HTTP;
 - inherited async plugin hooks compiled per operation: `on_request`,
   `pre_parse`, `pre_validate`, `pre_handler`, `pre_serialize`, reverse-order
   `on_error`/`on_response`, plus child-before-parent shutdown hooks;
@@ -115,7 +127,10 @@ The first executable vertical slice now includes:
 - an optional Compio-based native adapter with no Tokio: HTTP/1 keep-alive,
   pipelining, Content-Length and chunked bodies, configurable limits, rustls
   TLS, graceful shutdown, cached HTTP `Date`, bounded pipelined-response
-  coalescing, and a balanced thread-per-core launcher;
+  coalescing, and a thread-per-core launcher that places each connection on
+  the least-loaded worker, with opt-in elevated worker scheduling priority
+  (measured minus 26% p99.9 on a contended host) and built-in per-stage tail
+  histograms behind `BLAZINGLY_NATIVE_STAGE_METRICS=1`;
 - experimental HTTP/2 prior-knowledge/ALPN support behind `native-http2`,
   using the same compiled `HttpApp`.
 

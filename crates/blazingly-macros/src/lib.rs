@@ -745,6 +745,7 @@ fn http_method_tokens(method: &HttpMethodArgument) -> syn::Result<proc_macro2::T
     Ok(method)
 }
 
+#[allow(clippy::too_many_lines)]
 fn provider_tokens(
     arguments: &ProviderArgs,
     function: &ItemFn,
@@ -763,22 +764,66 @@ fn provider_tokens(
     if function.sig.inputs.len() > 8 {
         return Err(syn::Error::new_spanned(
             &function.sig.inputs,
-            "Blazingly providers accept at most eight `Depends<T>` arguments",
+            "Blazingly providers accept at most eight arguments",
         ));
     }
+    let mut provider_arguments = Vec::with_capacity(function.sig.inputs.len());
     for input in &function.sig.inputs {
         let FnArg::Typed(argument) = input else {
             return Err(syn::Error::new_spanned(
                 input,
-                "provider inputs must use `Depends<T>`",
+                "provider arguments must be `Depends<T>` or a typed request \
+                 input: `Path<T>`, `Query<T>`, `Header<T>`, or `Cookie<T>`",
             ));
         };
-        if wrapper_inner(&argument.ty, "Depends").is_none() {
+        let name = operation_argument_name(&argument.pat)?;
+        let Some((kind, inner)) = OperationInputKind::from_type(&argument.ty) else {
             return Err(syn::Error::new_spanned(
                 &argument.ty,
-                "provider inputs must use `Depends<T>`",
+                "provider arguments must be `Depends<T>` or a typed request \
+                 input: `Path<T>`, `Query<T>`, `Header<T>`, or `Cookie<T>`",
+            ));
+        };
+        match kind {
+            OperationInputKind::Dependency
+            | OperationInputKind::Path
+            | OperationInputKind::Query
+            | OperationInputKind::Header
+            | OperationInputKind::Cookie => {}
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &argument.ty,
+                    "a provider reads scalar request inputs; body payloads \
+                     belong to the handler that owns the request body",
+                ));
+            }
+        }
+        let required = wrapper_inner(&inner, "Option").is_none();
+        if matches!(kind, OperationInputKind::Path) && !required {
+            return Err(syn::Error::new_spanned(
+                &argument.ty,
+                "Path<T> arguments are always required and cannot wrap Option<T>",
             ));
         }
+        provider_arguments.push((
+            LitStr::new(&name.to_string(), name.span()),
+            kind,
+            (*argument.ty).clone(),
+            inner,
+            required,
+        ));
+    }
+    let request_input_count = provider_arguments
+        .iter()
+        .filter(|(_, kind, ..)| !kind.is_dependency())
+        .count();
+    if request_input_count > 0 && matches!(arguments.lifetime, ProviderLifetimeArgument::Singleton)
+    {
+        return Err(syn::Error::new_spanned(
+            &function.sig,
+            "a singleton provider cannot declare request inputs; it is built \
+             once at compile time, before any request exists",
+        ));
     }
 
     let ReturnType::Type(_, output) = &function.sig.output else {
@@ -807,6 +852,35 @@ fn provider_tokens(
         ));
     }
 
+    let function_name = &function.sig.ident;
+    let provider_module = format_ident!("{function_name}");
+    let visibility = &function.vis;
+
+    if request_input_count > 0 {
+        let body = request_provider_body(
+            arguments,
+            function_name,
+            output,
+            &provider_arguments,
+            asynchronous,
+            fallible,
+        );
+        return Ok(quote! {
+            #function
+
+            #[doc(hidden)]
+            #visibility mod #provider_module {
+                #[allow(unused_imports)]
+                use super::*;
+
+                #[must_use]
+                pub fn provider() -> ::blazingly::RequestProvider {
+                    #body
+                }
+            }
+        });
+    }
+
     let constructor = match (arguments.lifetime, asynchronous, fallible) {
         (ProviderLifetimeArgument::Singleton, false, false) => format_ident!("singleton"),
         (ProviderLifetimeArgument::Singleton, false, true) => format_ident!("try_singleton"),
@@ -822,9 +896,6 @@ fn provider_tokens(
         }
         (ProviderLifetimeArgument::Singleton, true, _) => unreachable!(),
     };
-    let function_name = &function.sig.ident;
-    let provider_module = format_ident!("{function_name}");
-    let visibility = &function.vis;
 
     Ok(quote! {
         #function
@@ -840,6 +911,134 @@ fn provider_tokens(
             }
         }
     })
+}
+
+/// Emits the `RequestProvider` for a provider that reads request inputs.
+///
+/// Dependencies keep their compiled numeric slots; each request input is
+/// decoded once per operation by the generated closure below and re-read from
+/// its slot here, so the provider body is plain calls over typed values with
+/// no per-request lookup of any kind.
+#[allow(clippy::too_many_lines)]
+fn request_provider_body(
+    arguments: &ProviderArgs,
+    function_name: &Ident,
+    output: &Type,
+    provider_arguments: &[(LitStr, OperationInputKind, Type, Type, bool)],
+    asynchronous: bool,
+    fallible: bool,
+) -> proc_macro2::TokenStream {
+    let value_type = if fallible {
+        result_types(output).map_or_else(|| output.clone(), |(success, _)| success)
+    } else {
+        output.clone()
+    };
+
+    let mut dependency_keys = Vec::new();
+    let mut bindings = Vec::new();
+    let mut call_arguments = Vec::new();
+    let mut input_records = Vec::new();
+    let mut depends_index = 0_usize;
+    let mut input_index = 0_usize;
+    for (position, (name, kind, wrapper, inner, required)) in provider_arguments.iter().enumerate()
+    {
+        let binding = format_ident!("__blazingly_argument_{position}");
+        if kind.is_dependency() {
+            let index = depends_index;
+            depends_index += 1;
+            dependency_keys.push(quote!(::blazingly::DependencyKey::of::<#inner>()));
+            bindings.push(quote! {
+                let #binding = reader.depends::<#inner>(#index)?;
+            });
+        } else {
+            let index = input_index;
+            input_index += 1;
+            let source = kind
+                .source_tokens()
+                .expect("request provider inputs always have a source");
+            bindings.push(quote! {
+                let #binding = (*reader.input::<#wrapper>(#index)?).clone();
+            });
+            input_records.push(quote! {
+                ::blazingly::ProviderInput::new::<#wrapper>(
+                    ::blazingly::InputDescriptor::new(
+                        #name,
+                        #source,
+                        #required,
+                        <#inner as ::blazingly::ApiSchema>::type_descriptor(),
+                    ),
+                    ::std::rc::Rc::new(|invocation: &::blazingly::InvocationInput<'_>| {
+                        <#wrapper as ::blazingly::FromInvocation>::from_invocation(
+                            invocation, #name, #required,
+                        )
+                        .map(|value| {
+                            ::std::rc::Rc::new(value) as ::blazingly::DependencyValue
+                        })
+                    }),
+                ),
+            });
+        }
+        call_arguments.push(binding);
+    }
+
+    let invocation = if fallible {
+        quote!(super::#function_name(#(#call_arguments),*))
+    } else {
+        quote!(::core::result::Result::Ok(super::#function_name(#(#call_arguments),*)))
+    };
+    let (constructor, factory) = if asynchronous {
+        let invocation = if fallible {
+            quote!(super::#function_name(#(#call_arguments),*).await)
+        } else {
+            quote!(::core::result::Result::Ok(
+                super::#function_name(#(#call_arguments),*).await
+            ))
+        };
+        let constructor = match arguments.lifetime {
+            ProviderLifetimeArgument::Transient => format_ident!("transient_from_slots_async"),
+            _ => format_ident!("request_from_slots_async"),
+        };
+        let factory = quote! {
+            ::std::rc::Rc::new(|reader: &::blazingly::SlotReader<'_>| {
+                let assemble = move || -> ::core::result::Result<_, ::blazingly::DependencyError> {
+                    #(#bindings)*
+                    ::core::result::Result::Ok((#(#call_arguments,)*))
+                };
+                match assemble() {
+                    ::core::result::Result::Ok((#(#call_arguments,)*)) => {
+                        ::std::boxed::Box::pin(async move { #invocation })
+                    }
+                    ::core::result::Result::Err(error) => ::std::boxed::Box::pin(async move {
+                        ::core::result::Result::Err(error)
+                    }),
+                }
+            })
+        };
+        (constructor, factory)
+    } else {
+        let constructor = match arguments.lifetime {
+            ProviderLifetimeArgument::Transient => format_ident!("transient_from_slots"),
+            _ => format_ident!("request_from_slots"),
+        };
+        let factory = quote! {
+            ::std::rc::Rc::new(|reader: &::blazingly::SlotReader<'_>| {
+                #(#bindings)*
+                #invocation
+            })
+        };
+        (constructor, factory)
+    };
+
+    quote! {
+        ::blazingly::RequestProvider::new(
+            ::blazingly::Provider::#constructor::<#value_type>(
+                ::std::vec![#(#dependency_keys),*],
+                #input_index,
+                #factory,
+            ),
+            ::std::vec![#(#input_records)*],
+        )
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3922,10 +4121,45 @@ fn wrapper_inner(ty: &Type, wrapper: &str) -> Option<Type> {
 mod tests {
     use super::{
         Attribute, FieldRules, FieldShape, Fields, ItemEnum, ItemStruct, ModelArgs, NumericLiteral,
-        RenameRule, Type, constraint_encodings, enum_model_tokens, field_shape,
-        lint_pattern_syntax, metadata_encodings, model_tokens, normalize_collection_rules, quote,
-        reject_incompatible_rules, schema_type, snake_to_camel, take_field_rules,
+        ProviderArgs, ProviderLifetimeArgument, RenameRule, Type, constraint_encodings,
+        enum_model_tokens, field_shape, lint_pattern_syntax, metadata_encodings, model_tokens,
+        normalize_collection_rules, provider_tokens, quote, reject_incompatible_rules, schema_type,
+        snake_to_camel, take_field_rules,
     };
+
+    #[test]
+    fn a_provider_may_read_request_inputs_and_a_singleton_may_not() {
+        let request = ProviderArgs {
+            lifetime: ProviderLifetimeArgument::Request,
+        };
+        let function = syn::parse_str::<syn::ItemFn>(
+            "fn tenant(Header(tenant): Header<String>, repo: Depends<Repo>) -> Tenant { todo!() }",
+        )
+        .expect("provider fixture parses");
+        let expansion = provider_tokens(&request, &function)
+            .expect("a request provider with inputs expands")
+            .to_string();
+        assert!(expansion.contains("RequestProvider"), "{expansion}");
+        assert!(expansion.contains("request_from_slots"), "{expansion}");
+        assert!(expansion.contains("InputSource :: Header"), "{expansion}");
+
+        let singleton = ProviderArgs {
+            lifetime: ProviderLifetimeArgument::Singleton,
+        };
+        let error = provider_tokens(&singleton, &function)
+            .expect_err("a singleton is built before any request exists");
+        assert!(
+            error.to_string().contains("cannot declare request inputs"),
+            "{error}"
+        );
+
+        let body = syn::parse_str::<syn::ItemFn>(
+            "fn bad(Json(payload): Json<Model>) -> Model { todo!() }",
+        )
+        .expect("body fixture parses");
+        let error = provider_tokens(&request, &body).expect_err("a provider must not own the body");
+        assert!(error.to_string().contains("body payloads"), "{error}");
+    }
 
     fn field_attributes(declaration: &str) -> Vec<Attribute> {
         let model = syn::parse_str::<ItemStruct>(&format!("struct Probe {{ {declaration} }}"))

@@ -14,8 +14,9 @@ pub use blazingly_executor::{
     ExecutableApp, ExecutableBuildError, ExecutableOperation, ExecutionOutcome, Extension, Extract,
     FromInvocation, HookContext, HookOutcome, HookOutcomeKind, HttpRequestParts, InputRejection,
     InvocationAbort, InvocationControl, InvocationInput, OperationFuture, OperationOutput, Plugin,
-    RequestParts, ResolvedDependencies, TestOverrides, UploadBody, blocking_error_outcome,
-    dependency_error_outcome, install_global_blocking_pool, routes, run_blocking,
+    ProviderInput, ProviderInputDecoder, RequestParts, RequestProvider, ResolvedDependencies,
+    TestOverrides, UploadBody, blocking_error_outcome, dependency_error_outcome,
+    install_global_blocking_pool, routes, run_blocking,
 };
 pub use blazingly_http as http;
 pub use blazingly_http::{

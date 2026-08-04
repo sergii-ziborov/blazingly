@@ -248,6 +248,23 @@ async fn read_task(Path(id): Path<u64>, tasks: Tasks) -> Result<Json<Task>, Task
 `Created<T>`, `Accepted<T>`, `NoContent`, and `Status<CODE, T>` are the typed
 responses; `WithHeaders` adds validated response headers.
 
+A provider may also read the request itself — `Path<T>`, `Query<T>`,
+`Header<T>`, and `Cookie<T>` work beside `Depends<T>`:
+
+```rust
+#[provider]
+fn current_user(Header(authorization): Header<String>, tasks: Depends<Tasks>) -> CurrentUser {
+    // decode the token, look the user up ...
+}
+```
+
+Every input a provider declares folds into the operations that use it,
+exactly once: the same header consumed by two providers is decoded once,
+appears once in `/openapi.json` and the MCP tool schema, and fails validation
+with the same `422` envelope a handler-declared input produces — before any
+provider runs. A test override that replaces the provider supplies the value
+directly, so the mock needs neither the header nor the cookie.
+
 Providers are registered on a plugin, and the plugin owns the routes:
 
 ```rust
@@ -260,6 +277,10 @@ fn application() -> ExecutableApp {
     .expect("application contract should compile")
 }
 ```
+
+The same module can be mounted twice — `Plugin::mount("/v1")` joins the path
+prefix at compile time and `with_id_namespace("v1")` keeps the operation
+identities and MCP tool names distinct per mount.
 
 The provider graph is compiled once, during `ExecutableApp` construction, which
 is why that call returns a `Result`: a dependency nothing provides is reported
