@@ -1,0 +1,23 @@
+# `cargo audit` reads Cargo.lock, which is feature-agnostic: it records every
+# package the resolver could need under any feature selection, including
+# optional dependencies this workspace never turns on. An advisory against
+# such a package is real for the ecosystem and inert here, because the code is
+# never compiled into anything this workspace builds or publishes.
+#
+# An entry below is only legitimate while that stays true, so the
+# `security-audit` job re-proves it on every run instead of trusting this
+# comment: see "ignored advisories are still unreachable" in
+# .github/workflows/quality.yml, which fails if an ignored advisory's crate
+# becomes feature-enabled.
+
+[advisories]
+ignore = [
+    # rkyv 0.7.46 — insufficient archive validation, out-of-bounds reads.
+    #
+    # Reaches Cargo.lock as an optional dependency of `rust_decimal`, whose
+    # enabled feature set here is exactly `default, serde, std`. `rkyv` is not
+    # among them, so it is never built. There is no upgrade path: the advisory
+    # is fixed in rkyv >=0.8.17 and rust_decimal 1.42.1, the latest release,
+    # still requires the 0.7 line.
+    "RUSTSEC-2026-0235",
+]

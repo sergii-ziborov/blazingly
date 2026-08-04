@@ -79,24 +79,41 @@ release may break the framework Rust API. It must become blocking before
 
 ## Release process
 
-1. Confirm both submodules, `crates/blazingly-contract` and
-   `crates/blazingly-wire`, are checked out at a released tag whose `version`
-   satisfies the matching requirement in the root `[workspace.dependencies]`.
-   Commit both submodule pointers. A fresh `git clone --recursive` must build
-   without any further steps. Each submodule releases from its own repository
-   and is published to crates.io before the framework crates that depend on it.
-2. Move the `Unreleased` section of `CHANGELOG.md` into a dated version
-   section, and record every intentional breaking change reported by
-   `workspace-semver`.
-3. Confirm `repository` in `[workspace.package]` is the canonical hosting URL.
+1. For each of the three submodules — `crates/blazingly-contract`,
+   `crates/blazingly-json`, `crates/blazingly-wire` — check whether its code
+   changed since its own last published version. **A changed submodule whose
+   version was not bumped is the failure that hides best**: the release
+   workflow skips any version already on crates.io, so the change is committed,
+   pushed, and never reaches a single user. Bump it in its own repository, tag
+   it, and push both before touching the parent.
+2. Commit the three submodule gitlinks. Each must point at a pushed, tagged
+   commit whose `version` satisfies the matching requirement in the root
+   `[workspace.dependencies]`; the tagged CI checkout fetches those commits
+   from the submodule remotes and cannot see anything that lives only locally.
+   A fresh `git clone --recursive` must build with no further steps.
+3. Bump `version` in `[workspace.package]`, **and every first-party
+   requirement in `[workspace.dependencies]` that carries it**. Cargo reads
+   `0.1.0` as `>=0.1.0, <0.2.0`, so a requirement left behind does not fail
+   loudly: each crate resolves its siblings from the previous release instead
+   of the one being published beside it.
+4. Update every version pinned in prose that ships to crates.io. Each crate
+   has its own `README.md` and each is uploaded with that crate's tarball, so
+   an install snippet reading `= "0.1"` on the 0.2.0 page tells readers to
+   depend on a version that cannot contain what they are reading about, and a
+   published version's files can never be replaced. Sweep with
+   `Select-String -Path "crates\*\README.md" -Pattern '= "0\.\d+"'` and check
+   each hit against the version that crate actually publishes — a submodule
+   crate on its own version line is often already correct.
+5. Move the `Unreleased` section of `CHANGELOG.md` into a dated version
+   section, and record every intentional breaking change. `workspace-semver`
+   reports the API diff against the last published release.
+6. Confirm `repository` in `[workspace.package]` is the canonical hosting URL.
    crates.io records it permanently.
-4. Bump `version` in `[workspace.package]`.
-5. Confirm the release gate above is green.
-6. Flip `publish` in `[workspace.package]` to `true`.
-7. Publish in dependency order: the submodule crates `blazingly-contract` and
-   `blazingly-wire` first, from their own repositories, then the leaf crates,
-   then `blazingly` and `cargo-blazingly`.
-8. Tag the release.
+7. Confirm the release gate above is green at the exact revision to be tagged.
+8. Tag `vX.Y.Z`. That is the release decision: `release.yml` re-runs the gate,
+   refuses a tag disagreeing with the workspace version, and publishes every
+   crate in dependency order, submodule crates included, skipping versions
+   already on crates.io so a resumed release is safe.
 
 The first `1.0.0` requires a stable facade, documented support window,
 production HTTP/1 hardening, independent security review, and at least two real

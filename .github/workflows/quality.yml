@@ -19,6 +19,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
+      # `cargo audit` reads Cargo.lock, which is feature-agnostic, so it
+      # reports advisories against optional dependencies this workspace never
+      # enables. `.cargo/audit.toml` ignores exactly those, and an ignore is
+      # only honest while the crate stays unbuilt — which Cargo.lock cannot
+      # express and a comment cannot enforce. Prove it from the
+      # feature-resolved graph instead, so the day the assumption breaks is
+      # the day this job says so.
+      - name: ignored advisories are still unreachable
+        run: |
+          features="$(cargo metadata --format-version 1 --all-features \
+            | jq -r '.resolve.nodes[]
+                     | select(.id | test("#rust_decimal@"))
+                     | .features[]')"
+          echo "rust_decimal enabled features: $(echo "$features" | tr '\n' ' ')"
+          if grep -qx rkyv <<<"$features"; then
+            echo "::error::rust_decimal now enables rkyv, so RUSTSEC-2026-0235 \
+          is live: drop its ignore from .cargo/audit.toml and fix the dependency" >&2
+            exit 1
+          fi
 
   # Enforces deny.toml. The banned-crate list is the point: "Tokio-free, no
   # Hyper, no Axum" is a claim a reviewer checks with `cargo tree`, so it is
@@ -140,24 +159,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
-      - name: Report workspace API changes against the base revision
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      # No `--baseline-rev`: a git revision answers "what changed in this
+      # push", which on a release commit is the release commit alone and on
+      # any other push is one commit of work. The question this job exists to
+      # answer is "what changed for someone upgrading", so each crate is
+      # compared against its own latest crates.io release, which is exactly
+      # what cargo-semver-checks does when given no baseline.
+      - name: Report workspace API changes against the published releases
         run: |
-          baseline="$BASE_SHA"
-          if [ -z "$baseline" ]; then
-            baseline="$(git rev-parse --verify --quiet HEAD^ || true)"
-          fi
-          if [ -z "$baseline" ]; then
-            echo "no baseline revision available; nothing to compare"
-            exit 0
-          fi
           cargo +stable semver-checks check-release \
             --workspace \
             --exclude blazingly-contract \
             --exclude blazingly-wire \
-            --exclude cargo-blazingly \
-            --baseline-rev "$baseline"
+            --exclude cargo-blazingly

@@ -41,13 +41,9 @@ categories = [
     "asynchronous",
     "development-tools",
 ]
-# The release gate (docs/stability.md, "Release process") was walked step by
-# step before this flipped: CI `test`, `security-audit`, `miri`,
-# `address-sanitizer`, `fuzz-smoke`, `contract-semver`,
-# `feature-combinations`, and `rustdoc` green on the release commit;
-# `workspace-semver` reviewed (advisory, no baseline before the first
-# release); submodules pinned to released tags satisfying the
-# [workspace.dependencies] requirements; CHANGELOG.md section promoted.
+# Publishing is on. Every tag walks the release process in docs/stability.md,
+# which is where the steps live; this flag is not the gate and flipping it
+# back would not be one either.
 publish = true
 
 [workspace.dependencies]
