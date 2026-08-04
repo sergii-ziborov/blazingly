@@ -109,6 +109,29 @@ Findings, in confidence order:
 - The one 188.6ms outlier at 14% background remains unexplained and is the
   open tail question for the rerun.
 
+**2026-08-04 evening: the priority lever, isolated and measured.** With the
+host briefly quiet (10-18% background on every sample), three interleaved
+rounds of base / elevated-priority / elevated-plus-1ms-timer produced, in
+medians of three: p99 2.284ms -> 2.033ms (-11%), p99.9 3.799ms -> 2.815ms
+(-26%), max -13%, throughput +2% — the elevated rounds beat their own round's
+base three times out of three. The 1ms Windows timer interrupt added nothing
+on top, which refutes the timer-quantum hypothesis for this completion-driven
+server and keeps the shipped lever fully portable:
+`MulticoreServer::with_worker_priority(WorkerPriority::Elevated)`.
+
+A same-window interleaved head-to-head (three rounds, json, depth 1) then
+measured medians of: Blazingly-elevated 119,621 req/s, p50 1.073ms, p99
+2.497ms, p99.9 3.948ms; Actix Web 114,502 / 1.119ms / 2.211ms / 3.081ms
+(its first round carried a background burst and read 5.6ms/12.7ms); Axum
+78,807 / 1.490ms / 3.855ms / 4.906ms. Read plainly: Blazingly leads
+throughput and p50 and now leads Axum on every metric including both tail
+percentiles; Actix Web's clean samples still lead p99/p99.9 by roughly
+10-25% — a sub-millisecond gap where a 1.7-3.2x gap stood a week ago — and
+Blazingly's isolated-run best (p99 2.005ms, p99.9 2.716ms) touches Actix
+Web's numbers. Three samples per side earn no ranking claim under this
+document's rules; they set the next target: close the last fraction of a
+millisecond to Actix Web's tail on a properly idle host.
+
 **Same-day verdict via thread cycles.** Wall-clock percentiles on a shared
 host measure the Windows scheduler, so the audit also recorded
 `QueryThreadCycleTime` around 200,000 full dispatches — thread cycles do not
