@@ -109,10 +109,22 @@ Findings, in confidence order:
 - The one 188.6ms outlier at 14% background remains unexplained and is the
   open tail question for the rerun.
 
-A nightly scheduled run (`nightly-matrix.ps1`, 03:30, busy-host preflight at
-20%) now measures the full interleaved ladder — floor, dispatch rung, full
-server, Actix Web, Axum, json and validated — five rounds per night, with a
-per-night summary in `results/`.
+**Same-day verdict via thread cycles.** Wall-clock percentiles on a shared
+host measure the Windows scheduler, so the audit also recorded
+`QueryThreadCycleTime` around 200,000 full dispatches — thread cycles do not
+advance while the thread is preempted, making the histogram immune to
+background load. Measured: p50 3,264 cycles, p99 6,202, p99.9 63,648,
+p99.99 111,955, max 241,210 — about 16 microseconds of the framework's own
+CPU work at p99.9 and 60 microseconds at the absolute worst over 200,000
+requests. Together with the 2-allocation audit, this acquits the request-path
+libraries (`wire`, `json`, routing, executor, dispatch) of the
+millisecond-scale socket tail by three orders of magnitude. The tail budget
+lives between socket readiness and the framework being scheduled: the
+adapter/runtime wake and completion path (`blazingly-native` + Compio + the
+operating system), which is where tail optimization work goes next. The
+`nightly-matrix.ps1` script remains available for an unattended interleaved
+ladder when a quiet host exists; the scheduled task for it was removed by
+request.
 
 ## 2026-08-03 single-sample checkpoint after the optimization wave
 
