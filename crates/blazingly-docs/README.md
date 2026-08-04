@@ -23,8 +23,8 @@ scaffold, and the optional `validation` feature projects declarative
 
 ```toml
 [dependencies]
-blazingly-core = "0.1"
-blazingly-docs = "0.1"
+blazingly-core = "0.2"
+blazingly-docs = "0.2"
 ```
 
 ```rust

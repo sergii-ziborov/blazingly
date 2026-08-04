@@ -22,8 +22,8 @@ tool schemas and decode failures.
 
 ```toml
 [dependencies]
-blazingly-executor = "0.1"
-blazingly-mcp = "0.1"
+blazingly-executor = "0.2"
+blazingly-mcp = "0.2"
 futures-lite = "2" # any executor works; used here to drive the example
 ```
 

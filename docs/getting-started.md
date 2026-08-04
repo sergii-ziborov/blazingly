@@ -43,7 +43,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-blazingly = { version = "0.1.1", features = ["native"] }
+blazingly = { version = "0.2.0", features = ["native"] }
 ```
 
 To track unreleased work on `main` instead, use
@@ -399,7 +399,7 @@ To speak MCP over stdio — the transport MCP hosts launch as a subprocess — a
 the feature:
 
 ```toml
-blazingly = { version = "0.1.1", features = ["native", "mcp-stdio"] }
+blazingly = { version = "0.2.0", features = ["native", "mcp-stdio"] }
 ```
 
 and branch in `main` before the server starts:

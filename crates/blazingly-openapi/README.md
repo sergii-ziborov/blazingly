@@ -20,8 +20,8 @@ schemas.
 
 ```toml
 [dependencies]
-blazingly-core = "0.1"
-blazingly-openapi = "0.1"
+blazingly-core = "0.2"
+blazingly-openapi = "0.2"
 ```
 
 ```rust

@@ -7,7 +7,8 @@
 //! the other — the constraint carrier itself reached one document a full fix
 //! before the other while each kept its own traversal. The few decisions the
 //! formats genuinely differ on are supplied by the caller through
-//! [`SchemaDialect`].
+//! `SchemaDialect`. The module is `#[doc(hidden)]`, so an intra-doc link out
+//! of this header has no page to point at.
 //!
 //! This module is shared plumbing for the first-party projection crates, not
 //! part of the stable public API: it is `#[doc(hidden)]` and may change in

@@ -12,18 +12,28 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
-### Changed
+Nothing yet.
 
-- The multicore accept loop now places each connection on the worker with
-  the fewest live connections instead of rotating blindly, with ties still
-  rotating — a fresh or evenly loaded server distributes exactly as before,
-  and the counts only change placement when load is actually skewed. One
-  slow worker no longer accumulates queueing tail while its neighbours idle.
-- `BLAZINGLY_NATIVE_STAGE_METRICS=1` makes the native HTTP/1 loop record two
-  log2 histograms per keep-alive cycle — head-parsed to response-flushed, and
-  response-flushed to next head-parsed — and print snapshots periodically, so
-  tail latency can be attributed to one side of the socket write in
-  production code. Disabled, it costs one static boolean check per request.
+## [0.2.0] - 2026-08-04
+
+This release breaks the framework Rust API, which pre-1.0 permits when the
+break is recorded. Three breaks, all mechanical:
+
+- `blazingly-contract` 0.4.0 adds a public `constraints` field to
+  `TypeDescriptor`, whose fields are all public: a struct literal that names
+  every field no longer compiles. Use `TypeDescriptor::scalar`/`model`/`new`,
+  or add `constraints: Vec::new()`.
+- The portable contract format moves v1.2 to v1.3, so **every operation
+  fingerprint changes**. Recorded compatibility baselines must be recaptured;
+  a diff taken across this release reports changes that are not real.
+- `ExecutableBuildError` gains `InvalidMountPrefix`, `InvalidIdNamespace`,
+  `SingletonRequestInputs`, and `ConflictingProviderInput`. An exhaustive
+  `match` over it needs the new arms or a wildcard.
+
+Submodule crates published alongside this release: `blazingly-contract`
+0.4.0, `blazingly-json` 0.1.1, `blazingly-wire` 0.1.2. The json and wire
+bumps carry performance work that landed after their previous publish and had
+never reached the registry.
 
 ### Added
 
@@ -60,8 +70,39 @@ pinned submodule revision is recorded as a single entry.
   accessors (defaulted, so existing adapters keep compiling), and a transport
   without a request line rejects with `400 transport_mismatch`.
 
+- `blazingly_mcp::FrameworkManifest`: a read-only MCP resource at the stable
+  URI `blazingly://framework/manifest` that publishes the operation graph to
+  an agent — identities, HTTP bindings, contract fingerprints, agent policy,
+  inputs, dependencies, security requirements, and response shapes. It is
+  deliberately static metadata only: no environment or runtime configuration,
+  no security-scheme configuration, no response-header values, no tool
+  descriptions. Mutating tools are not part of it and will need
+  authentication, confirmation, audit, and rollback before they exist.
+- Process CPU and resident-memory metrics on macOS, which the 0.1.0 known
+  limitations recorded as deliberately unimplemented. All three first-class
+  platforms now report the same observability surface.
+- Operations whose input is decoded now document the `422` they can return
+  before the handler runs, the way the runtime already answers. The response
+  carries the rejection envelope, the closed set of codes that operation's own
+  inputs can produce — derived per input source from the executor's actual
+  behaviour, so a JSON body can fail as `invalid_json` even with no declared
+  rule — and the `violations` array naming the field path and code of each
+  broken rule. An operation that only streams bytes documents no `422`, and an
+  operation that declares its own `422` keeps it. The projected response is
+  marked `x-blazingly-automatic` so a reader can tell it from a declared one.
+
 ### Changed
 
+- The multicore accept loop now places each connection on the worker with
+  the fewest live connections instead of rotating blindly, with ties still
+  rotating — a fresh or evenly loaded server distributes exactly as before,
+  and the counts only change placement when load is actually skewed. One
+  slow worker no longer accumulates queueing tail while its neighbours idle.
+- `BLAZINGLY_NATIVE_STAGE_METRICS=1` makes the native HTTP/1 loop record two
+  log2 histograms per keep-alive cycle — head-parsed to response-flushed, and
+  response-flushed to next head-parsed — and print snapshots periodically, so
+  tail latency can be attributed to one side of the socket write in
+  production code. Disabled, it costs one static boolean check per request.
 - The `OpenAPI` and MCP schema projections now share one traversal in
   `blazingly-core`'s hidden `schema` module, parameterised by a small dialect
   trait; both generated documents are unchanged. The duplication had let the
@@ -90,23 +131,15 @@ pinned submodule revision is recorded as a single entry.
 - `cargo blazingly new` now generates a dependency on the crates.io framework
   version matching the installed CLI, while `--framework-path` retains the
   local-checkout workflow and the scaffold documents the opt-in Git form.
-- Advanced `blazingly-json` to the parser revision that jumps between string
-  escapes instead of scanning decoded strings byte by byte.
-- Advanced `blazingly-wire` to the revision that removes formatting machinery
-  from response encoding, adds reusable prepared headers, and removes
-  quadratic inline-header insertion during parsing.
-
-### Added
-
-- Operations whose input is decoded now document the `422` they can return
-  before the handler runs, the way the runtime already answers. The response
-  carries the rejection envelope, the closed set of codes that operation's own
-  inputs can produce — derived per input source from the executor's actual
-  behaviour, so a JSON body can fail as `invalid_json` even with no declared
-  rule — and the `violations` array naming the field path and code of each
-  broken rule. An operation that only streams bytes documents no `422`, and an
-  operation that declares its own `422` keeps it. The projected response is
-  marked `x-blazingly-automatic` so a reader can tell it from a declared one.
+- Advanced `blazingly-json` to 0.1.1, the parser revision that jumps between
+  string escapes instead of scanning decoded strings byte by byte: 1 MiB of
+  roughly 1% escapes parsed in 2.59ms and now parses in 0.88ms, which is
+  parity with `serde_json` on the same document.
+- Advanced `blazingly-wire` to 0.1.2, which removes formatting machinery from
+  response encoding, adds reusable prepared headers, and removes quadratic
+  inline-header insertion during parsing: a 200 response with six headers
+  encoded in 521ns, encodes in 187ns, and in 70ns through prepared headers
+  against a 67ns hand-written floor.
 
 ### Fixed
 

@@ -22,7 +22,7 @@ are compared in
 
 ```toml
 [dependencies]
-blazingly-deploy = "0.1"
+blazingly-deploy = "0.2"
 ```
 
 ```rust

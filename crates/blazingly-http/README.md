@@ -19,9 +19,9 @@ explicitly, as shown.
 
 ```toml
 [dependencies]
-blazingly-core = "0.1"
-blazingly-executor = "0.1"
-blazingly-http = "0.1"
+blazingly-core = "0.2"
+blazingly-executor = "0.2"
+blazingly-http = "0.2"
 futures-lite = "2"
 ```
 

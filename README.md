@@ -27,8 +27,8 @@ framework.
 
 ## Publication status
 
-**Published.** Blazingly `0.1.0` is on crates.io; the release gate that was
-walked before flipping `publish` is in [stability and SemVer](docs/stability.md).
+**Published.** Blazingly `0.2.0` is on crates.io; the release gate walked
+before every tag is in [stability and SemVer](docs/stability.md).
 
 ```console
 cargo add blazingly
@@ -348,12 +348,12 @@ Three crates are developed in their own repositories and enter this workspace as
 submodules under `crates/`:
 
 - `blazingly-contract`: independent portable operation contracts, pinned to its
-  `v0.3.0` tag; registry publication is pending;
+  `v0.4.0` tag and published as `blazingly-contract 0.4.0`;
 - `blazingly-wire`: framework- and runtime-independent HTTP/1 parsing and
-  response framing, pinned to its `v0.1.0` tag; registry publication is
-  pending;
+  response framing, pinned to its `v0.1.2` tag and published as
+  `blazingly-wire 0.1.2`;
 - `blazingly-json`: the JSON engine every crate here encodes and decodes with,
-  published as `blazingly-json 0.1.0`.
+  pinned to its `v0.1.1` tag and published as `blazingly-json 0.1.1`.
 
 Four more repositories are external and not submodules. The three adapters
 implement the framework's database and queue seams against real backends and

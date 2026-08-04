@@ -20,9 +20,9 @@ non-default `native` feature and exposes it as `blazingly::native`.
 
 ```toml
 [dependencies]
-blazingly-core = "0.1"
-blazingly-executor = "0.1"
-blazingly-native = "0.1"
+blazingly-core = "0.2"
+blazingly-executor = "0.2"
+blazingly-native = "0.2"
 ```
 
 ```rust

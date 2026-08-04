@@ -19,9 +19,9 @@ exposes it as `blazingly::mcp::stdio` behind the `mcp-stdio` feature.
 
 ```toml
 [dependencies]
-blazingly-executor = "0.1"
-blazingly-mcp = "0.1"
-blazingly-mcp-stdio = "0.1"
+blazingly-executor = "0.2"
+blazingly-mcp = "0.2"
+blazingly-mcp-stdio = "0.2"
 ```
 
 ```rust
