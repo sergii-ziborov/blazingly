@@ -14,6 +14,16 @@ pinned submodule revision is recorded as a single entry.
 
 ### Added
 
+- `MulticoreServer::with_worker_priority(WorkerPriority::Elevated)`: workers
+  request elevated scheduling priority when they start, shortening the gap
+  between an I/O completion arriving and the worker running again on a
+  contended host — the layer the tail-attribution work identified as owning
+  the millisecond-scale latency tail, after the request path itself measured
+  microseconds. Best effort on every platform (Windows above-normal priority;
+  macOS and Linux through the portable priority API); a system that refuses
+  the request keeps the inherited priority and the server serves normally.
+  The default stays `Inherited`: a framework should not quietly outrank the
+  rest of a shared machine.
 - `Plugin::mount("/v1")` and `Plugin::with_id_namespace("v1")`: a module
   written once mounts under two path prefixes without restating a handler.
   Prefixes and namespaces nest, identities and MCP tool names stay distinct

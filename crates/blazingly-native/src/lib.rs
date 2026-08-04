@@ -726,6 +726,27 @@ impl Server {
     }
 }
 
+/// How worker threads schedule against everything else on the machine.
+///
+/// The layer-attribution work showed the framework's own request path costs
+/// microseconds with a tight tail; the milliseconds live between a completion
+/// arriving and the worker running again. Scheduling priority is the one
+/// portable lever over that gap.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkerPriority {
+    /// The operating system's default scheduling. This is the default: a
+    /// framework should not quietly outrank the rest of a shared machine.
+    #[default]
+    Inherited,
+    /// Elevated priority for lower wake latency under host contention.
+    ///
+    /// On Windows this is above-normal thread priority; on macOS and Linux it
+    /// is a best-effort raise through the portable priority API, and a system
+    /// that refuses it — an unprivileged Linux container, for example — keeps
+    /// the inherited priority rather than failing the server.
+    Elevated,
+}
+
 /// Thread-per-core launcher with one compiled, non-`Send` app per worker.
 ///
 /// The factory runs lazily once on every worker. Requests execute as local
@@ -739,6 +760,7 @@ pub struct MulticoreServer<Factory> {
     middleware: Option<MiddlewareFactory>,
     max_connections: Option<NonZeroUsize>,
     tcp_nodelay: bool,
+    worker_priority: WorkerPriority,
     #[cfg(feature = "tls")]
     tls_acceptor: Option<compio::tls::TlsAcceptor>,
 }
@@ -758,6 +780,7 @@ where
             middleware: None,
             max_connections: None,
             tcp_nodelay: true,
+            worker_priority: WorkerPriority::Inherited,
             #[cfg(feature = "tls")]
             tls_acceptor: None,
         }
@@ -818,6 +841,19 @@ where
     #[must_use]
     pub const fn with_tcp_nodelay(mut self, nodelay: bool) -> Self {
         self.tcp_nodelay = nodelay;
+        self
+    }
+
+    /// Sets the scheduling priority workers request when they start.
+    ///
+    /// [`WorkerPriority::Elevated`] shortens the gap between an I/O completion
+    /// arriving and the worker running again on a contended host, at the cost
+    /// of outranking other work on the machine. The request is best effort: an
+    /// operating system that refuses it leaves the worker at its inherited
+    /// priority and the server serves normally.
+    #[must_use]
+    pub const fn with_worker_priority(mut self, priority: WorkerPriority) -> Self {
+        self.worker_priority = priority;
         self
     }
 
@@ -897,7 +933,13 @@ where
         let server_id = NEXT_MULTICORE_SERVER_ID.fetch_add(1, Ordering::Relaxed);
         let mut next_worker = 0_usize;
 
-        if let Err(error) = start_workers(&dispatchers, server_id, &config, &active) {
+        if let Err(error) = start_workers(
+            &dispatchers,
+            server_id,
+            &config,
+            &active,
+            self.worker_priority,
+        ) {
             for dispatcher in dispatchers {
                 let _ = future::block_on(dispatcher.join());
             }
@@ -1024,6 +1066,7 @@ fn start_workers<Factory>(
     server_id: u64,
     config: &Arc<WorkerConfig<Factory>>,
     active: &Arc<AtomicUsize>,
+    priority: WorkerPriority,
 ) -> io::Result<()>
 where
     Factory: Fn() -> ExecutableApp + Send + Sync + 'static,
@@ -1034,6 +1077,10 @@ where
         let active = Arc::clone(active);
         let completion = dispatcher
             .dispatch(move || async move {
+                // This future is the first thing each dispatcher runs, so it
+                // executes on the worker's own thread — the only place the
+                // scheduling request can be made.
+                apply_worker_priority(priority);
                 install_drain_counter(&active);
                 let (app, created) = worker_app(server_id, config.as_ref());
                 if created {
@@ -1060,6 +1107,27 @@ where
             .map_err(io::Error::other)?;
     }
     Ok(())
+}
+
+/// Requests the configured scheduling priority on the calling worker thread.
+///
+/// Best effort by design: the tail improvement is an optimization, and a
+/// refusal — an unprivileged container, a hardened host — must not cost the
+/// server anything but the optimization itself.
+fn apply_worker_priority(priority: WorkerPriority) {
+    if priority == WorkerPriority::Inherited {
+        return;
+    }
+    #[cfg(windows)]
+    let elevated = thread_priority::ThreadPriority::Os(
+        thread_priority::WinAPIThreadPriority::AboveNormal.into(),
+    );
+    #[cfg(not(windows))]
+    let elevated = thread_priority::ThreadPriorityValue::try_from(75_u8)
+        .map_or(thread_priority::ThreadPriority::Max, |value| {
+            thread_priority::ThreadPriority::Crossplatform(value)
+        });
+    let _ = thread_priority::set_current_thread_priority(elevated);
 }
 
 fn worker_app<Factory>(server_id: u64, config: &WorkerConfig<Factory>) -> (Rc<HttpApp>, bool)

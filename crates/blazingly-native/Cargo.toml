@@ -28,6 +28,7 @@ futures-lite.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
 shiguredo_http2 = { workspace = true, optional = true }
+thread-priority.workspace = true
 
 [lints]
 workspace = true

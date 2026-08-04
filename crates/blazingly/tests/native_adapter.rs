@@ -386,6 +386,48 @@ fn multicore_launcher_builds_thread_local_apps_and_shuts_down_gracefully() {
     server_thread.join().unwrap();
 }
 
+/// Elevated priority is a scheduling request, never a functional dependency.
+///
+/// CI runs this on Windows, macOS, and an unprivileged Linux runner, so both
+/// the granted and the refused path must leave the server serving normally.
+#[test]
+fn elevated_worker_priority_serves_whether_or_not_the_system_grants_it() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+
+    let (shutdown, signal) = blazingly::native::shutdown_channel();
+    let server_thread = std::thread::spawn(move || {
+        blazingly::native::MulticoreServer::new(NonZeroUsize::new(2).unwrap(), || {
+            ExecutableApp::new(routes![health]).expect("worker app should compile")
+        })
+        .with_worker_priority(blazingly::native::WorkerPriority::Elevated)
+        .serve_gracefully(address, signal, Duration::from_secs(2))
+        .expect("an elevated server should stop cleanly");
+    });
+
+    let mut stream = (0..100)
+        .find_map(|_| {
+            std::net::TcpStream::connect(address).ok().or_else(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            })
+        })
+        .expect("elevated listener should start");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    shutdown.shutdown();
+    server_thread.join().unwrap();
+}
+
 #[test]
 fn native_http1_coalesces_pipelined_responses_without_reordering() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
