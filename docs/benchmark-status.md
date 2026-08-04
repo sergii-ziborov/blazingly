@@ -76,6 +76,44 @@ is not presented as a universal per-request or latency improvement. All values
 are local engineering diagnostics, not publishable cross-platform claims. Raw
 evidence and the exact comparison table live in the benchmark repository.
 
+## 2026-08-04 tail attribution, first ladder
+
+Which layer owns the p99? Three samples survived a short quiet window on the
+loopback host (pipeline client, depth 1, 128 connections, 4 workers, json
+scenario; every other sample of the series was rejected by the busy-host
+preflight):
+
+| Rung | Background | req/s | p99 | p99.9 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Bare compio loop, no framework | 23.5% | 122,707 | 3.58ms | 6.20ms | 10.9ms |
+| + framework dispatch (minimal transport), run 1 | 14.2% | 103,719 | 5.83ms | 34.6ms | 188.6ms |
+| + framework dispatch (minimal transport), run 2 | 28.3% | 78,848 | 5.95ms | 9.04ms | 15.1ms |
+
+Findings, in confidence order:
+
+- **The environment floor dominates p99.** A canned-response compio loop with
+  zero framework code already spends 3.6ms at p99 on this host — roughly the
+  same order as the full framework's 4.33ms p99 in the 2026-08-03 checkpoint.
+- **Framework heap pressure is exonerated.** The new counting-allocator audit
+  (`blazingly-alloc-audit` in the benchmark repository) measures the whole
+  dispatch path — handler, compiled executor, full borrowed HTTP dispatch —
+  at exactly 2 heap allocations and 133 bytes per request in steady state:
+  the handler's own `String` and the response body. There is nothing left to
+  cut on that axis.
+- **The dispatch rung's own glue was contaminated.** The minimal-transport
+  server assembled its response head through `core::fmt` per request — the
+  formatting machinery `blazingly-wire` removed after measuring it 7.8x over
+  the manual floor. The rung now encodes its head as bytes; the +2.3ms p99
+  delta it showed over the floor must be re-measured before any of it is
+  attributed to the framework libraries.
+- The one 188.6ms outlier at 14% background remains unexplained and is the
+  open tail question for the rerun.
+
+A nightly scheduled run (`nightly-matrix.ps1`, 03:30, busy-host preflight at
+20%) now measures the full interleaved ladder — floor, dispatch rung, full
+server, Actix Web, Axum, json and validated — five rounds per night, with a
+per-night summary in `results/`.
+
 ## 2026-08-03 single-sample checkpoint after the optimization wave
 
 One 5-second pipeline-client sample per framework (depth 1 — one request in
