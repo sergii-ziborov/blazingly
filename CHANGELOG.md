@@ -12,6 +12,19 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
+### Changed
+
+- The multicore accept loop now places each connection on the worker with
+  the fewest live connections instead of rotating blindly, with ties still
+  rotating — a fresh or evenly loaded server distributes exactly as before,
+  and the counts only change placement when load is actually skewed. One
+  slow worker no longer accumulates queueing tail while its neighbours idle.
+- `BLAZINGLY_NATIVE_STAGE_METRICS=1` makes the native HTTP/1 loop record two
+  log2 histograms per keep-alive cycle — head-parsed to response-flushed, and
+  response-flushed to next head-parsed — and print snapshots periodically, so
+  tail latency can be attributed to one side of the socket write in
+  production code. Disabled, it costs one static boolean check per request.
+
 ### Added
 
 - `MulticoreServer::with_worker_priority(WorkerPriority::Elevated)`: workers

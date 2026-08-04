@@ -930,6 +930,11 @@ where
         });
         let active = Arc::new(AtomicUsize::new(0));
         let connections = Arc::new(AtomicUsize::new(0));
+        let worker_loads: Arc<Vec<AtomicUsize>> = Arc::new(
+            (0..dispatchers.len())
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+        );
         let server_id = NEXT_MULTICORE_SERVER_ID.fetch_add(1, Ordering::Relaxed);
         let mut next_worker = 0_usize;
 
@@ -983,12 +988,15 @@ where
             };
             active.fetch_add(1, Ordering::AcqRel);
             connections.fetch_add(1, Ordering::AcqRel);
-            let dispatcher = &dispatchers[next_worker];
-            next_worker = (next_worker + 1) % dispatchers.len();
+            let worker = least_loaded_worker(&worker_loads, &mut next_worker);
+            worker_loads[worker].fetch_add(1, Ordering::AcqRel);
+            let loads_for_task = Arc::clone(&worker_loads);
+            let dispatcher = &dispatchers[worker];
             if dispatcher
                 .dispatch(move || async move {
                     let _work = ActiveWork::adopt(active_for_task);
                     let _slot = ActiveWork::adopt(connections_for_task);
+                    let _load = WorkerSlot::adopt(loads_for_task, worker);
                     let app = worker_app(server_id, config.as_ref()).0;
                     let Ok(stream) = compio::net::TcpStream::from_std(stream) else {
                         return;
@@ -1006,6 +1014,7 @@ where
             {
                 active.fetch_sub(1, Ordering::AcqRel);
                 connections.fetch_sub(1, Ordering::AcqRel);
+                worker_loads[worker].fetch_sub(1, Ordering::AcqRel);
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "all Compio workers stopped",
@@ -1211,6 +1220,51 @@ impl Drop for ActiveWork {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// One accepted connection's slot in its worker's load count.
+///
+/// The accept loop counts the connection onto the chosen worker before
+/// dispatching; the connection task adopts the slot so the count falls when
+/// the connection actually ends, whichever way it ends.
+struct WorkerSlot {
+    loads: Arc<Vec<AtomicUsize>>,
+    worker: usize,
+}
+
+impl WorkerSlot {
+    const fn adopt(loads: Arc<Vec<AtomicUsize>>, worker: usize) -> Self {
+        Self { loads, worker }
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.loads[self.worker].fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Picks the worker with the fewest live connections.
+///
+/// Blind rotation hands a connection to the next worker whatever it is
+/// carrying, so one slow or unlucky worker accumulates queueing tail while
+/// its neighbours idle. Ties still rotate through `cursor`, so equal-load
+/// workers share arrivals exactly as the old round-robin did — a fresh
+/// server distributes identically, and the counts only change placement
+/// when the load is actually skewed.
+fn least_loaded_worker(loads: &[AtomicUsize], cursor: &mut usize) -> usize {
+    let mut chosen = *cursor % loads.len();
+    let mut lightest = loads[chosen].load(Ordering::Acquire);
+    for offset in 1..loads.len() {
+        let candidate = (*cursor + offset) % loads.len();
+        let load = loads[candidate].load(Ordering::Acquire);
+        if load < lightest {
+            chosen = candidate;
+            lightest = load;
+        }
+    }
+    *cursor = (chosen + 1) % loads.len();
+    chosen
 }
 
 enum AcceptEvent {
@@ -2329,6 +2383,9 @@ async fn serve_native_connection(
     let mut wire_response = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut completed_requests = 0_usize;
     let mut buffered_responses = 0_usize;
+    let stages = stage_metrics_enabled();
+    let mut stage_head: Option<Instant> = None;
+    let mut stage_flush: Option<Instant> = None;
 
     loop {
         let mut head_deadline = None;
@@ -2356,7 +2413,19 @@ async fn serve_native_connection(
 
             if !connection_start || !is_partial_http2_preface(&buffer) {
                 match parse_head(&buffer, limits) {
-                    Ok(Some(parsed)) => break parsed,
+                    Ok(Some(parsed)) => {
+                        if stages {
+                            let now = Instant::now();
+                            if let (Some(head), Some(flushed)) = (stage_head, stage_flush) {
+                                record_stage(&STAGE_SERVICE, flushed - head);
+                                record_stage(&STAGE_WAIT, now - flushed);
+                                maybe_dump_stage_metrics();
+                            }
+                            stage_head = Some(now);
+                            stage_flush = None;
+                        }
+                        break parsed;
+                    }
                     Ok(None) if buffer.len() >= limits.max_header_bytes => {
                         write_rejection_native(
                             &mut io,
@@ -2387,6 +2456,9 @@ async fn serve_native_connection(
 
             flush_native_pending(&mut io, &mut wire_response, limits.write_timeout).await?;
             buffered_responses = 0;
+            if stages && stage_flush.is_none() && stage_head.is_some() {
+                stage_flush = Some(Instant::now());
+            }
             let receiving_head = !buffer.is_empty();
             let wait = if receiving_head {
                 remaining(
@@ -2727,6 +2799,9 @@ async fn serve_native_connection(
             {
                 flush_native_pending(&mut io, &mut wire_response, limits.write_timeout).await?;
                 buffered_responses = 0;
+                if stages && stage_flush.is_none() && stage_head.is_some() {
+                    stage_flush = Some(Instant::now());
+                }
             }
         }
         consume_prefix(&mut buffer, request_bytes);
@@ -2736,6 +2811,71 @@ async fn serve_native_connection(
             return Ok(());
         }
     }
+}
+
+/// Per-request stage histograms, recorded only when
+/// `BLAZINGLY_NATIVE_STAGE_METRICS=1` is set in the environment.
+///
+/// Two log2-bucketed distributions split one keep-alive request cycle at the
+/// socket write: `service` is head-parsed to response-flushed — everything
+/// this crate and the layers above it do — and `wait` is response-flushed to
+/// the next head parsed, which is the peer's turnaround plus the kernel and
+/// the wake path back onto this worker. The attribution ladder pinned the
+/// millisecond tail below the framework; this instrument says which side of
+/// the flush it sits on, per request, in production code, at the cost of one
+/// static bool check per request when disabled.
+const STAGE_BUCKETS: usize = 40;
+static STAGE_SERVICE: [AtomicU64; STAGE_BUCKETS] = [const { AtomicU64::new(0) }; STAGE_BUCKETS];
+static STAGE_WAIT: [AtomicU64; STAGE_BUCKETS] = [const { AtomicU64::new(0) }; STAGE_BUCKETS];
+static STAGE_RECORDED: AtomicU64 = AtomicU64::new(0);
+static STAGE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn stage_metrics_enabled() -> bool {
+    *STAGE_ENABLED
+        .get_or_init(|| std::env::var("BLAZINGLY_NATIVE_STAGE_METRICS").as_deref() == Ok("1"))
+}
+
+fn record_stage(histogram: &[AtomicU64; STAGE_BUCKETS], elapsed: Duration) {
+    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX) | 1;
+    let bucket = (63 - usize::try_from(nanos.leading_zeros()).unwrap_or(0)).min(STAGE_BUCKETS - 1);
+    histogram[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Prints both distributions every 2^18 recorded cycles.
+///
+/// The dump rides the request path rather than shutdown so a benchmark runner
+/// that kills the process still leaves snapshots in its log.
+fn maybe_dump_stage_metrics() {
+    let recorded = STAGE_RECORDED.fetch_add(1, Ordering::Relaxed) + 1;
+    if recorded & 0x3_FFFF != 0 {
+        return;
+    }
+    let render = |histogram: &[AtomicU64; STAGE_BUCKETS]| {
+        let counts: Vec<u64> = histogram
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        let percentile = |quantile: f64| {
+            let mut seen = 0_u64;
+            for (bucket, count) in counts.iter().enumerate() {
+                seen += count;
+                #[allow(clippy::cast_precision_loss)]
+                if seen as f64 >= total as f64 * quantile {
+                    return 1_u64 << bucket;
+                }
+            }
+            1_u64 << (STAGE_BUCKETS - 1)
+        };
+        (percentile(0.50), percentile(0.99), percentile(0.999))
+    };
+    let (service_p50, service_p99, service_p999) = render(&STAGE_SERVICE);
+    let (wait_p50, wait_p99, wait_p999) = render(&STAGE_WAIT);
+    eprintln!(
+        "stage metrics after {recorded} cycles (log2 upper bounds, ns): \
+         service p50<={service_p50} p99<={service_p99} p99.9<={service_p999} | \
+         wait p50<={wait_p50} p99<={wait_p99} p99.9<={wait_p999}"
+    );
 }
 
 async fn native_read_more(io: &mut TcpStream, buffer: &mut Vec<u8>) -> io::Result<usize> {
