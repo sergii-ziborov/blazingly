@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![doc = include_str!("../README.md")]
 
 use blazingly_mcp::JsonRpcServer;
 use std::future::Future;

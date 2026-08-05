@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![doc = include_str!("../README.md")]
 
 use core::fmt::Write as _;
 use proc_macro::TokenStream;

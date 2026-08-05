@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "blazingly-docs"
 version.workspace = true
 edition.workspace = true
@@ -10,6 +10,13 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
+
+# Without this, docs.rs documents default features only, and every optional
+# surface is missing from the rendered page: for the facade that is the
+# native server itself. The workspace rustdoc job already builds all
+# features under -D warnings, so this asks docs.rs for what CI proves.
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 validation = ["dep:blazingly-validation"]

@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// The crate README is the docs.rs landing page, so the two cannot drift and
+// the example in it is compiled as a doctest rather than trusted.
+#![doc = include_str!("../README.md")]
 
 pub use blazingly_contract::*;
 pub use blazingly_core::*;

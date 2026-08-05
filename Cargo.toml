@@ -51,7 +51,7 @@ publish = true
 # reads `0.1.0` as `>=0.1.0, <0.2.0`, so a stale requirement here does not fail
 # loudly: it silently resolves a published 0.1.x from the registry instead of
 # the sibling being released beside it.
-blazingly-contract = { version = "0.4.0", path = "crates/blazingly-contract" }
+blazingly-contract = { version = "0.4.1", path = "crates/blazingly-contract" }
 blazingly-core = { version = "0.2.0", path = "crates/blazingly-core" }
 blazingly-database = { version = "0.2.0", path = "crates/blazingly-database" }
 blazingly-deploy = { version = "0.2.0", path = "crates/blazingly-deploy" }

@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "blazingly-mcp"
 version.workspace = true
 edition.workspace = true
@@ -11,6 +11,13 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+# Without this, docs.rs documents default features only, and every optional
+# surface is missing from the rendered page: for the facade that is the
+# native server itself. The workspace rustdoc job already builds all
+# features under -D warnings, so this asks docs.rs for what CI proves.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 validation = ["dep:blazingly-validation"]
 
@@ -20,6 +27,12 @@ blazingly-core.workspace = true
 blazingly-executor.workspace = true
 blazingly-json.workspace = true
 serde = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# The README example is this crate's rustdoc header, so it runs as a doctest;
+# it needs some executor to drive the returned future, and this crate
+# deliberately ships none.
+futures-lite.workspace = true
 
 [lints]
 workspace = true

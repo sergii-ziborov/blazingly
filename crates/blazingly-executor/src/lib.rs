@@ -1,4 +1,5 @@
 ﻿#![forbid(unsafe_code)]
+#![doc = include_str!("../README.md")]
 
 use base64::Engine;
 use blazingly_core::{

@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "blazingly-contract"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "sha2",
@@ -276,6 +276,7 @@ dependencies = [
  "blazingly-executor",
  "blazingly-json",
  "blazingly-validation",
+ "futures-lite",
  "serde",
 ]
 
