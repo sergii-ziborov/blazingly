@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
 use base64::Engine;
@@ -14,7 +14,7 @@ use blazingly_core::{
 pub use blazingly_di::DependencyError;
 use blazingly_di::{
     CompiledProvider, DependencyLifetime, DependencyRequest, DependencySlot, DependencyValue,
-    Depends, Provider,
+    Depends, Provider, RequestOutcome,
 };
 use blazingly_json::{Value, json};
 use serde::Serialize;
@@ -554,6 +554,24 @@ pub enum InvocationAbort {
 }
 
 impl InvocationAbort {
+    /// What request-scoped teardown is told when an invocation is cut short.
+    ///
+    /// Mirrors [`Self::into_execution_outcome`] by hand rather than deriving
+    /// from it, because teardown runs before the outcome is built and must not
+    /// be handed a borrow of something that does not exist yet.
+    const fn request_outcome(self) -> RequestOutcome<'static> {
+        match self {
+            Self::Cancelled => RequestOutcome::Failed {
+                status: 499,
+                code: "invocation_cancelled",
+            },
+            Self::TimedOut => RequestOutcome::Failed {
+                status: 504,
+                code: "invocation_timeout",
+            },
+        }
+    }
+
     fn into_execution_outcome(self) -> ExecutionOutcome {
         match self {
             Self::Cancelled => ExecutionOutcome::Rejected {
@@ -1362,6 +1380,32 @@ impl ExecutionOutcome {
             Self::Success { .. } | Self::StreamingSuccess { .. } | Self::Upgrade { .. }
         )
     }
+
+    /// What request-scoped teardown is told about this request.
+    ///
+    /// A streaming success counts as succeeded even though its body has not
+    /// been written yet: finalizers run when the handler returns, and the
+    /// decision the handler made is the one teardown is reacting to.
+    #[must_use]
+    pub fn request_outcome(&self) -> RequestOutcome<'_> {
+        match self {
+            Self::Success { .. } | Self::StreamingSuccess { .. } | Self::Upgrade { .. } => {
+                RequestOutcome::Succeeded
+            }
+            Self::Rejected { status, code, .. } => RequestOutcome::Failed {
+                status: *status,
+                code: code.as_str(),
+            },
+            Self::DomainError(failure) => RequestOutcome::Failed {
+                status: failure.status,
+                code: failure.code.as_ref(),
+            },
+            Self::InternalError { code, .. } => RequestOutcome::Failed {
+                status: 500,
+                code: code.as_str(),
+            },
+        }
+    }
 }
 
 /// A typed handler result that can become a shared operation outcome.
@@ -1742,19 +1786,26 @@ impl ExecutableOperation {
             && let Some(outcome) = self.handler.invoke_sync(input, &dependencies)
         {
             let outcome = outcome.unwrap_or_else(|outcome| outcome);
-            if let Err(finalizer_error) = plan.finalize(&requests).await {
+            if let Err(finalizer_error) = plan.finalize(&requests, outcome.request_outcome()).await
+            {
                 return dependency_error_outcome(finalizer_error);
             }
             return outcome;
         }
         if let Err(error) = self.hooks.pre_parse().await {
-            if let Err(finalizer_error) = plan.finalize(&requests).await {
+            if let Err(finalizer_error) = plan
+                .finalize(&requests, dependency_request_outcome(&error))
+                .await
+            {
                 return dependency_error_outcome(finalizer_error);
             }
             return dependency_error_outcome(error);
         }
         if let Err(error) = self.hooks.pre_validate().await {
-            if let Err(finalizer_error) = plan.finalize(&requests).await {
+            if let Err(finalizer_error) = plan
+                .finalize(&requests, dependency_request_outcome(&error))
+                .await
+            {
                 return dependency_error_outcome(finalizer_error);
             }
             return dependency_error_outcome(error);
@@ -1762,26 +1813,34 @@ impl ExecutableOperation {
         let handler = match self.handler.prepare(input, &dependencies) {
             Ok(handler) => handler,
             Err(outcome) => {
-                if let Err(finalizer_error) = plan.finalize(&requests).await {
+                if let Err(finalizer_error) =
+                    plan.finalize(&requests, outcome.request_outcome()).await
+                {
                     return dependency_error_outcome(finalizer_error);
                 }
                 return outcome;
             }
         };
         if let Err(error) = self.hooks.pre_handler().await {
-            if let Err(finalizer_error) = plan.finalize(&requests).await {
+            if let Err(finalizer_error) = plan
+                .finalize(&requests, dependency_request_outcome(&error))
+                .await
+            {
                 return dependency_error_outcome(finalizer_error);
             }
             return dependency_error_outcome(error);
         }
         let outcome = handler.await;
         if let Err(error) = self.hooks.pre_serialize().await {
-            if let Err(finalizer_error) = plan.finalize(&requests).await {
+            if let Err(finalizer_error) = plan
+                .finalize(&requests, dependency_request_outcome(&error))
+                .await
+            {
                 return dependency_error_outcome(finalizer_error);
             }
             return dependency_error_outcome(error);
         }
-        if let Err(error) = plan.finalize(&requests).await {
+        if let Err(error) = plan.finalize(&requests, outcome.request_outcome()).await {
             return dependency_error_outcome(error);
         }
         outcome
@@ -1834,7 +1893,9 @@ impl ExecutableOperation {
         let handler = match self.handler.prepare(input, &dependencies) {
             Ok(handler) => handler,
             Err(outcome) => {
-                if let Err(finalizer_error) = plan.finalize(&requests).await {
+                if let Err(finalizer_error) =
+                    plan.finalize(&requests, outcome.request_outcome()).await
+                {
                     return dependency_error_outcome(finalizer_error);
                 }
                 return outcome;
@@ -1848,7 +1909,9 @@ impl ExecutableOperation {
         let outcome = match control.run(handler).await {
             Ok(outcome) => outcome,
             Err(abort) => {
-                if let Err(finalizer_error) = plan.finalize(&requests).await {
+                if let Err(finalizer_error) =
+                    plan.finalize(&requests, abort.request_outcome()).await
+                {
                     return dependency_error_outcome(finalizer_error);
                 }
                 return abort.into_execution_outcome();
@@ -1859,10 +1922,24 @@ impl ExecutableOperation {
         {
             return hook_outcome;
         }
-        if let Err(error) = plan.finalize(&requests).await {
+        if let Err(error) = plan.finalize(&requests, outcome.request_outcome()).await {
             return dependency_error_outcome(error);
         }
         outcome
+    }
+}
+
+/// What request-scoped teardown is told when a dependency itself failed.
+///
+/// A rejected dependency answers the request with its own status and code; an
+/// internal failure is a 500 carrying the code teardown would see in the log.
+fn dependency_request_outcome(error: &DependencyError) -> RequestOutcome<'_> {
+    match error {
+        DependencyError::Rejected(failure) => RequestOutcome::Failed {
+            status: failure.status,
+            code: failure.code.as_ref(),
+        },
+        DependencyError::Internal { code, .. } => RequestOutcome::Failed { status: 500, code },
     }
 }
 
@@ -1880,7 +1957,7 @@ where
         Ok(Err(error)) => dependency_error_outcome(error),
         Err(abort) => abort.into_execution_outcome(),
     };
-    if let Err(finalizer_error) = plan.finalize(requests).await {
+    if let Err(finalizer_error) = plan.finalize(requests, outcome.request_outcome()).await {
         return Err(dependency_error_outcome(finalizer_error));
     }
     Err(outcome)
@@ -2109,7 +2186,8 @@ impl CompiledOperationDependencies {
                     return self.resolve_from(requests, index).await;
                 }
                 Err(error) => {
-                    self.finalize_prefix(&requests, index).await?;
+                    self.finalize_prefix(&requests, index, dependency_request_outcome(&error))
+                        .await?;
                     return Err(error);
                 }
             }
@@ -2128,7 +2206,8 @@ impl CompiledOperationDependencies {
             let value = match provider.run(&self.singletons, requests.as_slice()).await {
                 Ok(value) => value,
                 Err(error) => {
-                    self.finalize_prefix(&requests, index).await?;
+                    self.finalize_prefix(&requests, index, dependency_request_outcome(&error))
+                        .await?;
                     return Err(error);
                 }
             };
@@ -2151,13 +2230,13 @@ impl CompiledOperationDependencies {
             {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => {
-                    self.finalize_prefix(&requests, index)
+                    self.finalize_prefix(&requests, index, dependency_request_outcome(&error))
                         .await
                         .map_err(ControlledInvocationError::Dependency)?;
                     return Err(ControlledInvocationError::Dependency(error));
                 }
                 Err(abort) => {
-                    self.finalize_prefix(&requests, index)
+                    self.finalize_prefix(&requests, index, abort.request_outcome())
                         .await
                         .map_err(ControlledInvocationError::Dependency)?;
                     return Err(ControlledInvocationError::Abort(abort));
@@ -2170,8 +2249,12 @@ impl CompiledOperationDependencies {
         Ok(requests)
     }
 
-    async fn finalize(&self, requests: &RequestDependencyValues) -> Result<(), DependencyError> {
-        self.finalize_prefix(requests, self.request_providers.len())
+    async fn finalize(
+        &self,
+        requests: &RequestDependencyValues,
+        outcome: RequestOutcome<'_>,
+    ) -> Result<(), DependencyError> {
+        self.finalize_prefix(requests, self.request_providers.len(), outcome)
             .await
     }
 
@@ -2179,6 +2262,7 @@ impl CompiledOperationDependencies {
         &self,
         requests: &RequestDependencyValues,
         initialized: usize,
+        outcome: RequestOutcome<'_>,
     ) -> Result<(), DependencyError> {
         let base = self.slot_base();
         for (index, provider) in self.request_providers[..initialized]
@@ -2196,7 +2280,7 @@ impl CompiledOperationDependencies {
                         "compiled finalizer could not read its dependency slot",
                     )
                 })?;
-            provider.finalize(value).await?;
+            provider.finalize(value, outcome).await?;
         }
         Ok(())
     }

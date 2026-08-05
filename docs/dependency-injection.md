@@ -106,14 +106,29 @@ remain redacted.
 - `Provider::transient` creates a value for every injection edge.
 - `Provider::request_scoped` and `Provider::try_request_scoped` add a finalizer.
 
-Finalizers execute after the handler completes, in reverse provider order:
+Finalizers execute after the handler completes, in reverse provider order, and
+are told how the request ended:
 
 ```rust
 Provider::request_scoped(
     || Transaction::begin(),
-    |transaction: Depends<Transaction>| transaction.close(),
+    |transaction: Depends<Transaction>, outcome: RequestOutcome<'_>| {
+        if outcome.succeeded() {
+            transaction.commit();
+        } else {
+            transaction.roll_back();
+        }
+    },
 )
 ```
+
+`RequestOutcome` is either `Succeeded` or `Failed { status, code }`, where
+`code` is the same stable error code the client received. A finalizer runs on
+every path that reached it — a typed `#[api_error]`, a rejected input, a
+cancelled or timed-out invocation, and a dependency that failed after this one
+was already built, which is the case a rollback exists for. The outcome borrows
+the failure, so an async finalizer reads what it needs before building its
+future rather than carrying the borrow across an `await`.
 
 A singleton may depend only on other singletons. Request and transient
 providers may depend on longer-lived or equally short-lived providers.

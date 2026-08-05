@@ -1011,13 +1011,13 @@ fn compiled_di_honors_transient_lifetime_and_reverse_finalizer_order() {
             }))
             .provide(Provider::request_scoped(
                 || BaseResource,
-                move |_resource: Depends<BaseResource>| {
+                move |_resource: Depends<BaseResource>, _outcome: RequestOutcome<'_>| {
                     base_cleanup.borrow_mut().push("base");
                 },
             ))
             .provide(Provider::request_scoped(
                 |_base: Depends<BaseResource>| ChildResource,
-                move |_resource: Depends<ChildResource>| {
+                move |_resource: Depends<ChildResource>, _outcome: RequestOutcome<'_>| {
                     child_cleanup.borrow_mut().push("child");
                 },
             ))
@@ -1041,8 +1041,17 @@ fn compiled_di_honors_transient_lifetime_and_reverse_finalizer_order() {
         Plugin::new("failing_lifecycle")
             .provide(Provider::request_scoped(
                 || BaseResource,
-                move |_resource: Depends<BaseResource>| {
-                    failed_cleanup.borrow_mut().push("base");
+                // Records the outcome, not just the fact of teardown: when a
+                // later provider rejects, this one must be told the rejection
+                // that answered the request rather than a bare "it ended".
+                move |_resource: Depends<BaseResource>, outcome: RequestOutcome<'_>| {
+                    failed_cleanup.borrow_mut().push(
+                        if outcome.code() == Some("dependency_unavailable") {
+                            "base:dependency_unavailable"
+                        } else {
+                            "base:unexpected"
+                        },
+                    );
                 },
             ))
             .provide(Provider::try_request(
@@ -1059,7 +1068,11 @@ fn compiled_di_honors_transient_lifetime_and_reverse_finalizer_order() {
     .expect("fallible lifecycle dependency graph should compile");
     let rejected = poll_ready(TestApp::new(&failing).call(Request::get("/di/failing-lifecycle")));
     assert_http_error(&rejected, 503, "dependency_unavailable");
-    assert_eq!(&*cleanup.borrow(), &["base"]);
+    assert_eq!(
+        &*cleanup.borrow(),
+        &["base:dependency_unavailable"],
+        "an already-built dependency is torn down knowing which rejection ended the request"
+    );
 }
 
 #[test]
@@ -1080,11 +1093,15 @@ fn async_providers_and_finalizers_are_runtime_neutral_across_http_and_mcp() {
                         AsyncResource(value)
                     }
                 },
-                move |resource: Depends<AsyncResource>| {
+                move |resource: Depends<AsyncResource>, outcome: RequestOutcome<'_>| {
                     let counter = Rc::clone(&finalizer_counter);
+                    // The outcome is read before the future is built: it borrows
+                    // the failure, so an async finalizer must take what it needs
+                    // rather than carry the borrow across an await.
+                    let succeeded = outcome.succeeded();
                     async move {
                         YieldOnce::new().await;
-                        counter.set(resource.0);
+                        counter.set(if succeeded { resource.0 } else { 0 });
                     }
                 },
             ))
@@ -1141,7 +1158,7 @@ fn inherited_async_plugin_hooks_compile_in_lifecycle_order() {
                 provider_log.0.borrow_mut().push("provider");
                 HookResource
             },
-            move |_resource: Depends<HookResource>| {
+            move |_resource: Depends<HookResource>, _outcome: RequestOutcome<'_>| {
                 finalizer_log.0.borrow_mut().push("finalizer");
             },
         ))

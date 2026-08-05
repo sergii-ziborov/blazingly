@@ -137,9 +137,10 @@ pub mod prelude {
         Extract, File, Form, Header, HookContext, HookOutcome, HookOutcomeKind, HttpApp,
         HttpMiddleware, HttpRequestContext, InvocationAbort, InvocationControl, Json, Multipart,
         NoContent, OperationDescriptor, OperationFailure, Path, Plugin, PreparedJson, Provider,
-        Query, Request, RequestParts, Response, ResponseDescriptor, ResponseExt, Router, Status,
-        StreamingBody, TestApp, TestOverrides, TypeDescriptor, UploadBody, UploadFile, WithHeaders,
-        api_error, api_model, connect, delete, get, head, install_global_blocking_pool, operation,
-        options, patch, post, provider, put, routes, security, trace,
+        Query, Request, RequestOutcome, RequestParts, Response, ResponseDescriptor, ResponseExt,
+        Router, Status, StreamingBody, TestApp, TestOverrides, TypeDescriptor, UploadBody,
+        UploadFile, WithHeaders, api_error, api_model, connect, delete, get, head,
+        install_global_blocking_pool, operation, options, patch, post, provider, put, routes,
+        security, trace,
     };
 }

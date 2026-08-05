@@ -23,12 +23,19 @@ async fn controlled(_resource: Depends<ControlledResource>) -> Json<ControlledVi
 fn controlled_invocations_distinguish_cancellation_and_timeout_and_finalize() {
     let finalizers = Rc::new(Cell::new(0_u32));
     let finalizer_probe = Rc::clone(&finalizers);
+    // Teardown records what it was told, so an aborted invocation is checked to
+    // reach the finalizer as the abort it actually was.
+    let outcomes = Rc::new(std::cell::RefCell::new(Vec::<(u16, String)>::new()));
+    let outcome_probe = Rc::clone(&outcomes);
     let executable = ExecutableApp::from_plugin(
         Plugin::new("controlled")
             .provide(Provider::request_scoped(
                 || ControlledResource,
-                move |_resource: Depends<ControlledResource>| {
+                move |_resource: Depends<ControlledResource>, outcome: RequestOutcome<'_>| {
                     finalizer_probe.set(finalizer_probe.get() + 1);
+                    if let RequestOutcome::Failed { status, code } = outcome {
+                        outcome_probe.borrow_mut().push((status, code.to_owned()));
+                    }
                 },
             ))
             .routes(routes![controlled]),
@@ -54,6 +61,11 @@ fn controlled_invocations_distinguish_cancellation_and_timeout_and_finalize() {
     ));
     assert_error(&timed_out, 504, "invocation_timeout");
     assert_eq!(finalizers.get(), 1);
+    assert_eq!(
+        outcomes.borrow().as_slice(),
+        [(504, "invocation_timeout".to_owned())],
+        "teardown is told the abort that ended the request, not merely that it ended"
+    );
 }
 
 struct PollAfter {

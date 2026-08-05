@@ -13,10 +13,15 @@ pinned submodule revision is recorded as a single entry.
 ## [Unreleased]
 
 This breaks the framework Rust API, which pre-1.0 permits when the break is
-recorded, so it releases as 0.3.0 rather than a patch. One break, mechanical:
-`OperationDescriptor` gains a public `documentation` field, so a struct literal
-that names every field no longer compiles. Use `OperationDescriptor::new` and
-the builders, or add `documentation: OperationDocumentation::default()`.
+recorded, so it releases as 0.3.0 rather than a patch. Two breaks, both
+mechanical:
+
+- `OperationDescriptor` gains a public `documentation` field, so a struct
+  literal that names every field no longer compiles. Use
+  `OperationDescriptor::new` and the builders, or add
+  `documentation: OperationDocumentation::default()`.
+- Request-scoped finalizers take a second argument. A finalizer that does not
+  care about the outcome takes `_outcome: RequestOutcome<'_>`.
 
 ### Added
 

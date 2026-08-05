@@ -175,9 +175,59 @@ enum ProviderRunner {
     Async(AsyncProviderRunner),
 }
 
-type SyncProviderFinalizer = Rc<dyn Fn(&DependencyValue) -> Result<(), DependencyError>>;
+/// How the request a scoped dependency was built for ended.
+///
+/// Request-scoped teardown runs after the handler, and until it could see
+/// this it had no way to tell a committed request from a failed one — so the
+/// canonical use, a transaction that commits on success and rolls back
+/// otherwise, could not be written. This is the argument a `try`/`except`
+/// around a `yield` gets in `FastAPI`.
+///
+/// Deliberately small. It carries what teardown reacts to, not the response:
+/// this crate sits below the executor and must not learn its types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestOutcome<'failure> {
+    /// The handler returned a success.
+    Succeeded,
+    /// The request was answered with an error — a typed `#[api_error]`, a
+    /// rejected input, an aborted invocation, or a failing dependency.
+    Failed {
+        /// The HTTP status the request was answered with.
+        status: u16,
+        /// The stable error code, the same one in the response body.
+        code: &'failure str,
+    },
+}
+
+impl RequestOutcome<'_> {
+    #[must_use]
+    pub const fn succeeded(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    /// The status a failing request was answered with, if it failed.
+    #[must_use]
+    pub const fn status(&self) -> Option<u16> {
+        match self {
+            Self::Succeeded => None,
+            Self::Failed { status, .. } => Some(*status),
+        }
+    }
+
+    /// The stable error code a failing request was answered with.
+    #[must_use]
+    pub const fn code(&self) -> Option<&str> {
+        match self {
+            Self::Succeeded => None,
+            Self::Failed { code, .. } => Some(*code),
+        }
+    }
+}
+
+type SyncProviderFinalizer =
+    Rc<dyn Fn(&DependencyValue, RequestOutcome<'_>) -> Result<(), DependencyError>>;
 type FinalizerFuture = Pin<Box<dyn Future<Output = Result<(), DependencyError>> + 'static>>;
-type AsyncProviderFinalizer = Rc<dyn Fn(&DependencyValue) -> FinalizerFuture>;
+type AsyncProviderFinalizer = Rc<dyn Fn(&DependencyValue, RequestOutcome<'_>) -> FinalizerFuture>;
 
 #[derive(Clone)]
 enum ProviderFinalizer {
@@ -218,14 +268,18 @@ impl CompiledProvider {
     }
 
     #[doc(hidden)]
-    pub fn finalize(&self, value: &DependencyValue) -> FinalizerFuture {
+    pub fn finalize(
+        &self,
+        value: &DependencyValue,
+        outcome: RequestOutcome<'_>,
+    ) -> FinalizerFuture {
         match &self.finalizer {
             None => Box::pin(async { Ok(()) }),
             Some(ProviderFinalizer::Sync(finalizer)) => {
-                let result = finalizer(value);
+                let result = finalizer(value, outcome);
                 Box::pin(async move { result })
             }
-            Some(ProviderFinalizer::Async(finalizer)) => finalizer(value),
+            Some(ProviderFinalizer::Async(finalizer)) => finalizer(value, outcome),
         }
     }
 }
@@ -362,7 +416,7 @@ impl Provider {
     ) -> Self
     where
         Factory: ProviderFactory<Arguments, Output>,
-        Finalizer: Fn(Depends<Output>) + 'static,
+        Finalizer: Fn(Depends<Output>, RequestOutcome<'_>) + 'static,
         Output: 'static,
     {
         let mut provider = Self::from_factory(DependencyLifetime::Request, factory);
@@ -378,7 +432,7 @@ impl Provider {
     ) -> Self
     where
         Factory: FallibleProviderFactory<Arguments, Output>,
-        Finalizer: Fn(Depends<Output>) + 'static,
+        Finalizer: Fn(Depends<Output>, RequestOutcome<'_>) + 'static,
         Output: 'static,
     {
         let mut provider = Self::from_fallible_factory(DependencyLifetime::Request, factory);
@@ -446,7 +500,7 @@ impl Provider {
     where
         Factory: AsyncProviderFactory<Arguments, Output, FactoryFuture>,
         FactoryFuture: Future<Output = Output> + 'static,
-        Finalizer: Fn(Depends<Output>) -> FinalizerFuture + 'static,
+        Finalizer: Fn(Depends<Output>, RequestOutcome<'_>) -> FinalizerFuture + 'static,
         FinalizerFuture: Future<Output = ()> + 'static,
         Output: 'static,
     {
@@ -471,7 +525,7 @@ impl Provider {
     where
         Factory: FallibleAsyncProviderFactory<Arguments, Output, FactoryFuture>,
         FactoryFuture: Future<Output = Result<Output, DependencyError>> + 'static,
-        Finalizer: Fn(Depends<Output>) -> FinalizerFuture + 'static,
+        Finalizer: Fn(Depends<Output>, RequestOutcome<'_>) -> FinalizerFuture + 'static,
         FinalizerFuture: Future<Output = ()> + 'static,
         Output: 'static,
     {
@@ -920,28 +974,28 @@ provider_factory!(
 
 fn typed_finalizer<T, Finalizer>(finalizer: Finalizer) -> ProviderFinalizer
 where
-    Finalizer: Fn(Depends<T>) + 'static,
+    Finalizer: Fn(Depends<T>, RequestOutcome<'_>) + 'static,
     T: 'static,
 {
-    ProviderFinalizer::Sync(Rc::new(move |value| {
+    ProviderFinalizer::Sync(Rc::new(move |value, outcome| {
         let dependency = Rc::clone(value).downcast::<T>().map_err(|_| {
             DependencyError::internal(
                 "dependency_type_mismatch",
                 "compiled finalizer received an unexpected dependency type",
             )
         })?;
-        finalizer(Depends::from_rc(dependency));
+        finalizer(Depends::from_rc(dependency), outcome);
         Ok(())
     }))
 }
 
 fn typed_async_finalizer<T, Finalizer, FinalizerOutput>(finalizer: Finalizer) -> ProviderFinalizer
 where
-    Finalizer: Fn(Depends<T>) -> FinalizerOutput + 'static,
+    Finalizer: Fn(Depends<T>, RequestOutcome<'_>) -> FinalizerOutput + 'static,
     FinalizerOutput: Future<Output = ()> + 'static,
     T: 'static,
 {
-    ProviderFinalizer::Async(Rc::new(move |value| {
+    ProviderFinalizer::Async(Rc::new(move |value, outcome| {
         let Ok(dependency) = Rc::clone(value).downcast::<T>() else {
             return Box::pin(async {
                 Err(DependencyError::internal(
@@ -950,7 +1004,7 @@ where
                 ))
             });
         };
-        let future = finalizer(Depends::from_rc(dependency));
+        let future = finalizer(Depends::from_rc(dependency), outcome);
         Box::pin(async move {
             future.await;
             Ok(())
