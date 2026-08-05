@@ -20,7 +20,8 @@ publish.workspace = true
 all-features = true
 
 [features]
-default = ["deploy", "docs", "mcp", "middleware", "observability", "openapi", "realtime", "security", "validation"]
+default = ["config", "deploy", "docs", "mcp", "middleware", "observability", "openapi", "realtime", "security", "validation"]
+config = ["dep:blazingly-config"]
 deploy = ["dep:blazingly-deploy"]
 database = ["dep:blazingly-database"]
 docs = ["dep:blazingly-docs"]
@@ -51,6 +52,7 @@ validation = [
 [dependencies]
 blazingly-contract.workspace = true
 blazingly-core.workspace = true
+blazingly-config = { workspace = true, optional = true }
 blazingly-database = { workspace = true, optional = true }
 blazingly-deploy = { workspace = true, optional = true }
 blazingly-docs = { workspace = true, optional = true }

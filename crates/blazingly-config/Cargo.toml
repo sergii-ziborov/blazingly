@@ -1,0 +1,31 @@
+[package]
+name = "blazingly-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Typed configuration for Blazingly services, read from the environment and checked at startup"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["config", "configuration", "environment", "settings", "twelve-factor"]
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+blazingly-contract.workspace = true
+
+[dev-dependencies]
+# The README example is this crate's rustdoc header, so it runs as a doctest,
+# and the loader it demonstrates is what the macro generates.
+blazingly-macros.workspace = true
+
+[lints]
+workspace = true
+
+# Without this, docs.rs documents default features only, and every optional
+# surface is missing from the rendered page: for the facade that is the
+# native server itself. The workspace rustdoc job already builds all
+# features under -D warnings, so this asks docs.rs for what CI proves.
+[package.metadata.docs.rs]
+all-features = true

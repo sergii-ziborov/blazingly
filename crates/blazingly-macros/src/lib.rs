@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+mod settings;
+
 use core::fmt::Write as _;
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -869,6 +871,41 @@ pub fn connect(arguments: TokenStream, item: TokenStream) -> TokenStream {
 ///     En,
 /// }
 /// ```
+/// Reads a struct's fields from configuration, and refuses to start without
+/// them.
+///
+/// Each field reads `FIELD_NAME` uppercased, with the optional
+/// `#[settings(prefix = "APP_")]` in front. `#[env("OTHER_NAME")]` overrides
+/// that, `#[default("...")]` supplies a value for an unset variable, and
+/// `Option<T>` reads an unset variable as `None` — though a value that *is*
+/// set and does not parse stays an error, because silently discarding
+/// something a deployment deliberately wrote is the failure this exists to
+/// prevent. `#[min_length]` and `#[max_length]` apply the same bounds an API
+/// model uses.
+///
+/// ```ignore
+/// #[settings(prefix = "APP_")]
+/// struct AppSettings {
+///     #[min_length(1)]
+///     database_url: String,
+///     #[default("8080")]
+///     port: u16,
+///     sentry_dsn: Option<String>,
+/// }
+/// ```
+///
+/// The generated loader reads every field before failing, so one failed boot
+/// reports every missing variable rather than the first.
+#[proc_macro_attribute]
+pub fn settings(arguments: TokenStream, item: TokenStream) -> TokenStream {
+    let arguments = parse_macro_input!(arguments as settings::SettingsArgs);
+    let mut item = parse_macro_input!(item as ItemStruct);
+    match settings::settings_tokens(&arguments, &mut item) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
 #[proc_macro_attribute]
 pub fn api_model(arguments: TokenStream, item: TokenStream) -> TokenStream {
     let arguments = parse_macro_input!(arguments as ModelArgs);

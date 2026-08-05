@@ -12,6 +12,8 @@
 #[doc = include_str!("../../../README.md")]
 struct RepositoryReadme;
 
+#[cfg(feature = "config")]
+pub use blazingly_config as config;
 pub use blazingly_contract::*;
 pub use blazingly_core::*;
 #[cfg(feature = "database")]
@@ -42,6 +44,8 @@ pub use blazingly_http::{
 // `serde_json` was the engine an application could reach it from crates.io on
 // its own; `blazingly-json` is not published yet, so the facade re-exports it.
 pub use blazingly_json as json;
+#[cfg(feature = "config")]
+pub use blazingly_macros::settings;
 pub use blazingly_macros::{
     api_error, api_model, connect, delete, get, head, operation, options, patch, post, provider,
     put, security, trace,
@@ -83,6 +87,8 @@ pub mod __private {
 }
 
 pub mod prelude {
+    #[cfg(feature = "config")]
+    pub use crate::config::{ConfigError, ConfigProblem, ConfigSource, Environment, Settings};
     // `ErrorKind` is aliased so a glob import of the prelude does not collide
     // with `std::io::ErrorKind`; the plain name stays at `blazingly::database`.
     #[cfg(feature = "database")]

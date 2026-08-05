@@ -25,6 +25,35 @@ mechanical:
 
 ### Added
 
+- `blazingly-config` and `#[settings]`: a struct whose fields are read from the
+  environment and checked before the service starts. A field reads its own
+  name uppercased, with an optional `#[settings(prefix = "APP_")]`;
+  `#[env("...")]` overrides it, `#[default("...")]` fills an unset variable,
+  `Option<T>` makes one optional, and `#[min_length]`/`#[max_length]` apply the
+  same bounds an API model uses. `Duration` reads `30s`, `500ms`, `2h` or bare
+  seconds; `bool` accepts what deployments actually write (`1`, `yes`, `on`);
+  `Vec<T>` is comma-separated.
+
+  Two decisions worth knowing. The loader reads **every** field before failing,
+  so a container missing three variables learns all three from one failed boot
+  rather than one per boot. And a value that is set but unparsable is an error
+  even for an `Option<T>` field — silently discarding something a deployment
+  deliberately wrote is the failure this exists to prevent.
+
+  Every loader takes a `ConfigSource` rather than reading the environment
+  directly. `std::env::set_var` is unsafe in Rust 2024 and this workspace
+  forbids unsafe, so a settings type that could only read the real environment
+  would be one nobody could test.
+- `HttpApp::unverified_security` and `HttpApp::check_security_coverage` report
+  every operation whose declared `#[security(...)]` scheme no registered layer
+  verifies on its path. The native server calls the check while building each
+  worker, so an application that would answer 500 on its first authenticated
+  request refuses to start instead. The runtime guard stays — it is the safety
+  property — and now writes a log line naming the operation and the exact
+  missing registration, once per operation rather than once per request.
+- `MiddlewareScope` is re-exported from the facade. It was reachable only from
+  `blazingly_http` while `HttpApp::with_scoped_middleware`, the method that
+  consumes it, was in the prelude.
 - An operation declares the prose a reader needs and the code cannot supply:
   `tags`, `description`, `deprecated`, `external_docs`, and
   `external_docs_description` on every method attribute and on `#[operation]`.

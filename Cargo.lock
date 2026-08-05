@@ -142,6 +142,7 @@ dependencies = [
 name = "blazingly"
 version = "0.2.2"
 dependencies = [
+ "blazingly-config",
  "blazingly-contract",
  "blazingly-core",
  "blazingly-database",
@@ -168,6 +169,14 @@ dependencies = [
  "serde",
  "serde_json",
  "shiguredo_http2",
+]
+
+[[package]]
+name = "blazingly-config"
+version = "0.2.2"
+dependencies = [
+ "blazingly-contract",
+ "blazingly-macros",
 ]
 
 [[package]]
