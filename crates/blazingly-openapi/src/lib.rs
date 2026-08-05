@@ -24,13 +24,47 @@ pub enum OpenApiUi {
 }
 
 /// `OpenAPI` document metadata and well-known HTTP paths.
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Not `Eq`: the overlay is arbitrary JSON, and JSON numbers are not.
+#[derive(Clone, Debug, PartialEq)]
 pub struct OpenApiConfig {
     pub title: String,
     pub version: String,
     pub document_path: String,
     pub ui_path: String,
     pub ui: OpenApiUi,
+    /// Prose for the document as a whole, shown above the operation list.
+    pub description: Option<String>,
+    /// The base URLs this document describes.
+    pub servers: Vec<OpenApiServer>,
+    /// Prose for a tag, keyed by tag name. A tag with no entry is still listed;
+    /// it simply carries no description.
+    pub tag_descriptions: BTreeMap<String, String>,
+    /// Anything the projection does not generate, merged into the finished
+    /// document. See [`OpenApiConfig::with_overlay`].
+    pub overlay: Option<Value>,
+}
+
+/// One base URL the document describes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenApiServer {
+    pub url: String,
+    pub description: Option<String>,
+}
+
+impl OpenApiServer {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            description: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
 }
 
 impl OpenApiConfig {
@@ -42,7 +76,51 @@ impl OpenApiConfig {
             document_path: "/openapi.json".to_owned(),
             ui_path: "/docs".to_owned(),
             ui: OpenApiUi::Scalar,
+            description: None,
+            servers: Vec::new(),
+            tag_descriptions: BTreeMap::new(),
+            overlay: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_server(mut self, server: OpenApiServer) -> Self {
+        self.servers.push(server);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tag_description(
+        mut self,
+        tag: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.tag_descriptions.insert(tag.into(), description.into());
+        self
+    }
+
+    /// Merges arbitrary OpenAPI into the generated document.
+    ///
+    /// This is the escape hatch for everything the framework cannot derive from
+    /// a handler signature — `callbacks`, `webhooks`, `info.contact`,
+    /// `info.license`, vendor extensions, prose on an individual response.
+    ///
+    /// The merge is **additive**: it writes a key only where the generated
+    /// document has none, recursing into objects it shares. It can therefore
+    /// never overwrite a schema, a status code, a parameter, or a security
+    /// requirement that was projected from the code, so the property that makes
+    /// the document trustworthy — the machine-checkable parts cannot drift from
+    /// what the runtime enforces — survives having an escape hatch at all.
+    #[must_use]
+    pub fn with_overlay(mut self, overlay: Value) -> Self {
+        self.overlay = Some(overlay);
+        self
     }
 
     #[must_use]
@@ -191,24 +269,49 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
         );
     }
 
+    let mut info = json!({
+        "title": config.title,
+        "version": config.version
+    });
+    if let Some(description) = &config.description {
+        info["description"] = Value::String(description.clone());
+    }
     let mut document = json!({
         "openapi": "3.1.0",
         "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-        "info": {
-            "title": config.title,
-            "version": config.version
-        },
+        "info": info,
         "paths": paths
     });
+    if !config.servers.is_empty() {
+        document["servers"] = Value::Array(
+            config
+                .servers
+                .iter()
+                .map(|server| {
+                    let mut value = json!({ "url": server.url });
+                    if let Some(description) = &server.description {
+                        value["description"] = Value::String(description.clone());
+                    }
+                    value
+                })
+                .collect(),
+        );
+    }
     let tags = app
         .operations()
         .iter()
-        .filter_map(operation_tag)
+        .flat_map(operation_tags)
         .collect::<BTreeSet<_>>();
     if !tags.is_empty() {
         document["tags"] = Value::Array(
             tags.into_iter()
-                .map(|name| json!({ "name": name }))
+                .map(|name| {
+                    let mut value = json!({ "name": name });
+                    if let Some(description) = config.tag_descriptions.get(name) {
+                        value["description"] = Value::String(description.clone());
+                    }
+                    value
+                })
                 .collect(),
         );
     }
@@ -230,7 +333,29 @@ pub fn to_value_with_config(app: &AppDefinition, config: &OpenApiConfig) -> Valu
         }
         document["components"] = Value::Object(components);
     }
+    if let Some(overlay) = &config.overlay {
+        merge_additively(&mut document, overlay);
+    }
     document
+}
+
+/// Writes `overlay` into `target` wherever `target` says nothing.
+///
+/// Objects present on both sides recurse. A key the projection already produced
+/// is left alone, at every depth, which is what keeps the overlay from being
+/// able to contradict the code.
+fn merge_additively(target: &mut Value, overlay: &Value) {
+    let (Value::Object(target), Value::Object(overlay)) = (target, overlay) else {
+        return;
+    };
+    for (key, value) in overlay {
+        match target.get_mut(key) {
+            Some(existing) => merge_additively(existing, value),
+            None => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -294,17 +419,34 @@ fn operation_value(operation: &OperationDescriptor, components: &Map<String, Val
         );
     }
 
+    // Same rule as the 422: the framework answers these itself, so the document
+    // should say so, and an operation that declares one keeps its own.
+    for (status, response) in security_responses(operation) {
+        responses.entry(status.to_owned()).or_insert(response);
+    }
+
     let mut value = json!({
         "operationId": operation.contract.id.as_str(),
         "summary": operation.contract.summary,
         "responses": responses,
         "x-blazingly-agent": operation.contract.agent
     });
-    if let Some(tag) = operation_tag(operation) {
-        value["tags"] = json!([tag]);
+    let tags = operation_tags(operation);
+    if !tags.is_empty() {
+        value["tags"] = json!(tags);
     }
     if let Some(description) = operation_description(operation) {
         value["description"] = Value::String(description.to_owned());
+    }
+    if operation.documentation.deprecated {
+        value["deprecated"] = Value::Bool(true);
+    }
+    if let Some(external) = &operation.documentation.external_docs {
+        let mut docs = json!({ "url": external.url });
+        if let Some(description) = &external.description {
+            docs["description"] = Value::String(description.clone());
+        }
+        value["externalDocs"] = docs;
     }
     if !operation.contract.dependencies.is_empty() {
         value["x-blazingly-dependencies"] = Value::Array(
@@ -382,7 +524,20 @@ fn operation_value(operation: &OperationDescriptor, components: &Map<String, Val
 /// `users`, and `billing.invoices.void` belongs to `billing.invoices`. An
 /// identity without a namespace stays untagged rather than becoming a section
 /// of its own.
-fn operation_tag(operation: &OperationDescriptor) -> Option<&str> {
+/// The groups an operation files under.
+///
+/// A declared list wins outright. Nothing is declared for most operations, and
+/// for those the namespace of the operation id is the tag — `users.create`
+/// files under `users` — which is why the inferred form stays.
+fn operation_tags(operation: &OperationDescriptor) -> Vec<&str> {
+    if !operation.documentation.tags.is_empty() {
+        return operation
+            .documentation
+            .tags
+            .iter()
+            .map(String::as_str)
+            .collect();
+    }
     operation
         .contract
         .id
@@ -390,16 +545,64 @@ fn operation_tag(operation: &OperationDescriptor) -> Option<&str> {
         .rsplit_once('.')
         .map(|(namespace, _)| namespace)
         .filter(|namespace| !namespace.is_empty())
+        .into_iter()
+        .collect()
 }
 
 /// Prose shown below the summary in a browser UI.
 ///
-/// The contract carries one long-form description, the one an operation
-/// declares for agents; it defaults to the summary, so it is only projected
-/// when it says something the summary does not.
+/// An explicitly declared description wins. Otherwise the contract carries one
+/// long-form description, the one an operation declares for agents; it defaults
+/// to the summary, so it is only projected when it says something the summary
+/// does not.
 fn operation_description(operation: &OperationDescriptor) -> Option<&str> {
+    if let Some(declared) = &operation.documentation.description
+        && !declared.is_empty()
+    {
+        return Some(declared.as_str());
+    }
     let description = operation.contract.mcp.as_ref()?.description.as_str();
     (!description.is_empty() && description != operation.contract.summary).then_some(description)
+}
+
+/// The statuses the security pipeline itself answers with, before the handler.
+///
+/// These are derived from the same `security` declaration that drives
+/// enforcement, exactly as the `422` is derived from what the operation
+/// decodes: an operation that requires a scheme can be answered `401`, and one
+/// that additionally requires a scope can be answered `403`. An operation that
+/// declares either status itself keeps the one it declared.
+fn security_responses(operation: &OperationDescriptor) -> Vec<(&'static str, Value)> {
+    if operation.contract.security.is_empty() {
+        return Vec::new();
+    }
+    let mut derived = vec![(
+        UNAUTHORIZED_STATUS,
+        security_response(
+            "The request carried no acceptable credential for a security scheme this operation requires.",
+        ),
+    )];
+    if operation
+        .contract
+        .security
+        .iter()
+        .any(|requirement| !requirement.scopes.is_empty())
+    {
+        derived.push((
+            FORBIDDEN_STATUS,
+            security_response(
+                "The credential was accepted but does not carry every scope this operation requires.",
+            ),
+        ));
+    }
+    derived
+}
+
+fn security_response(description: &str) -> Value {
+    json!({
+        "description": description,
+        "x-blazingly-automatic": true
+    })
 }
 
 /// A media type entry carrying a schema and, when derivable, a sample payload.
@@ -641,6 +844,8 @@ fn escape_html(value: &str) -> String {
 
 /// The status every input rejection is reported under.
 const REJECTION_STATUS: &str = "422";
+const UNAUTHORIZED_STATUS: &str = "401";
+const FORBIDDEN_STATUS: &str = "403";
 
 /// Every code a rejection can carry, in the order a reader most wants them.
 ///

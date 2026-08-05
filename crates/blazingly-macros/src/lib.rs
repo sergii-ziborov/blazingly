@@ -14,6 +14,70 @@ struct OperationArgs {
     path: LitStr,
     id: LitStr,
     summary: LitStr,
+    documentation: DocumentationArgs,
+}
+
+/// The unverifiable prose keys, collected before they are lowered into
+/// `blazingly_core::OperationDocumentation`.
+#[derive(Default)]
+struct DocumentationArgs {
+    tags: Vec<LitStr>,
+    description: Option<LitStr>,
+    deprecated: bool,
+    external_docs_url: Option<LitStr>,
+    external_docs_description: Option<LitStr>,
+}
+
+impl DocumentationArgs {
+    fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+            && self.description.is_none()
+            && !self.deprecated
+            && self.external_docs_url.is_none()
+    }
+
+    /// Lowers to a `.with_documentation(...)` call, or to nothing when the
+    /// operation declared none of it.
+    fn tokens(&self) -> syn::Result<proc_macro2::TokenStream> {
+        if let Some(description) = &self.external_docs_description
+            && self.external_docs_url.is_none()
+        {
+            return Err(syn::Error::new(
+                description.span(),
+                "`external_docs_description` needs an `external_docs = \"<url>\"` to describe",
+            ));
+        }
+        if self.is_empty() {
+            return Ok(quote!());
+        }
+        let tags = &self.tags;
+        let description = option_tokens(self.description.as_ref());
+        let deprecated = self.deprecated;
+        let external_docs = match (&self.external_docs_url, &self.external_docs_description) {
+            (None, _) => quote!(::core::option::Option::None),
+            (Some(url), None) => quote!(::core::option::Option::Some(
+                ::blazingly::ExternalDocumentation::new(#url)
+            )),
+            (Some(url), Some(text)) => quote!(::core::option::Option::Some(
+                ::blazingly::ExternalDocumentation::new(#url).with_description(#text)
+            )),
+        };
+        Ok(quote! {
+            .with_documentation(::blazingly::OperationDocumentation {
+                tags: ::std::vec![#(::std::string::String::from(#tags)),*],
+                description: #description,
+                deprecated: #deprecated,
+                external_docs: #external_docs,
+            })
+        })
+    }
+}
+
+fn option_tokens(value: Option<&LitStr>) -> proc_macro2::TokenStream {
+    value.map_or_else(
+        || quote!(::core::option::Option::None),
+        |value| quote!(::core::option::Option::Some(::std::string::String::from(#value))),
+    )
 }
 
 struct UniversalOperationArgs {
@@ -370,11 +434,79 @@ impl Parse for McpArgs {
     }
 }
 
+/// Parses the documentation keys shared by `#[get]`-style attributes and
+/// `#[operation]`.
+///
+/// These are separated from `id`, `path` and `method` on purpose: everything
+/// here is prose a reader sees and nothing checks, so it lands in
+/// `OperationDocumentation` outside the contract rather than in the canonical
+/// bytes. Returns `Ok(true)` when the key was one of them.
+fn parse_documentation_key(
+    key: &Ident,
+    input: ParseStream<'_>,
+    documentation: &mut DocumentationArgs,
+) -> syn::Result<bool> {
+    match key.to_string().as_str() {
+        "tags" => {
+            if !documentation.tags.is_empty() {
+                return Err(syn::Error::new(key.span(), "`tags` was specified twice"));
+            }
+            input.parse::<Token![=]>()?;
+            let content;
+            bracketed!(content in input);
+            while !content.is_empty() {
+                documentation.tags.push(content.parse::<LitStr>()?);
+                if !content.is_empty() {
+                    content.parse::<Token![,]>()?;
+                }
+            }
+            if documentation.tags.is_empty() {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "`tags = []` says nothing; drop the key to fall back to the operation-id namespace",
+                ));
+            }
+            Ok(true)
+        }
+        "description" => {
+            input.parse::<Token![=]>()?;
+            documentation.description = Some(input.parse::<LitStr>()?);
+            Ok(true)
+        }
+        // A bare `deprecated` reads better than `deprecated = true` and is what
+        // an author reaches for; both are accepted.
+        "deprecated" => {
+            if input.peek(Token![=]) {
+                input.parse::<Token![=]>()?;
+                documentation.deprecated = input.parse::<LitBool>()?.value();
+            } else {
+                documentation.deprecated = true;
+            }
+            Ok(true)
+        }
+        "external_docs" => {
+            input.parse::<Token![=]>()?;
+            documentation.external_docs_url = Some(input.parse::<LitStr>()?);
+            Ok(true)
+        }
+        "external_docs_description" => {
+            input.parse::<Token![=]>()?;
+            documentation.external_docs_description = Some(input.parse::<LitStr>()?);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+const OPERATION_KEY_HELP: &str = "supported keys are `id`, `summary`, `tags`, `description`, \
+     `deprecated`, `external_docs`, and `external_docs_description`";
+
 impl Parse for OperationArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let path = input.parse::<LitStr>()?;
         let mut id = None;
         let mut summary = None;
+        let mut documentation = DocumentationArgs::default();
 
         while !input.is_empty() {
             input.parse::<Token![,]>()?;
@@ -383,17 +515,19 @@ impl Parse for OperationArgs {
             }
 
             let key = input.parse::<Ident>()?;
-            input.parse::<Token![=]>()?;
-            let value = input.parse::<LitStr>()?;
-
             match key.to_string().as_str() {
-                "id" => id = Some(value),
-                "summary" => summary = Some(value),
+                "id" => {
+                    input.parse::<Token![=]>()?;
+                    id = Some(input.parse::<LitStr>()?);
+                }
+                "summary" => {
+                    input.parse::<Token![=]>()?;
+                    summary = Some(input.parse::<LitStr>()?);
+                }
                 _ => {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        "supported keys are `id` and `summary`",
-                    ));
+                    if !parse_documentation_key(&key, input, &mut documentation)? {
+                        return Err(syn::Error::new(key.span(), OPERATION_KEY_HELP));
+                    }
                 }
             }
         }
@@ -403,7 +537,12 @@ impl Parse for OperationArgs {
         })?;
         let summary = summary.unwrap_or_else(|| LitStr::new("", path.span()));
 
-        Ok(Self { path, id, summary })
+        Ok(Self {
+            path,
+            id,
+            summary,
+            documentation,
+        })
     }
 }
 
@@ -413,9 +552,18 @@ impl Parse for UniversalOperationArgs {
         let mut path = None;
         let mut id = None;
         let mut summary = None;
+        let mut documentation = DocumentationArgs::default();
 
         while !input.is_empty() {
             let key = input.parse::<Ident>()?;
+            // The documentation keys parse their own `=` because `deprecated`
+            // may stand alone and `tags` is followed by a bracketed list.
+            if parse_documentation_key(&key, input, &mut documentation)? {
+                if !input.is_empty() {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "method" => {
@@ -457,7 +605,9 @@ impl Parse for UniversalOperationArgs {
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "supported keys are `method`, `path`, `id`, and `summary`",
+                        "supported keys are `method`, `path`, `id`, `summary`, `tags`, \
+                         `description`, `deprecated`, `external_docs`, and \
+                         `external_docs_description`",
                     ));
                 }
             }
@@ -481,7 +631,12 @@ impl Parse for UniversalOperationArgs {
 
         Ok(Self {
             method,
-            operation: OperationArgs { path, id, summary },
+            operation: OperationArgs {
+                path,
+                id,
+                summary,
+                documentation,
+            },
         })
     }
 }
@@ -578,6 +733,34 @@ pub fn operation(arguments: TokenStream, item: TokenStream) -> TokenStream {
 /// so it must outlive changes to the path and to the function name. `summary`
 /// is optional and supplies the one-line description that reaches the OpenAPI
 /// operation, the `cargo blazingly routes` table, and the MCP tool description.
+///
+/// Five more keys carry prose for a reader and are enforced by nothing:
+///
+/// ```ignore
+/// #[get(
+///     "/users",
+///     id = "users.list",
+///     summary = "List users",
+///     tags = ["users", "admin"],
+///     description = "Returns one page of users, newest first.",
+///     deprecated,
+///     external_docs = "https://example.com/users",
+///     external_docs_description = "Pagination and filtering"
+/// )]
+/// ```
+///
+/// `tags` replaces the group the operation would otherwise take from the
+/// namespace of its id, and the first one names its section in the generated
+/// Markdown. `description` is the long form shown below the summary.
+/// `deprecated` stands alone or takes `= true` / `= false`.
+///
+/// None of these can be checked against the signature, so none of them can
+/// contradict it, and none of them enter the operation contract: adding a tag
+/// does not move a fingerprint or register as a compatibility change. For
+/// anything else the projection cannot derive — `callbacks`, `webhooks`,
+/// `info.contact`, prose on one response — use
+/// `OpenApiConfig::with_overlay`, which merges additively and therefore cannot
+/// overwrite what the code decided.
 ///
 /// Handler arguments are the extractors — `Path`, `Query`, `Header`, `Cookie`,
 /// `Json`, `Form`, `Multipart`, `File`, `Extract<T>` — and compiled dependency
@@ -1182,6 +1365,7 @@ fn operation_tokens(
     let path = arguments.path;
     let id = arguments.id;
     let summary = arguments.summary;
+    let documentation = arguments.documentation.tokens()?;
 
     let input_descriptors = inputs.iter().filter_map(|input| {
         let source = input.kind.source_tokens()?;
@@ -1273,7 +1457,8 @@ fn operation_tokens(
                 .expect("the operation id was validated by the Blazingly macro")
                 .with_inputs(::std::vec![#(#input_descriptors),*])
                 .with_dependencies(::std::vec![#(#dependency_descriptors),*])
-                .with_security(::std::vec![#(#security_requirements),*]);
+                .with_security(::std::vec![#(#security_requirements),*])
+                #documentation;
                 #mcp_projection
             }
 

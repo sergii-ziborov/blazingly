@@ -12,7 +12,44 @@ pinned submodule revision is recorded as a single entry.
 
 ## [Unreleased]
 
-Nothing yet.
+This breaks the framework Rust API, which pre-1.0 permits when the break is
+recorded, so it releases as 0.3.0 rather than a patch. One break, mechanical:
+`OperationDescriptor` gains a public `documentation` field, so a struct literal
+that names every field no longer compiles. Use `OperationDescriptor::new` and
+the builders, or add `documentation: OperationDocumentation::default()`.
+
+### Added
+
+- An operation declares the prose a reader needs and the code cannot supply:
+  `tags`, `description`, `deprecated`, `external_docs`, and
+  `external_docs_description` on every method attribute and on `#[operation]`.
+  `tags` replaces the group otherwise taken from the namespace of the operation
+  id, and its first entry names the section in the generated Markdown.
+  `deprecated` stands alone or takes `= true` / `= false`.
+
+  None of this enters `blazingly-contract`. It lives in a new
+  `OperationDocumentation` beside the contract, for the same reason HTTP paths
+  and methods already do: it is unverifiable against a handler signature, so it
+  cannot drift from the code, and it must not move an operation fingerprint or
+  register as a compatibility change. Adding a tag to a shipped operation is
+  not a change to that operation.
+- The document as a whole takes `OpenApiConfig::with_description`,
+  `with_server` (with `OpenApiServer`), and `with_tag_description`.
+- `OpenApiConfig::with_overlay` merges raw OpenAPI into the generated document
+  — the escape hatch for `callbacks`, `webhooks`, `info.contact`, prose on an
+  individual response, and vendor extensions. The merge is **additive**: it
+  writes a key only where the projection produced none, recursing into shared
+  objects. An overlay can therefore add to the document but can never overwrite
+  a schema, a status code, a parameter, or a security requirement that came
+  from the code, so the property that makes the document worth trusting
+  survives the framework having an escape hatch at all.
+- An operation that declares `#[security(...)]` now documents the responses the
+  security pipeline itself answers with: `401`, and `403` as well when the
+  requirement names scopes. These carry `x-blazingly-automatic`, the same
+  marker the derived `422` uses, and an operation that declares either status
+  keeps its own. The framework already enforced this fail-closed; it simply did
+  not say so, which left a hand-written `utoipa` annotation more complete than
+  the generated document on exactly the axis this project claims to win.
 
 ## [0.2.2] - 2026-08-05
 

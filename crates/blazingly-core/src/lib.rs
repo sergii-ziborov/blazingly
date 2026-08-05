@@ -1875,11 +1875,72 @@ impl HttpBinding {
     }
 }
 
+/// A link to prose that lives outside the generated document.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExternalDocumentation {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl ExternalDocumentation {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            description: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+/// Prose an operation declares for a reader, and that nothing enforces.
+///
+/// This is deliberately not part of [`OperationContract`]. Everything here is
+/// unverifiable against a handler signature — a tag is a filing decision, not a
+/// fact about the operation — so none of it can drift from the code the way a
+/// hand-written status code can. Keeping it out of the contract also keeps it
+/// out of the canonical bytes, so adding a tag does not change a fingerprint or
+/// register as a compatibility change.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationDocumentation {
+    /// Groups the operation belongs to. Empty means the projection falls back
+    /// to the namespace of the operation id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Long-form prose shown below the summary. Overrides the description an
+    /// MCP tool declares, when both are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Marks the operation as still served but no longer recommended.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub deprecated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_docs: Option<ExternalDocumentation>,
+}
+
+impl OperationDocumentation {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+            && self.description.is_none()
+            && !self.deprecated
+            && self.external_docs.is_none()
+    }
+}
+
 /// A protocol-neutral operation paired with its HTTP projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationDescriptor {
     pub contract: OperationContract,
     pub http: HttpBinding,
+    #[serde(default, skip_serializing_if = "OperationDocumentation::is_empty")]
+    pub documentation: OperationDocumentation,
 }
 
 impl OperationDescriptor {
@@ -1900,7 +1961,14 @@ impl OperationDescriptor {
         Ok(Self {
             contract: OperationContract::new(id, summary, input, responses)?,
             http: HttpBinding::new(method, path),
+            documentation: OperationDocumentation::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: OperationDocumentation) -> Self {
+        self.documentation = documentation;
+        self
     }
 
     #[must_use]

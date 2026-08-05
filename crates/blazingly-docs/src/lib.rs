@@ -252,11 +252,16 @@ pub fn api_markdown(app: &AppDefinition) -> String {
     output
 }
 
-/// The section an operation belongs to, taken from its identity namespace.
+/// The section an operation belongs to.
 ///
-/// `users.create` and `users.list` both belong to `users`; an identity without
-/// a namespace belongs to no section.
+/// The first tag it declares, when it declares any — a page has one section per
+/// operation, so a multi-tag operation files under the first. Otherwise the
+/// namespace of its identity: `users.create` and `users.list` both belong to
+/// `users`, and an identity without a namespace belongs to no section.
 fn operation_tag(operation: &OperationDescriptor) -> Option<&str> {
+    if let Some(tag) = operation.documentation.tags.first() {
+        return Some(tag.as_str());
+    }
     operation
         .contract
         .id
@@ -267,7 +272,16 @@ fn operation_tag(operation: &OperationDescriptor) -> Option<&str> {
 }
 
 /// The long-form description an operation declares beyond its summary.
+///
+/// An explicitly declared description wins over the one an MCP tool carries,
+/// which itself defaults to the summary and is therefore only worth printing
+/// when it says something the summary does not.
 fn operation_description(operation: &OperationDescriptor) -> Option<&str> {
+    if let Some(declared) = &operation.documentation.description
+        && !declared.is_empty()
+    {
+        return Some(declared.as_str());
+    }
     let description = operation.contract.mcp.as_ref()?.description.as_str();
     (!description.is_empty() && description != operation.contract.summary).then_some(description)
 }
@@ -666,6 +680,14 @@ fn write_operation(output: &mut String, operation: &OperationDescriptor, heading
         operation.contract.id.as_str(),
         operation.contract.summary
     );
+    // Above the description, not below: a reader deciding whether to use this
+    // operation should learn it is on the way out before reading how it works.
+    if operation.documentation.deprecated {
+        let _ = writeln!(
+            output,
+            "**Deprecated.** Still served, no longer recommended.\n"
+        );
+    }
     if let Some(description) = operation_description(operation) {
         let _ = writeln!(output, "{description}\n");
     }
@@ -675,6 +697,13 @@ fn write_operation(output: &mut String, operation: &OperationDescriptor, heading
         operation.http.method.as_str(),
         operation.http.path
     );
+    if let Some(external) = &operation.documentation.external_docs {
+        let label = external
+            .description
+            .as_deref()
+            .unwrap_or("Further documentation");
+        let _ = writeln!(output, "- See also: [{label}]({})", external.url);
+    }
 
     for input in &operation.contract.inputs {
         let requirement = if input.required {

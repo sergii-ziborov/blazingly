@@ -336,6 +336,66 @@ The document is served at `/openapi.json` and a Scalar reference UI at `/docs`.
 `with_document_path`, `with_ui_path`, and `with_ui(OpenApiUi::Swagger)` move or
 change them.
 
+### Prose the code cannot supply
+
+The machine-checkable parts of the document — parameters, status codes, bodies,
+validation constraints — come from the handler signature and cannot drift from
+it. Prose cannot be derived that way, so an operation declares it:
+
+```rust
+#[get(
+    "/tasks",
+    id = "tasks.list",
+    summary = "List tasks",
+    tags = ["tasks"],
+    description = "Returns one page of tasks, newest first.",
+    external_docs = "https://example.com/tasks"
+)]
+```
+
+`tags` decides which group the operation files under, in the browser UI and in
+the generated Markdown; without it the namespace of the operation id is used, so
+`tasks.list` files under `tasks` on its own. `deprecated` marks an operation as
+still served but no longer recommended. None of this enters the operation
+contract, so adding a tag does not change a fingerprint.
+
+The document as a whole takes the same treatment:
+
+```rust
+blazingly::openapi::OpenApiConfig::new("Tasks API", "0.1.0")
+    .with_description("Everything a task tracker needs.")
+    .with_server(
+        blazingly::openapi::OpenApiServer::new("https://api.example.com")
+            .with_description("Production"),
+    )
+    .with_tag_description("tasks", "Creating, reading, and closing tasks.")
+```
+
+For anything the projection does not generate at all — `callbacks`, `webhooks`,
+`info.contact`, a description on one individual response — `with_overlay` takes
+raw OpenAPI and merges it in:
+
+```rust
+    .with_overlay(blazingly_json::json!({
+        "info": { "contact": { "name": "API team", "email": "api@example.com" } }
+    }))
+```
+
+The merge is additive: it writes a key only where the generated document has
+none, at every depth. An overlay can therefore add to the document but never
+overwrite a schema, a status code, or a security requirement that came from the
+code — which is what keeps the document worth trusting even with an escape
+hatch in it.
+
+### Responses the framework answers itself
+
+Two kinds of response are in the document without being declared, marked
+`x-blazingly-automatic` so a reader can tell them apart from the ones the
+handler returns. An operation that decodes any input can be answered `422`
+before the handler runs. An operation that declares `#[security(...)]` can be
+answered `401`, and if the requirement names scopes, `403` as well. Declaring
+either status yourself keeps yours.
+
 ```console
 curl -s http://127.0.0.1:3000/openapi.json
 ```
