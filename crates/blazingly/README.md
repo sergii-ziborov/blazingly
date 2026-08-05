@@ -16,8 +16,11 @@ the feature wiring, and the macros. MSRV is Rust 1.88. `tokio`, `hyper`, and
 
 - FastAPI-style handlers: `#[get]`/`#[post]`/... on plain functions,
   `#[api_model]` validated models, `#[api_error]` stable typed errors;
-- compiled dependency injection (`#[provider]`, `Depends<T>`) and nested
+- compiled dependency injection (`#[provider]`, `Depends<T>`, with
+  `Path`/`Query`/`Header`/`Cookie` inputs beside them) and nested, mountable
   `Plugin` scopes with lifecycle hooks;
+- custom extraction through `Extract<T>` over the public `FromInvocation`
+  trait, and `Extract<RequestParts>` for the request line and peer address;
 - runtime-neutral `Request`, `Response`, compiled `Router`, and an in-memory
   `TestApp`;
 - deterministic OpenAPI 3.1 / JSON Schema 2020-12 with precompiled

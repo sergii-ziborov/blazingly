@@ -12,9 +12,16 @@ compiles the whole graph once, and `invoke` runs the full pipeline — hooks,
 typed extraction, validation (behind the `validation` feature), the handler,
 and projection into an `ExecutionOutcome` — for one operation. The same
 pipeline serves HTTP requests (routed by `blazingly-http`) and MCP tool
-calls. The crate also owns the bounded blocking pool (`run_blocking`,
-`install_global_blocking_pool`) used by synchronous handlers and by
-`blazingly-database`.
+calls. `Extract<T>` disambiguates a custom extractor from a compiled
+dependency request, `Extract<RequestParts>` snapshots the HTTP request line,
+and `Plugin::mount` / `Plugin::with_id_namespace` serve one module at two
+prefixes under distinct operation identities.
+
+The crate also owns the bounded blocking pool (`run_blocking`,
+`install_global_blocking_pool`), which `blazingly-database` uses. It is opt-in,
+not automatic: a synchronous handler runs inline on the calling thread and is
+never moved to the pool, so work that genuinely blocks has to reach for
+`run_blocking` itself.
 
 Standalone use is real: there is no HTTP transport, no macro, and no async
 runtime here. `invoke` returns an ordinary future you can drive with any

@@ -10,7 +10,10 @@ dependency, so the operation graph, router, DI, and documentation crates stay
 runtime-neutral; Tokio, Hyper, and Axum are not in this crate's tree. Parsing
 and framing come from `blazingly-wire`, sockets and completion I/O from
 Compio. `Server` serves one compiled app; `MulticoreServer` runs
-thread-per-core with one non-`Send` app per worker; `ServerLimits` enforces
+thread-per-core with one non-`Send` app per worker, placing each new connection
+on the least-loaded one, with `with_worker_priority` for elevated scheduling
+and per-stage tail latency under `BLAZINGLY_NATIVE_STAGE_METRICS=1`;
+`ServerLimits` enforces
 header, body, chunk, pipeline, and socket-deadline limits before an operation
 is dispatched; `shutdown_channel` and `termination_channel` drive graceful
 drain. The crate is usable without the `blazingly` facade: anything that

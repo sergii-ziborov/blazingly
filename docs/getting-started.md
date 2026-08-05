@@ -43,12 +43,15 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-blazingly = { version = "0.2.0", features = ["native"] }
+# To track unreleased work on `main` instead:
+# blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }
+blazingly = { version = "0.2.1", features = ["native"] }
 ```
 
-To track unreleased work on `main` instead, use
-`blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }`
-— Cargo checks the submodules out itself.
+The version is the one the CLI itself was built against, so `cargo install
+cargo-blazingly` and the project it scaffolds cannot disagree. Uncommenting the
+line above tracks unreleased work on `main` instead; Cargo checks the
+submodules out itself.
 
 `[workspace]` is deliberate: it stops the project from being adopted by a parent
 workspace if you generated it inside one.
@@ -90,10 +93,12 @@ fn health() -> Json<&'static str> {
 }
 ```
 
-The attribute carries the path, a stable operation id, and the summary. The id
-is not decoration: it names the operation in the contract, in OpenAPI, in the
-generated documentation, and in compatibility reports, and it is the one thing
-that must stay stable as the path or the function name change.
+The attribute carries the path, a stable operation id, and a one-line summary.
+The id is not decoration: it names the operation in the contract, in OpenAPI,
+in the generated documentation, and in compatibility reports, and it is the one
+thing that must stay stable as the path or the function name change. The
+summary is what reaches the OpenAPI description, the `cargo blazingly routes`
+table, and the MCP tool description.
 
 Handlers may be `fn` or `async fn`. A synchronous handler with no lifecycle
 hooks runs on a direct, allocation-free path; the macro also emits an async form

@@ -8,6 +8,9 @@ validated operation graph — into an OpenAPI 3.1 / JSON Schema 2020-12
 document (`to_value`, `to_value_with_config`) and precompiles the
 `/openapi.json` and Scalar or Swagger UI responses as ready HTTP assets
 (`OpenApiService`), so nothing is generated on the request hot path. It is an
+A validation failure is documented automatically as a `422` marked
+`x-blazingly-automatic`, and a value type's constraints reach the item schema
+of a collection that uses it, at any nesting depth. It is an
 ordinary library and works standalone: it depends only on `blazingly-core`
 and `blazingly-json`, performs no I/O, and needs neither the facade nor a
 server. The [Blazingly](https://github.com/sergii-ziborov/blazingly)

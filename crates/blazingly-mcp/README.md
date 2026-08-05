@@ -8,6 +8,7 @@ dependency injection, and typed errors; nothing is reconstructed from
 OpenAPI. The crate provides `McpRuntime` (direct in-process tool calls),
 `JsonRpcServer` (the MCP JSON-RPC lifecycle), `StreamableHttpServer` (the
 stateful Streamable HTTP transport), `McpRegistry` (resources and prompts),
+a read-only `FrameworkManifest` resource at `blazingly://framework/manifest`,
 and a bounded, redacted audit log. It works standalone: it depends on
 `blazingly-core`, `blazingly-executor`, `blazingly-json`, and `serde`, opens
 no sockets, and starts no runtime — each transport is handed one message and

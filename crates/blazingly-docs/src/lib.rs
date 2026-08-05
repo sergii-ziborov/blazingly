@@ -170,7 +170,10 @@ pub fn scaffold(config: &ScaffoldConfig) -> DocsBundle {
             "use blazingly::prelude::*;\n",
             "use std::num::NonZeroUsize;\n",
             "use std::time::Duration;\n\n",
-            "#[get(\"/health\", id = \"health.read\")]\n",
+            // The summary is not decoration in a scaffold: it is what reaches
+            // OpenAPI, the `cargo blazingly routes` table, and the MCP tool
+            // description, so a generated project should demonstrate it.
+            "#[get(\"/health\", id = \"health.read\", summary = \"Liveness probe\")]\n",
             "fn health() -> Json<&'static str> {{\n",
             "    Json(\"ok\")\n",
             "}}\n\n",
