@@ -440,6 +440,47 @@ emits the document with the default title and version, because `with_openapi` is
 applied after the app is constructed and the emit happens during construction.
 The served `/openapi.json` carries whatever you configured.
 
+## Cutting the rebuild loop
+
+Rust has no answer to `uvicorn --reload`, and pretending otherwise wastes your
+time. What follows is what was measured, on one Windows machine, over a project
+the size of this guide's: three repetitions of each edit, alternating, reporting
+the fastest of each set because that is the number least contaminated by
+whatever else the machine was doing.
+
+| configuration | fastest rebuild |
+|---|---|
+| stock `cargo build` | 3.50 s |
+| `debug = "line-tables-only"` alone | 3.45 s |
+| `rust-lld` alone | 3.52 s |
+| **both together** | **3.11 s** |
+
+About a tenth off the floor, and neither half does it alone: `lld`'s advantage
+shows up once there is less debug info to link. The generated `Cargo.toml`
+already carries the profile. The linker is one file, because a linker cannot be
+chosen from `Cargo.toml`:
+
+```toml
+# .cargo/config.toml
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+```
+
+`rust-lld` ships with the toolchain but is not on `PATH`; add
+`$(rustc --print sysroot)/lib/rustlib/<target>/bin` to it, or name the binary by
+its full path. On Linux use `linker = "clang"` with
+`rustflags = ["-Clink-arg=-fuse-ld=lld"]`; on macOS the platform linker is
+already fast enough that this buys little.
+
+One thing measured and worth **not** doing: it is sometimes suggested that
+splitting the framework's generics would stop an edit to `main` from
+re-monomorphising the server. On the same project, editing a handler body and
+editing `main` cost the same — 4.45 s against 4.83 s, ranges overlapping. They
+are the same crate, so any edit recompiles all of it and relinks, and there is
+no crate boundary for a generics split to protect. Splitting your own
+application across crates would change that; changing the framework's generics
+would not.
+
 ## Expose the same operations to agents
 
 MCP is not generated from OpenAPI. It projects the same operation model, so a

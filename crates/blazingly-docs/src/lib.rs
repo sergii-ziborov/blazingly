@@ -161,7 +161,13 @@ pub fn scaffold(config: &ScaffoldConfig) -> DocsBundle {
             "edition = \"2024\"\n\n",
             "[workspace]\n\n",
             "[dependencies]\n",
-            "blazingly = {}\n"
+            "blazingly = {}\n\n",
+            "# Full debug info is the part of a rebuild a service does not\n",
+            "# need; line tables still point backtraces at real lines. Pair it\n",
+            "# with a fast linker for the rest -- see the framework's\n",
+            "# getting-started guide, `Cutting the rebuild loop`.\n",
+            "[profile.dev]\n",
+            "debug = \"line-tables-only\"\n"
         ),
         config.package_name, config.blazingly_dependency
     );
