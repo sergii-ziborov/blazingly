@@ -8,8 +8,10 @@ feature).
 The adapter deliberately owns every socket-runtime and wire-protocol
 dependency, so the operation graph, router, DI, and documentation crates stay
 runtime-neutral; Tokio, Hyper, and Axum are not in this crate's tree. Parsing
-and framing come from `blazingly-wire`, sockets and completion I/O from
-Compio. `Server` serves one compiled app; `MulticoreServer` runs
+and framing come from `blazingly-wire`, sockets and I/O from Compio — a
+completion driver on Windows (IOCP) and Linux (io_uring), and a readiness
+driver elsewhere, because macOS and the BSDs expose no general-purpose
+completion interface for sockets. `Server` serves one compiled app; `MulticoreServer` runs
 thread-per-core with one non-`Send` app per worker, placing each new connection
 on the least-loaded one, with `with_worker_priority` for elevated scheduling
 and per-stage tail latency under `BLAZINGLY_NATIVE_STAGE_METRICS=1`;

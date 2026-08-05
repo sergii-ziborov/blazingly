@@ -44,7 +44,10 @@ request framing, chunk decoding, and response-head encoding with only
 OpenAPI, MCP, socket, or runtime crate. It now lives in its own repository and
 enters this workspace as a submodule, because that independence was real rather
 than aspirational: `blazingly-native` drives it asynchronously over Compio
-completion I/O, and the standard-library, thread-per-connection
+Compio (completion I/O where the platform has it — IOCP on Windows, io_uring
+on Linux — and a readiness driver on macOS and the BSDs, which expose no
+general-purpose completion interface for sockets), and the standard-library,
+thread-per-connection
 `standalone_server` example in the wire repository drives the same codec with
 no async at all.
 
