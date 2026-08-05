@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Generates human and agent-oriented Markdown documentation and project scaffolds from a Blazingly app"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Facade crate re-exporting the Blazingly framework: routing, extraction, validation, dependency injection, OpenAPI, and MCP"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

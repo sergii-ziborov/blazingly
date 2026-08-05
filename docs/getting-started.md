@@ -245,6 +245,9 @@ async fn read_task(Path(id): Path<u64>, tasks: Tasks) -> Result<Json<Task>, Task
 
 `Path<T>`, `Query<T>`, `Header<T>`, `Cookie<T>`, `Json<T>`, `Form<T>`,
 `Multipart<T>`, and `File<T>` are the extractors, and a handler may take several.
+For anything they do not cover, `Extract<T>` accepts any type implementing the
+public `FromInvocation` trait, and `Extract<RequestParts>` hands you an owned
+snapshot of the method, path, effective scheme and host, and peer address.
 `Created<T>`, `Accepted<T>`, `NoContent`, and `Status<CODE, T>` are the typed
 responses; `WithHeaders` adds validated response headers.
 

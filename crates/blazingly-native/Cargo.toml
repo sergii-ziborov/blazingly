@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Native Compio HTTP/1 adapter for Blazingly, with optional rustls TLS and an experimental HTTP/2 path"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

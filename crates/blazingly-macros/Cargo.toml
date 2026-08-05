@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Procedural macros for Blazingly operation, model, and error declarations"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

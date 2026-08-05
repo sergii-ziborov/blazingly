@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Compiled dependency-injection graph, provider lifetimes, and numeric slot plans for Blazingly"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

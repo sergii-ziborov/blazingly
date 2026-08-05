@@ -6,9 +6,18 @@ rust-version.workspace = true
 description = "Development and production CLI for Blazingly applications"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
-categories.workspace = true
+# Not the workspace list: this crate is a cargo subcommand, not a server
+# library, and the inherited categories left it out of the two lists a
+# developer actually browses to find `cargo blazingly new`.
+categories = [
+    "development-tools::cargo-plugins",
+    "command-line-utilities",
+    "development-tools",
+    "web-programming",
+]
 publish.workspace = true
 
 [dependencies]

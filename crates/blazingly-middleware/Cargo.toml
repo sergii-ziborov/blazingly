@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Runtime-neutral HTTP middleware for Blazingly: CORS, compression, trusted host and proxy handling, and rate limiting"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

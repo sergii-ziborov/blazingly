@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "MiniJinja HTML templates exposed as Blazingly dependency-injection state and typed responses"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

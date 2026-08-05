@@ -72,18 +72,13 @@ without compiling Compio, sockets, TLS, or native HTTP codecs to Wasm.
 - semantic compatibility changes classified as breaking, non-breaking, or
   informational.
 
-It is maintained as an independent repository. During the pre-release phase,
-the framework pins that repository as a Git submodule so every checkout and CI
-run uses an exact reviewed contract revision. After the first registry release,
-the framework will consume it as a normal SemVer dependency.
-
-That pin is currently wrong. The committed submodule pointer is `02b2fae`,
-whose `Cargo.toml` declares `version = "0.0.1"`, while the root
-`[workspace.dependencies]` requires `blazingly-contract = "0.3.0"`. A fresh
-`git clone --recursive` therefore fails to resolve the workspace. Local working
-trees are on `v0.3.0` (`b1b4b91`) and build, which is why CI has not caught it.
-Committing the updated pointer is a release-process step in
-`docs/stability.md`.
+It is maintained as an independent repository and published to crates.io. The
+framework also pins that repository as a Git submodule, so a checkout and a CI
+run build one exact reviewed contract revision rather than whatever the registry
+requirement happens to resolve to. `blazingly-json` and `blazingly-wire` use the
+same arrangement. The committed pointer and the requirement in
+`[workspace.dependencies]` advance together; keeping them in step is a
+release-process step in `docs/stability.md`.
 
 The legacy single-input field is retained only for serialized-data migration
 and is excluded from canonical identity. HTTP paths/methods remain projections
@@ -219,12 +214,12 @@ both transports invoke the same operation semantics.
     workspace-wide `cargo-semver-checks` job reports Rust API breaks
     advisorily. An independent external security audit and a stable 1.0 API
     are explicit release gates.
-15. Release readiness: repository-root MIT `LICENSE` matching the contract
-    repository, publishable package metadata on every crate, `CHANGELOG.md`,
-    and a release process in `docs/stability.md` whose gate names real CI
-    jobs. `publish` stays `false`. Two blockers remain: the committed
-    submodule pointer below, and a `repository` URL in `[workspace.package]`
-    that is still a placeholder.
+15. Release readiness: done. `publish = true`, a canonical `repository` URL in
+    `[workspace.package]`, an MIT `LICENSE` in every published crate matching
+    the contract repository, `CHANGELOG.md`, and a release process in
+    `docs/stability.md` whose gate names real CI jobs. The framework is on
+    crates.io: 21 workspace crates at 0.2.1, plus `blazingly-contract` 0.4.1,
+    `blazingly-json` 0.1.2, and `blazingly-wire` 0.1.3.
 
 Mesh work starts only after the framework contract is stable.
 

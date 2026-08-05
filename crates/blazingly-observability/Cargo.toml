@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Request identity, access events, tracing and OpenTelemetry propagation, and Prometheus metrics for Blazingly"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

@@ -14,6 +14,94 @@ pinned submodule revision is recorded as a single entry.
 
 Nothing yet.
 
+## [0.2.1] - 2026-08-05
+
+No Rust API changes. Packaging and documentation corrections only. Published
+tarballs are immutable, so everything below reaches users at this release
+rather than retroactively repairing 0.2.0.
+
+Submodule crates published alongside: `blazingly-contract` 0.4.1,
+`blazingly-json` 0.1.2, `blazingly-wire` 0.1.3 — each carrying the same class
+of correction to its own crates.io page.
+
+### Fixed
+
+- Every workspace crate now ships the MIT LICENSE file its manifest declares.
+  The 21 crates published at 0.2.0 declare `license = "MIT"` and contain no
+  LICENSE file, because only files inside a crate directory reach its tarball.
+- docs.rs builds default features unless the manifest says otherwise, and this
+  workspace puts most of its surface behind optional features. Every
+  publishable manifest now carries `[package.metadata.docs.rs] all-features =
+  true`. Before this, `blazingly::native::MulticoreServer` — the type
+  getting-started tells a new user to reach for first — did not appear on
+  docs.rs at all, and neither did `database`, `mcp-stdio`, `native-http2`,
+  `native-tls`, `observability-otel`, `queue`, or `templates`.
+- Eleven crates, the facade among them, had no crate-level documentation, so
+  their docs.rs landing page was a bare item list. Each now includes its own
+  README as the crate doc, which also means every README example is compiled
+  as a doctest from here on.
+- The repository README's main example had stopped compiling: it declared
+  items and then issued top-level `let ... ?` statements, so it was valid at
+  neither module nor function scope. It is now a `fn main` and is compiled by
+  the workspace test run through a `#[cfg(doctest)]` include in the facade.
+- The README described a published release as a prototype, miscounted the
+  external repositories in the sentence that introduces them, attributed the
+  worker-priority measurement to a contended host when
+  [benchmark status](docs/benchmark-status.md) records a quiet one, and claimed
+  a bounded pool runs synchronous handlers. That last one was the load-bearing
+  error: a synchronous handler runs inline on the worker that accepted the
+  request and is never moved to the blocking pool, so blocking work must call
+  `run_blocking` or it stalls one thread-per-core worker and every connection
+  placed on it. README and crate docs now say so at the point of use.
+- `docs/architecture.md` described a submodule pin mismatch that no longer
+  exists and listed release readiness as blocked with `publish = false`.
+- `docs/getting-started.md`'s extractor list omitted `Extract<T>` and
+  `Extract<RequestParts>`, so the documented path to the peer address and the
+  raw request line was missing.
+- The advisory `workspace-semver` job compares each crate against its own
+  latest crates.io release instead of `HEAD^`, so it reports the diff someone
+  upgrading actually sees rather than the contents of one push. The 0.1.0
+  known limitations recorded it as unable to resolve a baseline.
+- `.cargo/audit.toml` ignores RUSTSEC-2026-0235 (rkyv 0.7.46, out-of-bounds
+  reads). `cargo audit` reads the feature-agnostic `Cargo.lock`; rkyv arrives
+  only as an optional dependency of `rust_decimal`, whose enabled features are
+  exactly `default`, `serde`, `std`, so it is never compiled. A CI step
+  re-proves that from the feature-resolved graph on every run and fails the day
+  it stops holding.
+- The release process in [docs/stability.md](docs/stability.md) is rewritten
+  around two silent failures the 0.2.0 pre-tag audit caught: a submodule whose
+  code changed without a version bump is skipped by the publisher, and a stale
+  `[workspace.dependencies]` requirement resolves siblings from the previous
+  release. It also names `blazingly-json`, which it had omitted.
+
+### Changed
+
+- `api-bindings` is dropped from the workspace categories. crates.io defines it
+  as an idiomatic wrapper around somebody else's web service, which is the
+  opposite relationship to a framework for authoring one.
+- `cargo-blazingly` no longer inherits the workspace categories. As a cargo
+  subcommand it belongs under `development-tools::cargo-plugins` and
+  `command-line-utilities`, the two lists a developer browses to find
+  `cargo blazingly new`; it was carrying `web-programming::http-server` and
+  appearing in neither.
+- Every crate declares a `homepage`.
+
+### Known limitations
+
+Carried forward and re-verified at this release: the Rust API is pre-1.0 and
+may break in a minor release when the break is recorded here; HTTP/2 is opt-in
+behind `native-http2` and outside the release contour; the 80k-request-per-second
+acceptance gate has no qualifying run yet; TLS certificate reload, asymmetric
+JWT with JWKS/OIDC discovery, key rotation, and CSRF helpers are absent; the
+OTLP exporter speaks plaintext transport only; there has been no external
+security audit.
+
+New to this list: a `#[provider]` cannot take `Extension<T>`, so a dependency
+cannot see the authenticated identity — read it in the handler instead. The
+published ecosystem adapters (`blazingly-sqlite`, `blazingly-postgres`,
+`blazingly-redis`, `blazingly-nats`) and `blazingly-examples` target 0.1.x and
+have not been updated for 0.2.
+
 ## [0.2.0] - 2026-08-04
 
 This release breaks the framework Rust API, which pre-1.0 permits when the

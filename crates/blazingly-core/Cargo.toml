@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Runtime-neutral operation model, HTTP projections, and typed response types for Blazingly"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true

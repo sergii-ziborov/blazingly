@@ -3,6 +3,15 @@
 // the example in it is compiled as a doctest rather than trusted.
 #![doc = include_str!("../README.md")]
 
+// The repository README is the first Rust anyone reads, and until this was
+// here nothing compiled it: its main example had not built for some time.
+// `#[cfg(doctest)]` strips the item before `include_str!` expands, so the path
+// out of the package root is never followed by `cargo package` or by docs.rs,
+// both of which are plain builds.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct RepositoryReadme;
+
 pub use blazingly_contract::*;
 pub use blazingly_core::*;
 #[cfg(feature = "database")]

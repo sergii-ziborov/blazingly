@@ -32,6 +32,19 @@ the feature wiring, and the macros. MSRV is Rust 1.88. `tokio`, `hyper`, and
 - an opt-in Tokio-free Compio native HTTP/1 server with rustls TLS, SSE, and
   WebSocket upgrades.
 
+New in 0.2: request-aware providers (a `#[provider]` takes `Path`/`Query`/
+`Header`/`Cookie` inputs, folded into the consuming operation's contract
+exactly once), `Plugin::mount("/v1")` and `with_id_namespace("v1")` for serving
+one module under two prefixes with distinct operation identities, custom
+extraction through `Extract<T>` over the public `FromInvocation` trait, and
+value-type constraints that survive nesting — a `#[min_length]` on a newtype
+now reaches the items schema of a `Vec<T>` that uses it, at any depth. The
+full list is in the [changelog](https://github.com/sergii-ziborov/blazingly/blob/main/CHANGELOG.md).
+
+One caveat worth knowing early: a synchronous handler runs inline on the worker
+that accepted the request and is never moved to the blocking pool. Anything
+that genuinely blocks must call `run_blocking`.
+
 ## Features
 
 `deploy`, `docs`, `mcp`, `middleware`, `observability`, `openapi`,
@@ -86,5 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [Getting started](https://github.com/sergii-ziborov/blazingly/blob/main/docs/getting-started.md)
   — install, a first application, validation, DI, OpenAPI, and MCP
 - [API documentation](https://docs.rs/blazingly)
+- [Changelog](https://github.com/sergii-ziborov/blazingly/blob/main/CHANGELOG.md)
+- [Stability and SemVer](https://github.com/sergii-ziborov/blazingly/blob/main/docs/stability.md)
+  — what pre-1.0 does and does not promise
 - [Repository](https://github.com/sergii-ziborov/blazingly) — the
   framework-internal documentation lives in `docs/`

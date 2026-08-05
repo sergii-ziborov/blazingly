@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 members = [
     "crates/cargo-blazingly",
     "crates/blazingly",
@@ -27,17 +27,22 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/sergii-ziborov/blazingly"
+homepage = "https://github.com/sergii-ziborov/blazingly"
 readme = "README.md"
 keywords = ["framework", "http", "api", "openapi", "mcp"]
+# `api-bindings` is deliberately absent: crates.io defines it as an idiomatic
+# wrapper around somebody else's web service, which is the opposite of a
+# framework for authoring one. The fifth slot stays empty rather than being
+# backfilled, because whatever goes here is inherited by `blazingly-macros`
+# and `blazingly-deploy` too.
 categories = [
     "web-programming::http-server",
     "web-programming",
-    "api-bindings",
     "asynchronous",
     "development-tools",
 ]
@@ -52,27 +57,27 @@ publish = true
 # loudly: it silently resolves a published 0.1.x from the registry instead of
 # the sibling being released beside it.
 blazingly-contract = { version = "0.4.1", path = "crates/blazingly-contract" }
-blazingly-core = { version = "0.2.0", path = "crates/blazingly-core" }
-blazingly-database = { version = "0.2.0", path = "crates/blazingly-database" }
-blazingly-deploy = { version = "0.2.0", path = "crates/blazingly-deploy" }
-blazingly-docs = { version = "0.2.0", path = "crates/blazingly-docs" }
-blazingly-di = { version = "0.2.0", path = "crates/blazingly-di" }
-blazingly-executor = { version = "0.2.0", path = "crates/blazingly-executor" }
-blazingly-http = { version = "0.2.0", path = "crates/blazingly-http" }
-blazingly-json = { version = "0.1.1", path = "crates/blazingly-json" }
-blazingly-macros = { version = "0.2.0", path = "crates/blazingly-macros" }
-blazingly-middleware = { version = "0.2.0", path = "crates/blazingly-middleware" }
-blazingly-mcp = { version = "0.2.0", path = "crates/blazingly-mcp" }
-blazingly-mcp-stdio = { version = "0.2.0", path = "crates/blazingly-mcp-stdio" }
-blazingly-native = { version = "0.2.0", path = "crates/blazingly-native" }
-blazingly-observability = { version = "0.2.0", path = "crates/blazingly-observability" }
-blazingly-openapi = { version = "0.2.0", path = "crates/blazingly-openapi" }
-blazingly-queue = { version = "0.2.0", path = "crates/blazingly-queue" }
-blazingly-realtime = { version = "0.2.0", path = "crates/blazingly-realtime" }
-blazingly-security = { version = "0.2.0", path = "crates/blazingly-security" }
-blazingly-templates = { version = "0.2.0", path = "crates/blazingly-templates" }
-blazingly-validation = { version = "0.2.0", path = "crates/blazingly-validation" }
-blazingly-wire = { version = "0.1.2", path = "crates/blazingly-wire" }
+blazingly-core = { version = "0.2.1", path = "crates/blazingly-core" }
+blazingly-database = { version = "0.2.1", path = "crates/blazingly-database" }
+blazingly-deploy = { version = "0.2.1", path = "crates/blazingly-deploy" }
+blazingly-docs = { version = "0.2.1", path = "crates/blazingly-docs" }
+blazingly-di = { version = "0.2.1", path = "crates/blazingly-di" }
+blazingly-executor = { version = "0.2.1", path = "crates/blazingly-executor" }
+blazingly-http = { version = "0.2.1", path = "crates/blazingly-http" }
+blazingly-json = { version = "0.1.2", path = "crates/blazingly-json" }
+blazingly-macros = { version = "0.2.1", path = "crates/blazingly-macros" }
+blazingly-middleware = { version = "0.2.1", path = "crates/blazingly-middleware" }
+blazingly-mcp = { version = "0.2.1", path = "crates/blazingly-mcp" }
+blazingly-mcp-stdio = { version = "0.2.1", path = "crates/blazingly-mcp-stdio" }
+blazingly-native = { version = "0.2.1", path = "crates/blazingly-native" }
+blazingly-observability = { version = "0.2.1", path = "crates/blazingly-observability" }
+blazingly-openapi = { version = "0.2.1", path = "crates/blazingly-openapi" }
+blazingly-queue = { version = "0.2.1", path = "crates/blazingly-queue" }
+blazingly-realtime = { version = "0.2.1", path = "crates/blazingly-realtime" }
+blazingly-security = { version = "0.2.1", path = "crates/blazingly-security" }
+blazingly-templates = { version = "0.2.1", path = "crates/blazingly-templates" }
+blazingly-validation = { version = "0.2.1", path = "crates/blazingly-validation" }
+blazingly-wire = { version = "0.1.3", path = "crates/blazingly-wire" }
 base64 = "0.22"
 brotli = "8"
 compio = { version = "0.17.0", default-features = false, features = [

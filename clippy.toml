@@ -1,0 +1,5 @@
+# Every crate README is now its crate's rustdoc header, which puts prose written
+# for a crates.io reader under `clippy::doc_markdown`. These are proper nouns, not
+# Rust items; backticking them would render a specification's name as code on the
+# published page. `..` keeps clippy's own default list.
+doc-valid-idents = ["OpenAPI", "OAuth2", "SemVer", ".."]

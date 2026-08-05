@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// The README example carries a `fn main` on purpose: it is copied out of a
+// crates.io page into a real file, where the wrapper is not needless.
+#![allow(clippy::needless_doctest_main)]
 #![doc = include_str!("../README.md")]
 
 mod audit;
