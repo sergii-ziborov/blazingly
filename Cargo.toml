@@ -67,7 +67,7 @@ blazingly-docs = { version = "0.2.2", path = "crates/blazingly-docs" }
 blazingly-di = { version = "0.2.2", path = "crates/blazingly-di" }
 blazingly-executor = { version = "0.2.2", path = "crates/blazingly-executor" }
 blazingly-http = { version = "0.2.2", path = "crates/blazingly-http" }
-blazingly-json = { version = "0.1.3", path = "crates/blazingly-json" }
+blazingly-json = { version = "0.1.4", path = "crates/blazingly-json" }
 blazingly-macros = { version = "0.2.2", path = "crates/blazingly-macros" }
 blazingly-middleware = { version = "0.2.2", path = "crates/blazingly-middleware" }
 blazingly-mcp = { version = "0.2.2", path = "crates/blazingly-mcp" }
