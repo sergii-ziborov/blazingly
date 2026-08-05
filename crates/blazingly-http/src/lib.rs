@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -1198,6 +1198,63 @@ impl HttpApp {
         }
     }
 
+    /// Every operation that declares a security scheme no registered layer can
+    /// verify on its path.
+    ///
+    /// Dispatch already fails closed on these, but it does so on the first
+    /// request that reaches one — which is a 500 in production rather than a
+    /// refusal to start. Everything the guard consults is known once the
+    /// application is assembled, so it can be asked ahead of time instead.
+    #[must_use]
+    pub fn unverified_security(&self) -> Vec<UnverifiedSecurity> {
+        if self.allow_unverified_security_schemes {
+            return Vec::new();
+        }
+        let mut unverified = Vec::new();
+        for operation in self.app.definition().operations() {
+            if operation.contract.security.is_empty() {
+                continue;
+            }
+            let path = operation.http.path.as_str();
+            if self.middleware.iter().any(|layer| {
+                layer.layer.verifies_security() && layer.matches(path, Some(operation))
+            }) {
+                continue;
+            }
+            unverified.push(UnverifiedSecurity {
+                operation: operation.contract.id.as_str().to_owned(),
+                method: operation.http.method,
+                path: path.to_owned(),
+                schemes: operation
+                    .contract
+                    .security
+                    .iter()
+                    .map(|requirement| requirement.scheme.clone())
+                    .collect(),
+            });
+        }
+        unverified
+    }
+
+    /// Refuses an application whose declared security nothing can verify.
+    ///
+    /// Call this before serving. The runtime guard stays either way — it is the
+    /// thing that makes an unverified scheme safe — but a service that would
+    /// answer 500 on its first authenticated request should not have started.
+    ///
+    /// # Errors
+    ///
+    /// Returns every operation whose declared scheme has no verifier reaching
+    /// its path, so one startup reports all of them rather than one per boot.
+    pub fn check_security_coverage(&self) -> Result<(), UnverifiedSecurityError> {
+        let unverified = self.unverified_security();
+        if unverified.is_empty() {
+            Ok(())
+        } else {
+            Err(UnverifiedSecurityError { unverified })
+        }
+    }
+
     /// Returns the compiled body source for a recognized request.
     ///
     /// Native adapters use this before buffering a body so streaming
@@ -1657,6 +1714,22 @@ impl Dispatcher<'_> {
         {
             return None;
         }
+        // The body stays generic — a client learns nothing about which scheme
+        // is unguarded — but the log line names the operation and the exact
+        // missing registration, because for this mistake the diagnostic is the
+        // only documentation anyone will find.
+        let unverified = UnverifiedSecurity {
+            operation: descriptor.contract.id.as_str().to_owned(),
+            method: descriptor.http.method,
+            path: descriptor.http.path.clone(),
+            schemes: descriptor
+                .contract
+                .security
+                .iter()
+                .map(|requirement| requirement.scheme.clone())
+                .collect(),
+        };
+        log_unverified_security(&unverified);
         Some(Failure::new(
             HttpErrorSource::Internal,
             500,
@@ -1665,6 +1738,92 @@ impl Dispatcher<'_> {
         ))
     }
 }
+
+thread_local! {
+    /// Operations already reported unverified on this worker.
+    ///
+    /// The guard runs per request, and a misconfigured operation is usually
+    /// misconfigured for every one of them. Reporting once per operation makes
+    /// the line findable instead of drowning the log it belongs in.
+    static REPORTED_UNVERIFIED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+fn log_unverified_security(unverified: &UnverifiedSecurity) {
+    REPORTED_UNVERIFIED.with(|reported| {
+        if !reported.borrow_mut().insert(unverified.operation.clone()) {
+            return;
+        }
+        eprintln!(
+            "error: refusing to serve {unverified}. Register a verifying layer with \
+             `HttpApp::with_middleware` (or `MulticoreServer::with_middleware_factory`) — a \
+             `Security` layer carrying the credential verifier for that scheme. Call \
+             `HttpApp::check_security_coverage()` before serving to catch this at startup."
+        );
+    });
+}
+
+/// One operation whose declared security nothing on its path can verify.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnverifiedSecurity {
+    pub operation: String,
+    pub method: HttpMethod,
+    pub path: String,
+    pub schemes: Vec<String>,
+}
+
+impl fmt::Display for UnverifiedSecurity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "operation `{}` ({} {}) declares {} that no registered layer verifies on its path",
+            self.operation,
+            self.method.as_str(),
+            self.path,
+            match self.schemes.as_slice() {
+                [scheme] => format!("security scheme `{scheme}`"),
+                schemes => format!("security schemes `{}`", schemes.join("`, `")),
+            }
+        )
+    }
+}
+
+/// Declared security that no registered layer can verify.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnverifiedSecurityError {
+    unverified: Vec<UnverifiedSecurity>,
+}
+
+impl UnverifiedSecurityError {
+    #[must_use]
+    pub fn unverified(&self) -> &[UnverifiedSecurity] {
+        &self.unverified
+    }
+}
+
+impl fmt::Display for UnverifiedSecurityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "{} operation(s) declare security with no verifier:",
+            self.unverified.len()
+        )?;
+        for entry in &self.unverified {
+            writeln!(formatter, "  - {entry}")?;
+        }
+        // The diagnostic is the documentation here: this is the one mistake the
+        // framework detects correctly and has never told anyone how to fix.
+        formatter.write_str(
+            "register a verifying layer with `HttpApp::with_middleware`, or \
+             `MulticoreServer::with_middleware_factory` on a native server — for example a \
+             `blazingly::security::Security` layer carrying the credential verifier for that \
+             scheme. A layer scoped to a path prefix or an operation predicate only counts \
+             where its scope reaches. If the schemes are verified somewhere this check cannot \
+             see, say so with `with_unverified_security_schemes(true)`.",
+        )
+    }
+}
+
+impl std::error::Error for UnverifiedSecurityError {}
 
 /// A failure response before it reaches the application error handlers.
 struct Failure {

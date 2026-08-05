@@ -33,7 +33,8 @@ pub use blazingly_executor::{
 pub use blazingly_http as http;
 pub use blazingly_http::{
     CollectBodyError, ConnectionInfo, HttpApp, HttpMiddleware, HttpRequestContext, HttpRequestView,
-    Request, Response, RouteError, RouteMatch, Router, TestApp,
+    MiddlewareScope, Request, Response, RouteError, RouteMatch, Router, TestApp,
+    UnverifiedSecurity, UnverifiedSecurityError,
 };
 // Public, not `__private`: `AuthenticatedIdentity::claims`, `VerifiedToken::claims`
 // and `PreparedJson::encode` name this crate's `Value` and `Error` in their

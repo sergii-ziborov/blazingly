@@ -997,7 +997,12 @@ where
                     let _work = ActiveWork::adopt(active_for_task);
                     let _slot = ActiveWork::adopt(connections_for_task);
                     let _load = WorkerSlot::adopt(loads_for_task, worker);
-                    let app = worker_app(server_id, config.as_ref()).0;
+                    // The startup future already built and checked this app, so
+                    // reaching here means it is cached; a failure would have
+                    // stopped the server before any connection was accepted.
+                    let Ok((app, _)) = worker_app(server_id, config.as_ref()) else {
+                        return;
+                    };
                     let Ok(stream) = compio::net::TcpStream::from_std(stream) else {
                         return;
                     };
@@ -1091,7 +1096,8 @@ where
                 // scheduling request can be made.
                 apply_worker_priority(priority);
                 install_drain_counter(&active);
-                let (app, created) = worker_app(server_id, config.as_ref());
+                let (app, created) =
+                    worker_app(server_id, config.as_ref()).map_err(|error| error.to_string())?;
                 if created {
                     return app.startup().await.map_err(|error| error.to_string());
                 }
@@ -1139,14 +1145,17 @@ fn apply_worker_priority(priority: WorkerPriority) {
     let _ = thread_priority::set_current_thread_priority(elevated);
 }
 
-fn worker_app<Factory>(server_id: u64, config: &WorkerConfig<Factory>) -> (Rc<HttpApp>, bool)
+fn worker_app<Factory>(
+    server_id: u64,
+    config: &WorkerConfig<Factory>,
+) -> io::Result<(Rc<HttpApp>, bool)>
 where
     Factory: Fn() -> ExecutableApp,
 {
     WORKER_APPS.with(|apps| {
         let mut apps = apps.borrow_mut();
         if let Some(app) = apps.get(&server_id) {
-            return (Rc::clone(app), false);
+            return Ok((Rc::clone(app), false));
         }
         let app = HttpApp::new((config.factory)()).with_max_body_bytes(config.max_body_bytes);
         let app = match &config.openapi {
@@ -1159,9 +1168,14 @@ where
                 .fold(app, HttpApp::with_shared_middleware),
             None => app,
         };
+        // Everything the fail-closed guard consults is known now, so a service
+        // that would answer 500 on its first authenticated request refuses to
+        // start instead of waiting for that request to arrive in production.
+        app.check_security_coverage()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let app = Rc::new(app);
         apps.insert(server_id, Rc::clone(&app));
-        (app, true)
+        Ok((app, true))
     })
 }
 
@@ -5061,7 +5075,8 @@ mod tests {
             })),
         };
         let server_id = super::NEXT_MULTICORE_SERVER_ID.fetch_add(1, Ordering::Relaxed);
-        let (app, created) = super::worker_app(server_id, &config);
+        let (app, created) =
+            super::worker_app(server_id, &config).expect("the worker application is servable");
         assert!(created);
 
         let response = future::block_on(app.call(Request::new(HttpMethod::Get, "/ping")));
