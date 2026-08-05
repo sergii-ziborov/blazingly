@@ -44,49 +44,52 @@ additional database/queue adapters, convenience integrations, and device-
 specific tuning packages. A larger crate count is not itself a completion
 metric.
 
-## Next P0 vertical slice: request-aware DI and `Extract<T>`
+## Next P0 vertical slice: closing the three shipped slices
 
-This is the next API slice after the current router, blocking-pool, database,
-OpenAPI, and CLI changes complete their normal quality gates.
+The request-aware DI, custom-extraction, and composition slices shipped in
+0.2.0; the matrix rows above record what landed. What remains of them is small
+and is what this slice finishes, plus the one capability a user cannot reach at
+all today.
 
 ### Scope
 
-1. Add an explicit `Extract<T>` handler wrapper backed by `FromInvocation`.
-   Preserve bare `T` as the existing direct-DI spelling so this is additive.
-2. Add a borrowed request-parts extractor for method, path, headers, peer,
-   scheme, host, and extensions. Body ownership remains with body extractors.
-3. Permit `#[provider]` inputs from `Depends`, `Path`, `Query`, `Header`,
-   `Cookie`, and `Extension`. Body extractors are intentionally excluded from
-   this first slice.
-4. Fold provider-declared request inputs into each consuming operation during
-   application compilation. Deduplicate the same logical input and fail on
-   incompatible declarations.
-5. Project the compiled inputs from the canonical operation graph to OpenAPI,
-   MCP, generated documentation, and compatibility fingerprints.
-6. Keep numeric DI slots and precompiled decode plans. The slice must not add a
-   per-request type-name map, reflection, route scan, or second JSON value.
+1. Permit `Extension<T>` as a `#[provider]` input. This is the one gap that
+   changes what an application can express: a dependency currently cannot see
+   the authenticated identity, so anything identity-derived has to be assembled
+   in the handler. The macro rejects it today, and the rejection message
+   describes the wrong reason.
+2. Add a borrowed, non-snapshot request-parts value for synchronous handlers.
+   `Extract<RequestParts>` already snapshots; the borrowed form avoids the copy
+   where the handler does not outlive the request.
+3. Make TLS configurable with shipped code. `Server::with_tls_config` takes a
+   `compio::tls::rustls::ServerConfig` that no re-export makes reachable, and
+   no crate here loads a certificate from disk, so `native-tls` is a builder
+   method a user cannot call. This needs a certificate loader, the re-exports
+   to name the config type, an example, and a section in
+   [deployment](deployment.md).
+4. Add default policies and per-mount tags to `Plugin::mount`, beyond the id
+   namespace it already keeps distinct.
+5. Land the one- and ten-dependency benchmark rows the DI slice deferred.
 
 ### Acceptance gates
 
-- A provider consumes a query model and header while a nested provider consumes
-  a cookie; HTTP success and every validation failure are integration-tested.
-- OpenAPI contains each dependency-origin parameter exactly once with its
-  required/default/validation schema; generated MCP/docs fixtures agree.
-- Global and plugin-scoped test overrides can replace the provider without
-  evaluating the original provider or requiring its request inputs.
-- A custom extractor implemented outside the framework crate works through
-  `Extract<T>` and can return a stable typed rejection.
-- HTTP-only extraction attempted through MCP returns a documented transport
-  mismatch rather than a panic or missing-dependency error.
+- A provider consumes `Extension<SecurityContext>` and the operation contract,
+  OpenAPI, and MCP metadata are unchanged by it, because an extension is not a
+  request input; a provider that asks for one on a transport that supplies none
+  fails deterministically rather than panicking.
+- A borrowed parts value is usable from a synchronous handler and cannot
+  outlive the invocation; the snapshot form keeps working unchanged.
+- An HTTPS server is stood up from PEM files on disk using only `blazingly`
+  with `native-tls`, following an example in the repository, with no direct
+  `compio` or `rustls` dependency in the application manifest.
 - One- and ten-dependency external benchmarks report throughput, p50/p95/p99,
   allocations, and peak RSS. The ten-dependency path performs no per-request
   hash lookup and regresses the current one-dependency median by no more than
   5% before it is accepted.
 
-Expected implementation areas are `blazingly-contract`, `blazingly-di`,
-`blazingly-executor`, `blazingly-macros`, `blazingly-openapi`, and focused
-facade integration tests. The operation graph changes before projections; no
-projection may invent semantics absent from the contract.
+Expected implementation areas are `blazingly-di`, `blazingly-executor`,
+`blazingly-macros`, and `blazingly-native`. The operation graph changes before
+projections; no projection may invent semantics absent from the contract.
 
 ## Performance and claim gates
 

@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords.workspace = true
+keywords = ["macros", "proc-macro", "api", "framework", "openapi"]
 categories.workspace = true
 publish.workspace = true
 

@@ -85,7 +85,7 @@ written for people working on the framework itself.
 
 ## Status
 
-Blazingly `0.2.1` is on crates.io. It is pre-1.0: suitable for evaluation and
+Blazingly `0.2.2` is on crates.io. It is pre-1.0: suitable for evaluation and
 controlled production trials, not a promise that every public Rust API is
 frozen. What that does and does not guarantee is in
 [stability and SemVer](docs/stability.md); the release history is in
@@ -333,9 +333,9 @@ have not yet been updated for `0.2`.**
 
 ## Facade features
 
-The facade enables `deploy`, `docs`, `mcp`, `middleware`, `observability`,
-`openapi`, `realtime`, `security`, and `validation` by default. Native socket
-and ecosystem integrations are opt-in:
+On by default: `deploy`, `docs`, `mcp`, `middleware`, `observability`,
+`openapi`, `realtime`, `security`, `validation`. Native socket and ecosystem
+integrations are opt-in:
 
 | Feature | Enables |
 | --- | --- |
@@ -345,10 +345,13 @@ and ecosystem integrations are opt-in:
 | `mcp-stdio` | `mcp` plus the supervised stdio transport |
 | `observability-otel` | `observability` plus OpenTelemetry parent propagation |
 | `database`, `queue`, `templates` | the optional ecosystem integration crates |
-| `deploy` | Docker/Kubernetes/HPA generation |
 
-`cargo check -p blazingly --no-default-features` verifies the minimal
-contract/core/DI/executor/HTTP/macros facade.
+`cargo check -p blazingly --no-default-features` verifies the minimal facade:
+contract, core, DI, executor, HTTP, macros, and `blazingly-json`. Turning the
+default features off does not remove the OpenAPI projection from the build —
+`blazingly-http` serves `/openapi.json` and so depends on `blazingly-openapi`
+unconditionally. The `openapi` feature gates the `blazingly::openapi`
+re-export, not the compilation.
 
 ## Scope
 

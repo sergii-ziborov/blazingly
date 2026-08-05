@@ -54,8 +54,11 @@ that genuinely blocks must call `run_blocking`.
 `realtime`, `security`, and `validation` are enabled by default. Opt-in:
 `native`, `native-tls`, `native-http2` (experimental), `mcp-stdio`,
 `database`, `queue`, `templates`, and `observability-otel`.
-`cargo check -p blazingly --no-default-features` verifies the minimal
-contract/core/DI/executor/HTTP/macros surface.
+`cargo check -p blazingly --no-default-features` verifies the minimal surface:
+contract, core, DI, executor, HTTP, macros, and `blazingly-json`. It does not
+drop the OpenAPI projection from the build — `blazingly-http` serves
+`/openapi.json` and depends on `blazingly-openapi` unconditionally, so the
+`openapi` feature gates the re-export rather than the compilation.
 
 ## Example
 

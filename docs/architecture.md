@@ -218,8 +218,8 @@ both transports invoke the same operation semantics.
     `[workspace.package]`, an MIT `LICENSE` in every published crate matching
     the contract repository, `CHANGELOG.md`, and a release process in
     `docs/stability.md` whose gate names real CI jobs. The framework is on
-    crates.io: 21 workspace crates at 0.2.1, plus `blazingly-contract` 0.4.1,
-    `blazingly-json` 0.1.2, and `blazingly-wire` 0.1.3.
+    crates.io: 21 workspace crates at 0.2.2, plus `blazingly-contract` 0.4.1,
+    `blazingly-json` 0.1.3, and `blazingly-wire` 0.1.3.
 
 Mesh work starts only after the framework contract is stable.
 

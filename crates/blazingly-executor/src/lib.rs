@@ -4222,6 +4222,19 @@ const fn source_name(source: InputSource) -> &'static str {
     }
 }
 
+/// Collects annotated handlers into the operation list an application is built
+/// from.
+///
+/// ```ignore
+/// let app = ExecutableApp::new(routes![create_user, read_user, delete_user])?;
+/// ```
+///
+/// Registration is explicit on purpose: there is no route scan and no
+/// inventory. A handler that is written but not listed here is not served, and
+/// does not appear in the contract, in OpenAPI, in the generated documentation,
+/// or as an MCP tool. Listing the same operation twice, or two operations that
+/// collide on method and path or on operation id, fails when the application is
+/// built rather than at the first request.
 #[macro_export]
 macro_rules! routes {
     ($($operation:ident),* $(,)?) => {

@@ -45,7 +45,7 @@ edition = "2024"
 [dependencies]
 # To track unreleased work on `main` instead:
 # blazingly = { git = "https://github.com/sergii-ziborov/blazingly", features = ["native"] }
-blazingly = { version = "0.2.1", features = ["native"] }
+blazingly = { version = "0.2.2", features = ["native"] }
 ```
 
 The version is the one the CLI itself was built against, so `cargo install

@@ -565,46 +565,81 @@ pub fn operation(arguments: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Declares a `GET` operation.
+///
+/// ```ignore
+/// #[get("/users/{id}", id = "users.read", summary = "Read a user")]
+/// async fn read_user(Path(id): Path<u64>) -> Json<UserView> { .. }
+/// ```
+///
+/// The path is positional and first. `id` is required and is the operation's
+/// stable identity: it names the operation in the contract, in OpenAPI, in the
+/// generated documentation, in compatibility reports, and as the MCP tool name,
+/// so it must outlive changes to the path and to the function name. `summary`
+/// is optional and supplies the one-line description that reaches the OpenAPI
+/// operation, the `cargo blazingly routes` table, and the MCP tool description.
+///
+/// Handler arguments are the extractors — `Path`, `Query`, `Header`, `Cookie`,
+/// `Json`, `Form`, `Multipart`, `File`, `Extract<T>` — and compiled dependency
+/// requests, in any combination. The return type declares the response
+/// contract. The handler may be `async` or plain `fn`; a plain `fn` runs inline
+/// on the calling thread and is never moved to the blocking pool, so work that
+/// genuinely blocks must call `run_blocking`.
+///
+/// This is an alias for [`macro@operation`] with the method fixed.
 #[proc_macro_attribute]
 pub fn get(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Get))
 }
 
+/// Declares a `HEAD` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn head(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Head))
 }
 
+/// Declares a `POST` operation. See [`macro@get`] for the argument form.
+///
+/// ```ignore
+/// #[post("/users", id = "users.create", summary = "Create a user")]
+/// async fn create_user(Json(input): Json<CreateUser>) -> Created<UserView> { .. }
+/// ```
 #[proc_macro_attribute]
 pub fn post(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Post))
 }
 
+/// Declares a `PUT` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn put(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Put))
 }
 
+/// Declares a `PATCH` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn patch(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Patch))
 }
 
+/// Declares a `DELETE` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn delete(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Delete))
 }
 
+/// Declares an `OPTIONS` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn options(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Options))
 }
 
+/// Declares a `TRACE` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn trace(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Trace))
 }
 
+/// Declares a `CONNECT` operation. See [`macro@get`] for the argument form.
 #[proc_macro_attribute]
 pub fn connect(arguments: TokenStream, item: TokenStream) -> TokenStream {
     expand_operation(arguments, item, &quote!(::blazingly::HttpMethod::Connect))
@@ -662,6 +697,36 @@ pub fn api_model(arguments: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Declares a stable domain error as an enum.
+///
+/// Each variant carries its own HTTP status, a stable machine-readable code,
+/// and an optional human message; a variant may also declare response headers
+/// and a typed details payload.
+///
+/// ```ignore
+/// #[api_error]
+/// enum CreateUserError {
+///     #[status(409)]
+///     #[code("email_already_exists")]
+///     #[message("A user with this email already exists.")]
+///     EmailAlreadyExists,
+///
+///     #[status(429)]
+///     #[code("rate_limited")]
+///     #[header("retry-after", "30")]
+///     RateLimited(RateLimitDetails),
+/// }
+/// ```
+///
+/// The code is the stable identity, the same way an operation `id` is: it
+/// reaches the response body, the OpenAPI responses, the generated
+/// documentation, and MCP typed-error handling, and it participates in
+/// compatibility reports. Returning `Result<T, ThisError>` from a handler is
+/// what declares the error responses on the operation.
+///
+/// Faults the framework raises itself — an invalid response header, a
+/// serialization failure — are not projected this way. They are redacted to a
+/// generic `500` over HTTP and a generic internal error over MCP.
 #[proc_macro_attribute]
 pub fn api_error(_arguments: TokenStream, item: TokenStream) -> TokenStream {
     let mut error = parse_macro_input!(item as ItemEnum);
@@ -688,6 +753,33 @@ pub fn provider(arguments: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Exposes an operation as a native MCP tool.
+///
+/// ```ignore
+/// #[post("/users", id = "users.create", summary = "Create a user")]
+/// #[mcp::tool(
+///     name = "create_user",
+///     risk = "write",
+///     confirmation = "required",
+///     expose_output = "full"
+/// )]
+/// async fn create_user(Json(input): Json<CreateUser>) -> Created<UserView> { .. }
+/// ```
+///
+/// Every option is optional: `name` overrides the tool name (the operation `id`
+/// otherwise), `description` overrides the summary, `risk` and `confirmation`
+/// declare agent policy, and `expose_output` controls how much of the response
+/// a model may see. A tool declared `confirmation = "required"` is rejected
+/// unless the MCP host sends `_meta["dev.blazingly/confirmed"] = true` after
+/// obtaining user confirmation.
+///
+/// The tool is not a translation of the OpenAPI document: an agent calling it
+/// runs the same executor, the same validation, and the same typed errors as an
+/// HTTP client.
+///
+/// This attribute only annotates; it never expands on its own. It must sit
+/// *below* the operation attribute that owns the function, and says so with a
+/// compile error if it does not.
 #[proc_macro_attribute]
 pub fn tool(_arguments: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
@@ -699,6 +791,27 @@ pub fn tool(_arguments: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Requires a registered security scheme, and optionally scopes, for an
+/// operation.
+///
+/// ```ignore
+/// #[get("/users/{id}", id = "users.read")]
+/// #[security("oauth", scopes = ["users:read"])]
+/// async fn read_user(Path(id): Path<u64>) -> Json<UserView> { .. }
+/// ```
+///
+/// The scheme name is positional and first, and must match a scheme registered
+/// on the application; `scopes` is the only supported option. The requirement
+/// reaches the OpenAPI security block, the contract, and compatibility reports.
+///
+/// Enforcement fails closed. If no registered layer can verify the named
+/// scheme, the request is rejected rather than served unauthenticated, and the
+/// check runs before the body is parsed — in `TestApp`, in native HTTP/1, and
+/// in HTTP/2 alike.
+///
+/// This attribute only annotates; it never expands on its own. It must sit
+/// *below* the operation attribute that owns the function, and says so with a
+/// compile error if it does not.
 #[proc_macro_attribute]
 pub fn security(_arguments: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
